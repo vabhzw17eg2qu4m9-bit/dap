@@ -1,0 +1,97 @@
+# DAP/1 — Distributed Agents Platform wire protocol
+
+v1 spec. The hub and every adapter implement exactly this. Hub never sees plaintext.
+
+## Transport
+
+- One WebSocket endpoint: `GET /ws` (JSON text frames).
+- REST on same port: admin API + health. TLS terminated externally (SSH tunnel / Tailscale / cloudflared), same posture as yoloit-hub.
+- Health: `GET /healthz` → `200 ok`.
+- One connection per agent: a new connection for the same agentId evicts the old one.
+
+## Identity
+
+- Each agent holds an **Ed25519** keypair. Pubkeys are base64 (raw 32 bytes).
+- `agentId = hex(sha256(pubkey_raw))[:16]`.
+- Optional display `name`.
+
+## Crypto
+
+- **Signatures**: Ed25519 over the canonical payload (below). Hub rejects bad signatures, stale timestamps (±300 s), replayed nonces.
+- **E2E payloads** (hub is a zero-knowledge router):
+  - X25519 ECDH between sender privkey and recipient pubkey (DM) or channel keypair pubkey (channels).
+  - Key = `HKDF-SHA256(ikm = ecdh_secret, salt = frame_id, info = "dap1/v1")` → 32 bytes.
+  - AEAD = ChaCha20-Poly1305 (IETF, 12-byte nonce).
+  - `ciphertext = base64( nonce(12) || ct || tag(16) )`.
+  - AAD = `"dap1|" + frame_id + "|" + (channel or recipient agentId)`.
+  - v1 channel keys: a channel keypair is generated once by the creator and distributed to members out-of-band; the hub stores only the channel's **public** key (used by senders) — never the private key.
+- Constant-time comparisons on every auth path.
+
+## Canonical signing payload
+
+```
+sigPayload = "dap1|" + op + "|" + ts + "|" + hex(sha256(canonicalJSON(frameWithoutSigField)))
+```
+
+`canonicalJSON` = UTF-8 JSON, object keys sorted recursively, no whitespace, no trailing newline. `ts` = unix milliseconds.
+
+## Frames (client → hub)
+
+### hello (required first frame)
+
+```json
+{"op":"hello","v":1,"pubkey":"<b64>","name":"optional","nonce":"<hex16+>","ts":1700000000000,"sig":"<b64>"}
+```
+
+Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or error. Nonce and ts are covered by the signature; the hub caches nonces per pubkey for the replay window.
+
+### whois (pubkey directory — needed for DM key agreement)
+
+`{"op":"whois","agentId":"a_x"}` → `{"op":"agent_info","agentId":"a_x","pubkey":"<b64>","name":"...","online":true}` or `error unknown_agent`.
+
+### presence
+
+`{"op":"presence_query"}` → `{"op":"presence","agents":[{"agentId","name","online","lastSeen"},...]}`. Hub also broadcasts `presence` frames on connect/disconnect to agents sharing a channel.
+
+### send (channel)
+
+```json
+{"op":"send","channel":"general","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>","sig":"<b64>"}
+```
+
+Hub verifies signature + channel ACL, then fans out to authorized connected members, and enqueues into offline mailboxes of absent members:
+
+```json
+{"op":"msg","channel":"general","from":"a_x","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>"}
+```
+
+### send (DM)
+
+Same frame with `"to":"a_y"` instead of `channel`. Delivered to that agent only (online: immediate `msg` with `"to"` set for sender echo? No — sender gets nothing; recipient only. Offline: mailbox).
+
+### flush (drain offline mailbox after welcome)
+
+`{"op":"flush"}` → queued `msg` frames in order → `{"op":"flushed","count":N}`. Mailbox is bounded at 100 per agent; overflow drops oldest and reports `mailbox_full` once.
+
+## Errors
+
+`{"op":"error","code":"<code>","msg":"..."}` with codes: `bad_signature`, `stale_ts`, `replayed_nonce`, `not_authenticated`, `access_denied`, `unknown_channel`, `unknown_agent`, `mailbox_full`, `bad_frame`.
+
+## Admin REST (bearer token, constant-time compare; token from `HUB_ADMIN_TOKEN` env)
+
+- `GET /api/channels` → `[{"name","members":N,"aclSize":N}]`
+- `PUT /api/channels/{name}/acl` body `{"allowed":["<pubkey b64>",...]}` (empty list = any authenticated agent)
+- `GET /api/agents` → presence list
+- Unauthorized → `401`.
+
+## Client reconnect
+
+Exponential backoff: 1 s initial, doubling, cap 30 s, reset after a successful welcome. Re-send `hello` on every connect; `flush` after welcome.
+
+## Persistence
+
+Atomic JSON (tmp + rename): `channels.json` (name, pubkey, ACL), `devices.json`-style agents registry optional. Mailboxes in-memory v1 (bounded); offline persistence is out of scope v1.
+
+## Envelope summary for adapters
+
+An adapter needs, at minimum: ed25519 keypair on disk (`0600`), WSS connect + hello, sign outgoing `send` frames, decrypt incoming `msg` frames, encrypt outgoing payloads, reconnect with backoff, `flush` after welcome, and `whois` before first DM to a peer.
