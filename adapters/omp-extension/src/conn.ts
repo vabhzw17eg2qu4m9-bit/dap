@@ -123,6 +123,12 @@ export class DapClient {
     return frame.ts as number;
   }
 
+  /** Channel membership (spec § join): first join creates the channel and
+   * registers chanPubkey; re-join is idempotent — safe on every reconnect. */
+  join(channel: string, chanPubkeyB64: string): void {
+    this.send({ op: 'join', channel, chanPubkey: chanPubkeyB64 });
+  }
+
   /** Pubkey directory lookup (needed for DM key agreement). */
   whois(agentId: string): Promise<AgentInfo | undefined> {
     const cached = this.whoisCache.get(agentId);
@@ -207,6 +213,9 @@ export class DapClient {
         this.emit('agent_info', info);
         break;
       }
+      case 'joined':
+        this.emit('joined', frame);
+        break;
       case 'flushed':
         this.emit('flushed', frame);
         break;

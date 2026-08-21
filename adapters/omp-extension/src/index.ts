@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { loadOrCreateKeys, type KeyPair } from './crypto.ts';
 import { DapClient, type Backoff, type Timers, type AgentInfo } from './conn.ts';
 import { Inbox, type InboxEntry } from './inbox.ts';
@@ -20,6 +21,22 @@ export interface ExtensionOptions {
   channelPrivs?: Record<string, string>;
   backoff?: Partial<Backoff>;
   timers?: Timers;
+}
+
+/** DAP_CHANNELS_FILE: JSON { "<channel>": { "pub": "<b64>", "priv": "<b64>" } }.
+ * Members hold the channel private key (needed to decrypt); share the file
+ * with every member. Only used when no override passed (omp loads with none). */
+function channelsFromEnv(): { channels: Record<string, string>; channelPrivs: Record<string, string> } {
+  const file = optStr(process.env.DAP_CHANNELS_FILE);
+  if (!file) return { channels: {}, channelPrivs: {} };
+  const raw: Record<string, { pub?: string; priv?: string }> = JSON.parse(readFileSync(file, 'utf8'));
+  const channels: Record<string, string> = {};
+  const channelPrivs: Record<string, string> = {};
+  for (const [name, keys] of Object.entries(raw)) {
+    if (keys.pub) channels[name] = keys.pub;
+    if (keys.priv) channelPrivs[name] = keys.priv;
+  }
+  return { channels, channelPrivs };
 }
 
 export interface DapExtension {
@@ -70,11 +87,12 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   const client = new DapClient({ url, keys, name, backoff: overrides.backoff, timers: resolveTimers(ctx, overrides.timers) });
   const inbox = new Inbox(100, (entry) => ctx.appendEntry(entry));
+  const envChannels = overrides.channels || overrides.channelPrivs ? null : channelsFromEnv();
   const cryptoCtx: PayloadCryptoContext = {
     keys,
     selfAgentId: client.agentId,
-    channels: overrides.channels ?? {},
-    channelPrivs: overrides.channelPrivs ?? {},
+    channels: overrides.channels ?? envChannels?.channels ?? {},
+    channelPrivs: overrides.channelPrivs ?? envChannels?.channelPrivs ?? {},
     peerXPub: async (agentId) => (await client.whois(agentId))?.x25519,
   };
 
@@ -95,6 +113,12 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       .catch((err: unknown) =>
         ctx.appendEntry({ type: 'dap_undecryptable', id: frame.id, error: String(err) }),
       );
+
+  // Membership: join every configured channel after each welcome (idempotent;
+  // first join ever creates the channel and registers its public key).
+  client.on('welcome', () => {
+    for (const [name, pub] of Object.entries(cryptoCtx.channels)) client.join(name, pub);
+  });
 
   ctx.registerTool({
     name: 'dap_send',
