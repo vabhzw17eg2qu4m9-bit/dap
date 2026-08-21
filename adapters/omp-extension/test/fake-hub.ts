@@ -1,6 +1,5 @@
 import http from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { randomBytes, bytesToHex } from '@noble/hashes/utils';
 import { verifyFrame, agentIdFor, unb64, type KeyPair } from '../src/crypto.ts';
 
 /** Signature check that treats malformed input as a bad signature, never a crash. */
@@ -104,6 +103,11 @@ export class FakeHub {
     this.agents.get(agentId)?.ws?.close();
   }
 
+  /** Push an error frame to a connected agent (rejection-surfacing tests). */
+  sendError(agentId: string, code: string, msg: string): void {
+    this.agents.get(agentId)?.ws?.send(JSON.stringify({ op: 'error', code, msg }));
+  }
+
   /** Resolve once the hub has processed an agent's disconnect. */
   waitOffline(agentId: string): Promise<void> {
     if (this.agents.get(agentId)?.ws === undefined) return Promise.resolve();
@@ -165,7 +169,7 @@ export class FakeHub {
       lastSeen: Date.now(),
     });
     this.log.push('hello-verified:' + id);
-    ws.send(JSON.stringify({ op: 'welcome', agentId: id, resumeToken: bytesToHex(randomBytes(16)) }));
+    ws.send(JSON.stringify({ op: 'welcome', agentId: id }));
     return id;
   }
 

@@ -151,8 +151,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { deliverAs: 'steer', triggerTurn: true });
   };
 
-  client.onMessage = (frame) =>
-    decryptInbound(frame, cryptoCtx)
+  client.onMessage = (frame) =>    decryptInbound(frame, cryptoCtx)
       .then((payload) => {
         const invite = payload.dm ? parseChankeyInvite(payload.text) : undefined;
         if (invite) {
@@ -181,6 +180,24 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     for (const [name, pub] of Object.entries(cryptoCtx.channels)) client.join(name, pub);
   });
 
+  // Hub rejections (unknown_agent, access_denied, replay, …) must never be
+  // silent: the sending tool already returned ok (it only proves the frame
+  // was signed and put on the wire) — the verdict arrives here.
+  client.on('error', (f) => {
+    const code = typeof f === 'object' && f !== null && 'code' in f ? String(f.code) : 'error';
+    const msg = typeof f === 'object' && f !== null && 'msg' in f ? String(f.msg) : JSON.stringify(f);
+    ctx.appendEntry('io.dap.error', { code, msg });
+    ctx.sendMessage(`[dap] hub rejected a frame — ${code}: ${msg}`, {
+      deliverAs: 'steer',
+      triggerTurn: true,
+    });
+  });
+
+  /** Honest failure: never report ok for a frame that left nothing —
+   * sends while disconnected are dropped silently by the socket layer. */
+  const requireConnected = (): { ok: false; error: string } | undefined =>
+    client.connected ? undefined : { ok: false, error: 'not connected to the hub (reconnecting with backoff — retry in a moment)' };
+
   ctx.registerTool({
     name: 'dap_send',
     description: 'Send an end-to-end-encrypted message to a DAP channel.',
@@ -193,6 +210,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       required: ['channel', 'text'],
     },
     execute: async (_toolCallId, params) => {
+      const down = requireConnected();
+      if (down) return toolResult(down);
       const channel = str(params.channel);
       // Unknown channel -> zero-config keygen + persist + join (spec § join:
       // senders only need the channel public key).
@@ -216,6 +235,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       required: ['to', 'text'],
     },
     execute: async (_toolCallId, params) => {
+      const down = requireConnected();
+      if (down) return toolResult(down);
       const to = str(params.to);
       const frameId = crypto.randomUUID();
       const ciphertext = await encryptForDM(str(params.text), to, frameId, cryptoCtx);
@@ -236,6 +257,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       required: ['channel', 'to'],
     },
     execute: async (_toolCallId, params) => {
+      const down = requireConnected();
+      if (down) return toolResult(down);
       const channel = str(params.channel);
       const to = str(params.to);
       const keys = channelKeysFor(channel);
@@ -281,6 +304,10 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
 
+  const dispose = (): void => client.stop();
+  // Clean exit: closing the socket lets the hub deregister immediately
+  // (identity + mailbox survive for offline DMs).
+  ctx.on('session_shutdown', dispose);
   client.connect();
-  return { client, inbox, dispose: () => client.stop() };
+  return { client, inbox, dispose };
 }

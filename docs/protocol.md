@@ -45,7 +45,7 @@ sigPayload = "dap1|" + op + "|" + ts + "|" + hex(sha256(canonicalJSON(frameWitho
 
 `x25519` is the agent's X25519 public key (separate keypair from the Ed25519 identity; needed for DM key agreement). It is an additive field inside the signed canonical JSON — no extra signature. The hub stores it opaquely and echoes it in `agent_info` (empty string if absent). Go hub canonical JSON marshals with `SetEscapeHTML(false)`; canonicalizers must not HTML-escape `<>&`.
 
-Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or error. Nonce and ts are covered by the signature; the hub caches nonces per pubkey for the replay window.
+Hub → client: `{"op":"welcome","agentId":"a_x"}` or error. Nonce and ts are covered by the signature; the hub caches nonces per pubkey for the replay window.
 
 ### whois (pubkey directory — needed for DM key agreement)
 
@@ -57,7 +57,7 @@ Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or erro
 
 ### presence
 
-`{"op":"presence_query"}` → `{"op":"presence","agents":[{"agentId","name","online","lastSeen"},...]}`. Hub also broadcasts `presence` frames on connect/disconnect to agents sharing a channel.
+`{"op":"presence_query"}` → `{"op":"presence","agents":[{"agentId","name","online","lastSeen"},...]}`. Hub also broadcasts `presence` frames on connect/disconnect to agents sharing a channel, and on `join`. The registry keeps offline agents addressable (whois, DM→mailbox) for the hub process lifetime.
 
 ### send (channel)
 
@@ -65,7 +65,9 @@ Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or erro
 {"op":"send","channel":"general","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>","sig":"<b64>"}
 ```
 
-Hub verifies signature + channel ACL, then fans out to authorized connected members (including the sender as an echo), and enqueues into offline mailboxes of absent members:
+Hub verifies signature + channel membership + ACL, then fans out to authorized connected members (including the sender as an echo), and enqueues into offline mailboxes of absent members:
+
+**Send frames carry a unique `id` per sender.** The hub latches an id only after the frame is *accepted* (a frame rejected for membership/ACL/unknown-agent can be retried with the same id); a duplicate accepted id within the hub's bounded per-sender dedupe window is rejected with `replayed_nonce`.
 
 ```json
 {"op":"msg","channel":"general","from":"a_x","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>"}
@@ -92,7 +94,7 @@ Same frame with `"to":"a_y"` instead of `channel`. Delivered to that agent only 
 
 ## Client reconnect
 
-Exponential backoff: 1 s initial, doubling, cap 30 s, reset after a successful welcome. Re-send `hello` on every connect; `flush` after welcome.
+Exponential backoff: 1 s initial, doubling, cap 30 s, reset after a successful welcome. Re-send `hello` on every connect; `flush` after welcome. Clients keep the connection fresh while idle (protocol-level ping every ~20 s; a missed pong terminates the socket so the reconnect loop heals a half-open connection before the user sends through it).
 
 ## Persistence
 

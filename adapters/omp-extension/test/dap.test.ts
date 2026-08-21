@@ -115,7 +115,6 @@ test('hello handshake: signed hello -> welcome, key file created 0600', async ()
     const expectedId = agentIdFor(keys.pub);
     assert.equal(welcome.agentId, expectedId);
     assert.equal(ext.client.agentId, expectedId);
-    assert.ok(ext.client.resumeToken.length >= 16);
     assert.ok(hub.agents.has(expectedId), 'hub registered the agent');
     assert.ok(hub.log.includes('hello-verified:' + expectedId), 'hub verified the signature');
     assert.equal(fs.statSync(keyPath).mode & 0o777, 0o600, 'key file mode 0600');
@@ -527,5 +526,49 @@ test('idle agent: inbound wakes it via steer+triggerTurn; session_start notifies
     extA.dispose();
     extB.dispose();
     await hub.close();
+  }
+});
+
+test('hub error frames surface to the session — steer + durable entry, never silent', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'a' });
+  try {
+    await nextEvent(ext.client, 'welcome');
+    const rejected = nextEvent(ext.client, 'error');
+    hub.sendError(ext.client.agentId, 'unknown_agent', 'no such agent: deadbeef');
+    await rejected;
+    assert.ok(cap.sent.some((s) => s.msg.includes('unknown_agent')), 'steer mentions the code');
+    assert.deepEqual(
+      cap.sent.find((s) => s.msg.includes('unknown_agent'))!.opts,
+      { deliverAs: 'steer', triggerTurn: true },
+    );
+    assert.equal(cap.entries.at(-1)!.type, 'io.dap.error');
+  } finally {
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('tools fail honestly while disconnected: ok:false instead of a silent drop', async () => {
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, {
+    url: 'ws://127.0.0.1:9/ws', // nothing listens: connection down
+    keyPath: nextKeyPath(),
+    name: 'x',
+    channels: { general: 'A'.repeat(43) + '=' }, // explicit keys: no file writes
+    backoff: { initial: 60_000, max: 60_000 }, // no reconnect storm during the test
+  });
+  try {
+    const r = await run<{ ok: boolean; error: string }>(cap, 'dap_send', {
+      channel: 'general',
+      text: 'must not claim success',
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /not connected/);
+    const dm = await run<{ ok: boolean }>(cap, 'dap_dm', { to: 'deadbeef', text: 'x' });
+    assert.equal(dm.ok, false);
+  } finally {
+    ext.dispose();
   }
 });

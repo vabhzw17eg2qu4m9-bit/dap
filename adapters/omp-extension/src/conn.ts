@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { randomBytes, bytesToHex } from '@noble/hashes/utils';
 import { signFrame, agentIdFor, b64, type KeyPair } from './crypto.ts';
+import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog, type KeepAliveOptions } from './keepalive.ts';
 
 export interface Timers {
   setInterval: (fn: () => void, ms: number) => unknown;
@@ -36,7 +37,6 @@ export interface AgentInfo {
 
 export interface WelcomeInfo {
   agentId: string;
-  resumeToken: string;
 }
 
 export interface DapOptions {
@@ -45,6 +45,8 @@ export interface DapOptions {
   name?: string;
   backoff?: Partial<Backoff>;
   timers?: Timers;
+  /** Client keepalive: ping the hub while idle, terminate on missed pong. */
+  keepAlive?: Partial<KeepAliveOptions>;
 }
 
 type Listener = (value: unknown) => void;
@@ -59,13 +61,13 @@ export class DapClient {
   connected = false;
   helloCount = 0;
   welcomeCount = 0;
-  resumeToken = '';
   /** Delays handed to setInterval for each reconnect — spec-visible backoff. */
   readonly backoffSchedule: number[] = [];
   onMessage: ((frame: MsgFrame) => void | Promise<void>) | undefined;
 
   private readonly backoff: Backoff;
   private readonly timers: Timers;
+  private readonly watchdog: KeepAliveWatchdog;
   private ws: WebSocket | undefined;
   private delay: number;
   private timer: unknown;
@@ -84,6 +86,7 @@ export class DapClient {
         setInterval: (fn, ms) => setInterval(fn, ms),
         clearInterval: (h) => clearInterval(h as TimerHandle),
       };
+    this.watchdog = new KeepAliveWatchdog({ ...DEFAULT_KEEP_ALIVE, ...opts.keepAlive });
   }
 
   connect(): void {
@@ -92,13 +95,17 @@ export class DapClient {
     const ws = new WebSocket(this.opts.url);
     this.ws = ws;
     ws.on('error', () => {}); // 'close' always follows; schedule from there
-    ws.on('open', () => this.sendHello());
+    ws.on('open', () => {
+      this.watchdog.start(ws); // refresh while idle; terminate a dead conn
+      this.sendHello();
+    });
     ws.on('message', (data) => this.handleFrame(data.toString()));
     ws.on('close', () => this.onClose());
   }
 
   stop(): void {
     this.stopped = true;
+    this.watchdog.stop();
     if (this.timer !== undefined) this.timers.clearInterval(this.timer);
     this.timer = undefined;
     this.ws?.close();
@@ -235,13 +242,14 @@ export class DapClient {
   private onWelcome(welcome: WelcomeInfo & Record<string, unknown>): void {
     this.connected = true;
     this.welcomeCount++;
-    this.resumeToken = welcome.resumeToken;
+
     this.delay = this.backoff.initial; // backoff resets after a successful welcome
     this.send({ op: 'flush' }); // drain offline mailbox
     this.emit('welcome', welcome);
   }
 
   private onClose(): void {
+    this.watchdog.stop();
     const wasConnected = this.connected;
     this.connected = false;
     this.ws = undefined;
