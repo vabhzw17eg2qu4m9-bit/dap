@@ -130,11 +130,12 @@ if [ -f site/index.html ] && grep -qi 'distributed agents' site/index.html \
 # c16: site integrity — every local href/src in site HTML resolves
 [ "$site_links_rc" = 0 ] && R[c16_site_links]=pass || R[c16_site_links]=fail
 
-# c17: minimal-token inter-agent protocol — compact payload codec spec'd in protocol.md,
-# implemented+tested in mcp-bridge: round-trip equality, >=50% size cut, cross-agent comprehension
-if [ "$mcp_rc" = 0 ] && grep -qi 'compact' docs/protocol.md 2>/dev/null \
-  && grep -rqiE 'compact|minitok|codec' adapters/mcp-bridge/src adapters/mcp-bridge/tests 2>/dev/null \
-  && grep -rqiE '0\.5|reduction|smaller' adapters/mcp-bridge/tests 2>/dev/null; then
+# c17: self-developed agent language — agents negotiate a glossary at runtime (no fixed dictionary),
+# converse in it, understand each other; verified by mcp-bridge tests (comprehension + >=50% reduction)
+if [ "$mcp_rc" = 0 ] && grep -qi 'glossary' docs/protocol.md 2>/dev/null \
+  && grep -rqiE 'glossary|negotiat' adapters/mcp-bridge/src adapters/mcp-bridge/tests 2>/dev/null \
+  && grep -rqiE '0\.5|reduction|smaller' adapters/mcp-bridge/tests 2>/dev/null \
+  && ! grep -rqi 'DICTIONARY *=' adapters/mcp-bridge/src 2>/dev/null; then
   R[c17_min_token_protocol]=pass; else R[c17_min_token_protocol]=fail; fi
 
 # --- JSON output ---
