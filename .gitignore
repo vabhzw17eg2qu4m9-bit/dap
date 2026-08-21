@@ -7,3 +7,4 @@ profile-reports/
 .dart_tool/
 .iterations.jsonl.bak
 *.log
+hub/dap-hub
