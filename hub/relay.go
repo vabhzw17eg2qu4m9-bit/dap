@@ -10,16 +10,18 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
 const (
-	maxFrameBytes = 1 << 20
-	sendBuffer    = 512
-	writeTimeout  = 10 * time.Second
-	pingEvery     = 30 * time.Second
+	maxFrameBytes    = 1 << 20
+	sendBuffer       = 512
+	maxQueuedBytes   = 4 << 20 // per-client queued-bytes cap; overflow drops the conn
+	writeTimeout     = 10 * time.Second
+	pingEvery        = 30 * time.Second
 )
 
 // agentEntry is the durable identity record (survives disconnects).
@@ -36,8 +38,10 @@ type client struct {
 	h         *hub
 	conn      *websocket.Conn
 	send      chan []byte
+	rejectCh  chan []byte
 	closed    chan struct{}
 	closeOnce sync.Once
+	queued    atomic.Int64
 	authed    bool
 	agentID   string
 	pubkey    string
@@ -57,10 +61,12 @@ type hub struct {
 	mailbox        map[string][]frame
 	mailboxDropped map[string]bool
 	nonces         *nonceCache
+	sendIDs        *sendIDCache
 	handlers       map[string]handlerFunc
 	adminToken     string
 	storePath      string
 	log            *log.Logger
+	now            func() int64
 	pingEvery      time.Duration
 }
 
@@ -72,9 +78,11 @@ func newHub(adminToken, storePath string, logOut io.Writer) *hub {
 		mailbox:        map[string][]frame{},
 		mailboxDropped: map[string]bool{},
 		nonces:         newNonceCache(),
+		sendIDs:        newSendIDCache(),
 		adminToken:     adminToken,
 		storePath:      storePath,
 		log:            log.New(logOut, "", log.LstdFlags|log.Lmicroseconds),
+		now:            func() int64 { return time.Now().UnixMilli() },
 		pingEvery:      pingEvery,
 	}
 	h.handlers = map[string]handlerFunc{
@@ -95,7 +103,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(2 * maxFrameBytes) // hard DoS cap; protocol check below
-	cl := &client{h: h, conn: c, send: make(chan []byte, sendBuffer), closed: make(chan struct{})}
+	cl := &client{h: h, conn: c, send: make(chan []byte, sendBuffer), rejectCh: make(chan []byte, 1), closed: make(chan struct{})}
 	go h.writePump(cl)
 	h.readLoop(cl, r.Context())
 	h.deregister(cl)
@@ -146,12 +154,17 @@ func (h *hub) dispatch(cl *client, data []byte) {
 func (h *hub) writePump(c *client) {
 	ticker := time.NewTicker(h.pingEvery)
 	defer ticker.Stop()
+	defer c.drop() // every pump exit terminates the conn (reject depends on it)
 	for {
 		select {
 		case b := <-c.send:
 			if !c.write(b) {
 				return
 			}
+			c.queued.Add(int64(-len(b)))
+		case b := <-c.rejectCh:
+			c.write(b) // single-writer guarantee; best effort
+			c.drop()   // reject is always fatal
 		case <-ticker.C:
 			if !c.ping() {
 				return
@@ -190,10 +203,16 @@ func (c *client) sendFrame(f frame) bool {
 	if err != nil {
 		return false
 	}
+	if c.queued.Load()+int64(len(b)) > maxQueuedBytes {
+		c.drop() // slow consumer: shed it rather than buffer unbounded
+		return false
+	}
+	c.queued.Add(int64(len(b)))
 	select {
 	case c.send <- b:
 		return true
 	case <-c.closed:
+		c.queued.Add(int64(-len(b)))
 		return false
 	}
 }
@@ -229,7 +248,7 @@ func (h *hub) deregister(cl *client) {
 	delete(h.clients, cl.agentID)
 	e := h.agents[cl.agentID]
 	e.Online = false
-	e.LastSeen = nowMS()
+	e.LastSeen = h.now()
 	peers := h.presencePeersLocked(cl.agentID)
 	h.mu.Unlock()
 	h.sendPresence(peers, cl.agentID, e.Name, e.X25519, e.Pubkey, false)
@@ -247,11 +266,18 @@ func (h *hub) upsertAgentLocked(cl *client) *agentEntry {
 	e.X25519 = cl.x25519
 	e.Name = cl.name
 	e.Online = true
-	e.LastSeen = nowMS()
+	e.LastSeen = h.now()
 	return e
 }
 
 // lookupAgent returns a copy of the identity record, or nil.
+//
+// The registry is intentionally NOT pruned on lookup or by TTL: an offline
+// agent must stay addressable (whois, DM→mailbox) for as long as the hub
+// process lives. Memory is bounded by the number of distinct agents, not by
+// traffic (each mailbox is capped separately). Identity deletion is a v2
+// knob (persistence + explicit TTL), not something the delivery path does —
+// pruning on lookup silently dropped the first DM to a long-offline agent.
 func (h *hub) lookupAgent(agentID string) *agentEntry {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

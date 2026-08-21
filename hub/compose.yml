@@ -3,7 +3,7 @@ services:
     build: .
     image: dap-hub:latest
     ports:
-      - "8080:8080"
+      - "8787:8080"
     environment:
       HUB_ADMIN_TOKEN: ${HUB_ADMIN_TOKEN:?set HUB_ADMIN_TOKEN before starting}
       HUB_CHANNELS_FILE: /data/channels.json

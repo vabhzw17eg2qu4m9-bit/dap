@@ -34,28 +34,27 @@ type agentInfo struct {
 // marshaled from it; client→hub frames are parsed into it. Signature
 // verification always uses the raw map (see auth.go), never this struct.
 type frame struct {
-	Op          string      `json:"op"`
-	V           int         `json:"v,omitempty"`
-	Pubkey      string      `json:"pubkey,omitempty"`
-	X25519      string      `json:"x25519,omitempty"`
-	Name        string      `json:"name,omitempty"`
-	Nonce       string      `json:"nonce,omitempty"`
-	TS          int64       `json:"ts,omitempty"`
-	Sig         string      `json:"sig,omitempty"`
-	AgentID     string      `json:"agentId,omitempty"`
-	Online      *bool       `json:"online,omitempty"`
-	LastSeen    int64       `json:"lastSeen,omitempty"`
-	Channel     string      `json:"channel,omitempty"`
-	ChanPubkey  string      `json:"chanPubkey,omitempty"`
-	To          string      `json:"to,omitempty"`
-	From        string      `json:"from,omitempty"`
-	ID          string      `json:"id,omitempty"`
-	Ciphertext  string      `json:"ciphertext,omitempty"`
-	Count       int         `json:"count,omitempty"`
-	Agents      []agentInfo `json:"agents,omitempty"`
-	Code        string      `json:"code,omitempty"`
-	Msg         string      `json:"msg,omitempty"`
-	ResumeToken string      `json:"resumeToken,omitempty"`
+	Op         string      `json:"op"`
+	V          int         `json:"v,omitempty"`
+	Pubkey     string      `json:"pubkey,omitempty"`
+	X25519     string      `json:"x25519,omitempty"`
+	Name       string      `json:"name,omitempty"`
+	Nonce      string      `json:"nonce,omitempty"`
+	TS         int64       `json:"ts,omitempty"`
+	Sig        string      `json:"sig,omitempty"`
+	AgentID    string      `json:"agentId,omitempty"`
+	Online     *bool       `json:"online,omitempty"`
+	LastSeen   int64       `json:"lastSeen,omitempty"`
+	Channel    string      `json:"channel,omitempty"`
+	ChanPubkey string      `json:"chanPubkey,omitempty"`
+	To         string      `json:"to,omitempty"`
+	From       string      `json:"from,omitempty"`
+	ID         string      `json:"id,omitempty"`
+	Ciphertext string      `json:"ciphertext,omitempty"`
+	Count      int         `json:"count,omitempty"`
+	Agents     []agentInfo `json:"agents,omitempty"`
+	Code       string      `json:"code,omitempty"`
+	Msg        string      `json:"msg,omitempty"`
 }
 
 // protoError is an error carrying a spec error code.

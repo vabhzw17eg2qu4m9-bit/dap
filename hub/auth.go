@@ -4,9 +4,7 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -16,14 +14,13 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/coder/websocket"
 )
 
 const (
-	tsWindow    = 300_000 // ms, spec: ±300 s
-	replayKeep  = 2 * time.Minute
-	nonceMinLen = 16
+	tsWindow        = 300_000                                                // ms, spec: ±300 s
+	replayKeep      = time.Duration(tsWindow)*time.Millisecond + time.Minute // cover the full ts window
+	nonceSweepEvery = time.Minute
+	nonceMinLen     = 16
 )
 
 // constEq compares two strings in constant time (hash first so length
@@ -109,8 +106,9 @@ func tsFresh(ts int64) bool {
 
 // nonceCache remembers hello nonces per pubkey for the replay window.
 type nonceCache struct {
-	mu   sync.Mutex
-	seen map[string]map[string]time.Time // pubkey → nonce → expiry
+	mu        sync.Mutex
+	seen      map[string]map[string]time.Time // pubkey → nonce → expiry
+	lastSweep time.Time
 }
 
 func newNonceCache() *nonceCache {
@@ -135,7 +133,69 @@ func (n *nonceCache) check(pub, nonce string, now time.Time) bool {
 			delete(perPub, k)
 		}
 	}
+	if now.Sub(n.lastSweep) >= nonceSweepEvery {
+		n.sweepLocked(now)
+	}
 	return true
+}
+
+// sweepLocked drops expired nonces and pubkeys with no live nonces.
+func (n *nonceCache) sweepLocked(now time.Time) {
+	n.lastSweep = now
+	for pub, perPub := range n.seen {
+		for nonce, exp := range perPub {
+			if !now.Before(exp) {
+				delete(perPub, nonce)
+			}
+		}
+		if len(perPub) == 0 {
+			delete(n.seen, pub)
+		}
+	}
+}
+
+// sendIDCache is a bounded per-sender FIFO of ACCEPTED send-frame ids.
+// Membership (seen) never latches — ids latch only after the routing
+// decision succeeds, so a frame rejected for membership/ACL/unknown-agent
+// can be retried with the same id. The cap bounds memory against a
+// high-rate sender; the dedupe window is therefore "last sendIDCap accepted
+// sends", an approximation that is a safety net against client id reuse,
+// not a cryptographic guarantee.
+const sendIDCap = 4096
+
+type sendIDCache struct {
+	mu    sync.Mutex
+	ids   map[string][]string // pubkey → ring buffer of recent ids
+	next  map[string]int      // pubkey → next overwrite index (once full)
+}
+
+func newSendIDCache() *sendIDCache {
+	return &sendIDCache{ids: map[string][]string{}, next: map[string]int{}}
+}
+
+// seen reports whether pub already sent id (no side effects).
+func (s *sendIDCache) seen(pub, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.ids[pub] {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+// add latches id for pub, overwriting the oldest entry once the cap is hit.
+func (s *sendIDCache) add(pub, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ring := s.ids[pub]
+	if len(ring) < sendIDCap {
+		s.ids[pub] = append(ring, id)
+		return
+	}
+	ring[s.next[pub]] = id
+	s.next[pub] = (s.next[pub] + 1) % sendIDCap
 }
 
 // handleHello authenticates the first frame on a connection.
@@ -151,8 +211,8 @@ func (h *hub) handleHello(cl *client, f frame, raw map[string]any) {
 	h.welcome(cl, f)
 }
 
-// reject answers a failed hello synchronously (direct write, bypassing
-// the pump) so the error frame reaches the peer before the close.
+// reject answers a failed hello through the write pump (single writer);
+// the pump writes the frame, then drops the connection.
 func (h *hub) reject(cl *client, code, msg string) {
 	b, err := json.Marshal(frame{Op: "error", Code: code, Msg: msg})
 	if err != nil {
@@ -160,10 +220,13 @@ func (h *hub) reject(cl *client, code, msg string) {
 		return
 	}
 	h.log.Printf("conn=%s code=%s msg=%s", cl.agentID, code, msg)
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	defer cancel()
-	cl.conn.Write(ctx, websocket.MessageText, b)
-	cl.drop()
+	select {
+	case cl.rejectCh <- b:
+		// wait for the pump to write the frame and drop the conn, so
+		// the caller's deregister cannot close before the error lands
+		<-cl.closed
+	case <-cl.closed:
+	}
 }
 
 // checkHello runs the full auth gauntlet: signature, timestamp, nonce.
@@ -193,12 +256,5 @@ func (h *hub) welcome(cl *client, f frame) {
 	cl.name = f.Name
 	cl.authed = true
 	h.register(cl)
-	cl.sendFrame(frame{Op: "welcome", AgentID: cl.agentID, ResumeToken: newToken()})
-}
-
-// newToken returns a random hex resume token.
-func newToken() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	cl.sendFrame(frame{Op: "welcome", AgentID: cl.agentID})
 }

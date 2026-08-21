@@ -17,7 +17,7 @@ func (h *hub) handlePresenceQuery(cl *client, _ frame, _ map[string]any) {
 	cl.sendFrame(frame{Op: "presence", Agents: h.presenceList()})
 }
 
-// presenceList snapshots the agent registry.
+// presenceList snapshots the agent registry (no pruning — see lookupAgent).
 func (h *hub) presenceList() []agentInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -34,7 +34,7 @@ func (h *hub) sendPresence(peers []*client, agentID, name, x25519, pubkey string
 	if len(peers) == 0 {
 		return
 	}
-	info := agentInfo{AgentID: agentID, Name: name, X25519: x25519, Pubkey: pubkey, Online: online, LastSeen: nowMS()}
+	info := agentInfo{AgentID: agentID, Name: name, X25519: x25519, Pubkey: pubkey, Online: online, LastSeen: h.now()}
 	f := frame{Op: "presence", Agents: []agentInfo{info}}
 	for _, p := range peers {
 		p.sendFrame(f)

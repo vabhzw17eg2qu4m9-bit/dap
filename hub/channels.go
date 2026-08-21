@@ -3,6 +3,7 @@ package main
 // channels.go — channel registry, pubkey ACLs, message routing.
 // The hub stores and forwards ciphertext only.
 
+
 // channel is a chat channel. Pubkey is the channel public key (b64)
 // registered by the creator; members' clients hold the private key
 // out-of-band. Allowed is the ACL (empty = any authenticated agent).
@@ -44,15 +45,18 @@ func (h *hub) handleJoin(cl *client, f frame, _ map[string]any) {
 // member, enforcing the ACL.
 func (h *hub) joinChannel(cl *client, name, chanPub string) *protoError {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	ch := h.channels[name]
 	if ch == nil {
 		ch = h.newChannelLocked(name, chanPub)
 	}
 	if !ch.allows(cl.pubkey) {
+		h.mu.Unlock()
 		return &protoError{codeDenied, "pubkey not on channel ACL"}
 	}
 	ch.Members[cl.agentID] = true
+	peers := h.presencePeersLocked(cl.agentID)
+	h.mu.Unlock()
+	h.sendPresence(peers, cl.agentID, cl.name, cl.x25519, cl.pubkey, true)
 	return nil
 }
 
@@ -75,20 +79,37 @@ func (h *hub) handleSend(cl *client, f frame, raw map[string]any) {
 		h.sendErr(cl, codeStaleTS, "timestamp outside ±300s window")
 		return
 	}
-	if f.To != "" {
-		h.deliverDM(cl, f)
+	if f.ID == "" {
+		h.sendErr(cl, codeBadFrame, "send requires id")
 		return
 	}
-	h.deliverChannel(cl, f)
+	// Dedupe is latch-after-accept: a frame rejected for membership/ACL/
+	// unknown-agent must NOT burn its id — clients retry the same id after
+	// fixing the cause (joining, waiting for the peer), and ids are the
+	// idempotency mechanism. The per-sender send-id cache is bounded; a
+	// duplicate within the window is codeReplay.
+	key := f.To + "|" + f.Channel + "|" + f.ID
+	if h.sendIDs.seen(cl.pubkey, key) {
+		h.sendErr(cl, codeReplay, "frame id already used")
+		return
+	}
+	if f.To != "" {
+		if !h.deliverDM(cl, f) {
+			return
+		}
+	} else if !h.deliverChannel(cl, f) {
+		return
+	}
+	h.sendIDs.add(cl.pubkey, key)
 }
 
 // deliverChannel fans a channel message out to connected members and
-// enqueues it into offline members' mailboxes.
-func (h *hub) deliverChannel(cl *client, f frame) {
+// enqueues it into offline members' mailboxes. Returns false when rejected.
+func (h *hub) deliverChannel(cl *client, f frame) bool {
 	msg, online, offline, perr := h.channelTargets(cl, f)
 	if perr != nil {
 		h.sendErr(cl, perr.code, perr.msg)
-		return
+		return false
 	}
 	for _, c := range online {
 		c.sendFrame(msg)
@@ -96,6 +117,7 @@ func (h *hub) deliverChannel(cl *client, f frame) {
 	for _, agentID := range offline {
 		h.enqueue(agentID, msg)
 	}
+	return true
 }
 
 // channelTargets resolves recipients under h.mu.
@@ -105,6 +127,9 @@ func (h *hub) channelTargets(cl *client, f frame) (frame, []*client, []string, *
 	ch := h.channels[f.Channel]
 	if ch == nil {
 		return frame{}, nil, nil, &protoError{codeUnknownChannel, "no such channel: " + f.Channel}
+	}
+	if !ch.Members[cl.agentID] {
+		return frame{}, nil, nil, &protoError{codeDenied, "not a member: join the channel first"}
 	}
 	if !ch.allows(cl.pubkey) {
 		return frame{}, nil, nil, &protoError{codeDenied, "pubkey not on channel ACL"}
@@ -123,19 +148,20 @@ func (h *hub) channelTargets(cl *client, f frame) (frame, []*client, []string, *
 }
 
 // deliverDM hands a direct message to the recipient — or their mailbox.
-// The sender never receives an echo (spec).
-func (h *hub) deliverDM(cl *client, f frame) {
+// The sender never receives an echo (spec). Returns false when rejected.
+func (h *hub) deliverDM(cl *client, f frame) bool {
 	msg := frame{Op: "msg", To: f.To, From: cl.agentID, ID: f.ID, TS: f.TS, Ciphertext: f.Ciphertext}
 	if h.lookupAgent(f.To) == nil {
 		h.sendErr(cl, codeUnknownAgent, "no such agent: "+f.To)
-		return
+		return false
 	}
 	h.mu.RLock()
 	rec := h.clients[f.To]
 	h.mu.RUnlock()
 	if rec == nil {
 		h.enqueue(f.To, msg)
-		return
+		return true
 	}
 	rec.sendFrame(msg)
+	return true
 }

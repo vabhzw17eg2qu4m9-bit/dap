@@ -187,9 +187,6 @@ func connect(t *testing.T, srv *httptest.Server, a *testAgent) *websocket.Conn {
 	if w.AgentID != a.id {
 		t.Fatalf("welcome agentId %q, want %q", w.AgentID, a.id)
 	}
-	if w.ResumeToken == "" {
-		t.Fatal("welcome missing resumeToken")
-	}
 	return c
 }
 
