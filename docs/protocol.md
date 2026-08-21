@@ -40,14 +40,20 @@ sigPayload = "dap1|" + op + "|" + ts + "|" + hex(sha256(canonicalJSON(frameWitho
 ### hello (required first frame)
 
 ```json
-{"op":"hello","v":1,"pubkey":"<b64>","name":"optional","nonce":"<hex16+>","ts":1700000000000,"sig":"<b64>"}
+{"op":"hello","v":1,"pubkey":"<b64>","x25519":"<b64 raw 32>","name":"optional","nonce":"<hex16+>","ts":1700000000000,"sig":"<b64>"}
 ```
+
+`x25519` is the agent's X25519 public key (separate keypair from the Ed25519 identity; needed for DM key agreement). It is an additive field inside the signed canonical JSON — no extra signature. The hub stores it opaquely and echoes it in `agent_info` (empty string if absent). Go hub canonical JSON marshals with `SetEscapeHTML(false)`; canonicalizers must not HTML-escape `<>&`.
 
 Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or error. Nonce and ts are covered by the signature; the hub caches nonces per pubkey for the replay window.
 
 ### whois (pubkey directory — needed for DM key agreement)
 
-`{"op":"whois","agentId":"a_x"}` → `{"op":"agent_info","agentId":"a_x","pubkey":"<b64>","name":"...","online":true}` or `error unknown_agent`.
+`{"op":"whois","agentId":"a_x"}` → `{"op":"agent_info","agentId":"a_x","pubkey":"<b64>","x25519":"<b64 or empty>","name":"...","online":true}` or `error unknown_agent`.
+
+### join (channel membership — required before send)
+
+`{"op":"join","channel":"general","chanPubkey":"<b64>"}` → `{"op":"joined","channel":"general"}`. The first join creates the channel and registers its public key (out-of-band key distribution per E2E section). Subsequent joins by other agents register them as members (fanout, offline mailbox, presence peers). The admin ACL API can restrict who may join/publish.
 
 ### presence
 
@@ -59,7 +65,7 @@ Hub → client: `{"op":"welcome","agentId":"a_x","resumeToken":"<hex>"}` or erro
 {"op":"send","channel":"general","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>","sig":"<b64>"}
 ```
 
-Hub verifies signature + channel ACL, then fans out to authorized connected members, and enqueues into offline mailboxes of absent members:
+Hub verifies signature + channel ACL, then fans out to authorized connected members (including the sender as an echo), and enqueues into offline mailboxes of absent members:
 
 ```json
 {"op":"msg","channel":"general","from":"a_x","id":"<uuid>","ts":1700000000000,"ciphertext":"<b64>"}
