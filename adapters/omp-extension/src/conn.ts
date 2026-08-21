@@ -253,10 +253,15 @@ export class DapClient {
     if (this.timer !== undefined) return; // one pending attempt at a time
     const ms = this.delay;
     this.backoffSchedule.push(ms);
+    // A throw in a raw (unmanaged) timer callback kills the whole omp session — the body must never throw.
     this.timer = this.timers.setInterval(() => {
-      this.timers.clearInterval(this.timer);
-      this.timer = undefined;
-      this.connect();
+      try {
+        this.timers.clearInterval(this.timer);
+        this.timer = undefined;
+        this.connect();
+      } catch {
+        // swallowed: connect() errors surface via the ws 'close' path, which reschedules
+      }
     }, ms);
     this.delay = Math.min(this.delay * 2, this.backoff.max);
   }

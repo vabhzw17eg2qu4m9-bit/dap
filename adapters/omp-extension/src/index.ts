@@ -1,5 +1,5 @@
 import { loadOrCreateKeys, x25519, b64, unb64, type KeyPair } from './crypto.ts';
-import { DapClient, type Backoff, type Timers, type AgentInfo } from './conn.ts';
+import { DapClient, type Backoff, type Timers } from './conn.ts';
 import { Inbox, type InboxEntry } from './inbox.ts';
 import {
   encryptForChannel,
@@ -14,7 +14,7 @@ import {
   newChannelKeypair,
   type ChannelKeys,
 } from './channels.ts';
-import type { ExtensionAPI } from './types.ts';
+import type { AgentToolResult, ExtensionAPI } from './types.ts';
 
 export interface ExtensionOptions {
   /** Test/config overrides; otherwise env (DAP_HUB_URL / DAP_KEY_PATH /
@@ -40,19 +40,12 @@ const str = (v: unknown): string => {
   return v;
 };
 
-function resolveTimers(ctx: ExtensionAPI, overrides?: Timers): Timers {
-  if (overrides) return overrides;
-  if (typeof ctx.setInterval === 'function') {
-    return {
-      setInterval: (fn, ms) => ctx.setInterval!(fn, ms),
-      clearInterval: (h) => ctx.clearInterval?.(h),
-    };
-  }
-  return {
-    setInterval: (fn, ms) => setInterval(fn, ms),
-    clearInterval: (h) => clearInterval(h as NodeJS.Timeout),
-  };
-}
+/** Real omp pi has no timers: DapClient's own default is the raw-timer
+ *  fallback (with a throw-safe callback body — see conn.ts). */
+const toolResult = (result: unknown): AgentToolResult => ({
+  content: [{ type: 'text', text: JSON.stringify(result) }],
+  details: result,
+});
 
 /** Injection text: enough context for the steered turn to answer in-channel. */
 function formatEntry(entry: InboxEntry, peerName: string): string {
@@ -104,9 +97,18 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     keys,
     name: settings.name,
     backoff: overrides.backoff,
-    timers: resolveTimers(ctx, overrides.timers),
+    timers: overrides.timers,
   });
-  const inbox = new Inbox(100, (entry) => ctx.appendEntry(entry));
+  const agentId = client.agentId; // available synchronously — no await needed
+  ctx.setLabel('DAP — distributed agents');
+  // Visible load confirmation; runtime actions are only legal inside
+  // events/tools, and ui access is guarded by hasUI.
+  ctx.on('session_start', (_event, sctx) => {
+    if (sctx.hasUI && sctx.ui) {
+      sctx.ui.notify(`DAP connected as ${agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
+    }
+  });
+  const inbox = new Inbox(100, (entry) => ctx.appendEntry('io.dap.message', entry));
   // Explicit channel maps (tests) opt out of the channels-file lifecycle;
   // otherwise keys live in settings.channelsFile (default ~/.dap/channels.json).
   const useChannelFile = !(overrides.channels || overrides.channelPrivs);
@@ -146,7 +148,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     cryptoCtx.channelPrivs[invite.channel] = invite.priv;
     if (useChannelFile) persistChannelKeys(settings.channelsFile, invite.channel, invite);
     client.join(invite.channel, invite.pub);
-    ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { type: 'steer' });
+    ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { deliverAs: 'steer', triggerTurn: true });
   };
 
   client.onMessage = (frame) =>
@@ -165,11 +167,12 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
           dm: payload.dm,
           text: payload.text,
         });
-        // Steer injection: wakes an idle turn and steers the live one.
-        ctx.sendMessage(formatEntry(entry, frame.from), { type: 'steer' });
+        // Steer + triggerTurn: steers the live turn AND starts one when the
+        // agent is idle — without triggerTurn an idle agent shows nothing.
+        ctx.sendMessage(formatEntry(entry, frame.from), { deliverAs: 'steer', triggerTurn: true });
       })
       .catch((err: unknown) =>
-        ctx.appendEntry({ type: 'dap_undecryptable', id: frame.id, error: String(err) }),
+        ctx.appendEntry('io.dap.undecryptable', { type: 'dap_undecryptable', id: frame.id, error: String(err) }),
       );
 
   // Membership: join every configured channel after each welcome (idempotent;
@@ -189,15 +192,15 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       },
       required: ['channel', 'text'],
     },
-    execute: async (args) => {
-      const channel = str(args.channel);
+    execute: async (_toolCallId, params) => {
+      const channel = str(params.channel);
       // Unknown channel -> zero-config keygen + persist + join (spec § join:
       // senders only need the channel public key).
       if (!cryptoCtx.channels[channel]) cryptoCtx.channels[channel] = createChannel(channel).pub;
       const frameId = crypto.randomUUID();
-      const ciphertext = await encryptForChannel(str(args.text), channel, frameId, cryptoCtx);
+      const ciphertext = await encryptForChannel(str(params.text), channel, frameId, cryptoCtx);
       const ts = client.signedSend({ channel, id: frameId, ciphertext });
-      return { ok: true, channel, id: frameId, ts };
+      return toolResult({ ok: true, channel, id: frameId, ts });
     },
   });
 
@@ -212,12 +215,12 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       },
       required: ['to', 'text'],
     },
-    execute: async (args) => {
-      const to = str(args.to);
+    execute: async (_toolCallId, params) => {
+      const to = str(params.to);
       const frameId = crypto.randomUUID();
-      const ciphertext = await encryptForDM(str(args.text), to, frameId, cryptoCtx);
+      const ciphertext = await encryptForDM(str(params.text), to, frameId, cryptoCtx);
       const ts = client.signedSend({ to, id: frameId, ciphertext });
-      return { ok: true, to, id: frameId, ts };
+      return toolResult({ ok: true, to, id: frameId, ts });
     },
   });
 
@@ -232,15 +235,15 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       },
       required: ['channel', 'to'],
     },
-    execute: async (args) => {
-      const channel = str(args.channel);
-      const to = str(args.to);
+    execute: async (_toolCallId, params) => {
+      const channel = str(params.channel);
+      const to = str(params.to);
       const keys = channelKeysFor(channel);
       const frameId = crypto.randomUUID();
       const payload = JSON.stringify({ t: 'chankey', channel, pub: keys.pub, priv: keys.priv });
       const ciphertext = await encryptForDM(payload, to, frameId, cryptoCtx);
       const ts = client.signedSend({ to, id: frameId, ciphertext });
-      return { ok: true, channel, to, id: frameId, ts };
+      return toolResult({ ok: true, channel, to, id: frameId, ts });
     },
   });
 
@@ -254,13 +257,14 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
         channel: { type: 'string', description: 'Filter to one channel' },
       },
     },
-    execute: async (args) => ({
-      count: inbox.size,
-      entries: inbox.list(
-        typeof args.limit === 'number' ? args.limit : 20,
-        optStr(args.channel),
-      ),
-    }),
+    execute: async (_toolCallId, params) =>
+      toolResult({
+        count: inbox.size,
+        entries: inbox.list(
+          typeof params.limit === 'number' ? params.limit : 20,
+          optStr(params.channel),
+        ),
+      }),
   });
 
   ctx.registerTool({
@@ -271,9 +275,9 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       properties: { agentId: { type: 'string' } },
       required: ['agentId'],
     },
-    execute: async (args): Promise<AgentInfo | { error: string }> => {
-      const info = await client.whois(str(args.agentId));
-      return info ?? { error: 'unknown_agent' };
+    execute: async (_toolCallId, params) => {
+      const info = await client.whois(str(params.agentId));
+      return toolResult(info ?? { error: 'unknown_agent' });
     },
   });
 

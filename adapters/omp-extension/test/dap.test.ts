@@ -8,7 +8,7 @@ import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/
 import { resolveDapSettings } from '../src/config.ts';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.ts';
 import type { DapClient, MsgFrame, Timers } from '../src/conn.ts';
-import type { ExtensionAPI, ToolDefinition } from '../src/types.ts';
+import type { ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.ts';
 import { FakeHub } from './fake-hub.ts';
 
 const KEYDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-test-'));
@@ -38,20 +38,34 @@ function nextEvent<T>(client: DapClient, event: string): Promise<T> {
 interface Captured {
   ctx: ExtensionAPI;
   tools: Map<string, ToolDefinition>;
-  sent: { msg: string; opts: { type?: string } | undefined }[];
-  entries: unknown[];
+  sent: { msg: string; opts: SendMessageOptions | undefined }[];
+  entries: { type: string; data: unknown }[];
+  labels: string[];
+  fire(event: string, sctx: SessionCtx): void;
 }
 
+/** Fake ExtensionAPI matching the real omp surface exactly. */
 function fakeCtx(): Captured {
   const tools = new Map<string, ToolDefinition>();
   const sent: Captured['sent'] = [];
-  const entries: unknown[] = [];
+  const entries: Captured['entries'] = [];
+  const labels: string[] = [];
+  const handlers = new Map<string, (event: unknown, ctx: SessionCtx) => void | Promise<void>>();
   const ctx: ExtensionAPI = {
     registerTool: (tool) => void tools.set(tool.name, tool),
     sendMessage: (msg, opts) => void sent.push({ msg, opts }),
-    appendEntry: (entry) => void entries.push(entry),
+    appendEntry: (type, data) => void entries.push({ type, data }),
+    setLabel: (label) => void labels.push(label),
+    on: (event, handler) => void handlers.set(event, handler),
   };
-  return { ctx, tools, sent, entries };
+  return {
+    ctx,
+    tools,
+    sent,
+    entries,
+    labels,
+    fire: (event, sctx) => void handlers.get(event)?.(event, sctx),
+  };
 }
 
 /** Deterministic stand-in for setInterval: tests fire due callbacks manually. */
@@ -76,6 +90,13 @@ const tool = (c: Captured, name: string): ToolDefinition => {
   assert.ok(t, 'tool not registered: ' + name);
   return t;
 };
+
+/** Invoke a registered tool the way omp does: execute(toolCallId, params);
+ *  returns the details field of the AgentToolResult. */
+const run = async <T>(c: Captured, name: string, params: Record<string, unknown> = {}): Promise<T> =>
+  (await tool(c, name).execute('test-call-id', params)).details as T;
+
+const lastEntry = <T>(c: Captured): T => c.entries.at(-1)!.data as T;
 
 test('canonicalJSON: sorted keys, no whitespace, no HTML escaping (Go SetEscapeHTML(false) parity)', () => {
   assert.equal(canonicalJSON({ b: 1, a: [{ z: true, y: null }] }), '{"a":[{"y":null,"z":true}],"b":1}');
@@ -117,8 +138,8 @@ test('signed channel send accepted; E2E fan-out, hub sees ciphertext only', asyn
     const text = 'check ignition and may god’s love be with you';
 
     const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
-    const result = await tool(a, 'dap_send').execute({ channel: 'general', text });
-    assert.equal((result as { ok: boolean }).ok, true);
+    const result = await run<{ ok: boolean; id: string }>(a, 'dap_send', { channel: 'general', text });
+    assert.equal(result.ok, true);
     const raw = await inbound;
 
     assert.equal(hub.verifiedSends.length, 1, 'hub verified the Ed25519 send signature');
@@ -128,8 +149,10 @@ test('signed channel send accepted; E2E fan-out, hub sees ciphertext only', asyn
     assert.equal(b.sent.length, 1, 'inbound msg steered into the turn');
     assert.match(b.sent[0].msg, /#general/);
     assert.match(b.sent[0].msg, new RegExp(text));
-    assert.equal(b.sent[0].opts?.type, 'steer');
-    const entry = b.entries.at(-1) as { text: string; channel: string };
+    assert.equal(b.sent[0].opts?.deliverAs, 'steer');
+    assert.equal(b.sent[0].opts?.triggerTurn, true, 'triggerTurn wakes an idle agent');
+    assert.equal(b.entries.at(-1)!.type, 'io.dap.message', 'namespaced durable entry');
+    const entry = lastEntry<{ text: string; channel: string }>(b);
     assert.equal(entry.text, text);
     assert.equal(entry.channel, 'general');
   } finally {
@@ -149,19 +172,19 @@ test('DM decrypt round-trip between two client instances (both directions)', asy
     await nextEvent(extA.client, 'welcome');
     await nextEvent(extB.client, 'welcome');
 
-    const inboundB = nextEvent(extB.client, 'inbound');
-    await tool(a, 'dap_dm').execute({ to: extB.client.agentId, text: 'psst, ping' });
+    const inboundB = nextEvent<MsgFrame>(extB.client, 'inbound');
+    await run(a, 'dap_dm', { to: extB.client.agentId, text: 'psst, ping' });
     await inboundB;
     assert.equal(b.sent.length, 1);
     assert.match(b.sent[0].msg, /DM/);
     assert.match(b.sent[0].msg, /psst, ping/);
-    const dmEntry = b.entries.at(-1) as { dm: boolean; text: string };
+    const dmEntry = lastEntry<{ dm: boolean; text: string }>(b);
     assert.equal(dmEntry.dm, true);
     assert.equal(dmEntry.text, 'psst, ping');
     assert.equal(hub.verifiedSends[0]?.to, extB.client.agentId, 'DM delivered to the recipient only');
 
     const inboundA = nextEvent(extA.client, 'inbound');
-    await tool(b, 'dap_dm').execute({ to: extA.client.agentId, text: 'pong' });
+    await run(b, 'dap_dm', { to: extA.client.agentId, text: 'pong' });
     await inboundA;
     assert.match(a.sent[0].msg, /pong/);
   } finally {
@@ -265,8 +288,8 @@ test('offline mailbox: flush after welcome -> steer + durable inbox; inbox/whois
     b1.dispose();
     await hub.waitOffline(bId);
 
-    await tool(a, 'dap_dm').execute({ to: bId, text: 'while you were out (1)' });
-    await tool(a, 'dap_dm').execute({ to: bId, text: 'while you were out (2)' });
+    await run(a, 'dap_dm', { to: bId, text: 'while you were out (1)' });
+    await run(a, 'dap_dm', { to: bId, text: 'while you were out (2)' });
     await hub.waitVerifiedSends(2);
     assert.equal(hub.mailboxes.get(bId)?.length, 2);
     assert.ok(!JSON.stringify(hub.mailboxes).includes('while you were out'), 'mailbox holds ciphertext only');
@@ -282,10 +305,10 @@ test('offline mailbox: flush after welcome -> steer + durable inbox; inbox/whois
       assert.match(b2.sent[1].msg, /while you were out \(2\)/);
       assert.equal(b2.entries.length, 2, 'appendEntry persisted both');
 
-      const inbox = (await tool(b2, 'dap_inbox').execute({ limit: 10 })) as {
+      const inbox = await run<{
         count: number;
         entries: { text: string; dm: boolean; from: string }[];
-      };
+      }>(b2, 'dap_inbox', { limit: 10 });
       assert.equal(inbox.count, 2);
       assert.deepEqual(
         inbox.entries.map((e) => e.text),
@@ -294,11 +317,11 @@ test('offline mailbox: flush after welcome -> steer + durable inbox; inbox/whois
       );
       assert.ok(inbox.entries.every((e) => e.dm && e.from === extA.client.agentId));
 
-      const info = (await tool(b2, 'dap_whois').execute({ agentId: extA.client.agentId })) as {
+      const info = await run<{
         online: boolean;
         pubkey: string;
         x25519: string;
-      };
+      }>(b2, 'dap_whois', { agentId: extA.client.agentId });
       assert.equal(info.online, true);
       assert.equal(info.pubkey, b64(loadOrCreateKeys(aKeyPath).pub));
       assert.equal(info.x25519, b64(loadOrCreateKeys(aKeyPath).xpub), 'agent_info echoes the x25519 pub');
@@ -375,12 +398,12 @@ test('auto-keygen: send to an unknown channel persists keys; a second instance j
 
     // First-ever use of #general: keygen + persist + join, then the send works.
     const joinedGeneral = nextEvent<{ channel: string }>(extA.client, 'joined');
-    const result = await tool(a, 'dap_send').execute({ channel: 'general', text: 'zero config' });
-    assert.equal((result as { ok: boolean }).ok, true);
+    const result = await run<{ ok: boolean }>(a, 'dap_send', { channel: 'general', text: 'zero config' });
+    assert.equal(result.ok, true);
     assert.equal((await joinedGeneral).channel, 'general');
     // A second unknown channel: read-modify-write keeps the first one.
     const joinedRandom = nextEvent<{ channel: string }>(extA.client, 'joined');
-    await tool(a, 'dap_send').execute({ channel: 'random', text: 'still zero config' });
+    await run(a, 'dap_send', { channel: 'random', text: 'still zero config' });
     assert.equal((await joinedRandom).channel, 'random');
     const saved = loadChannelKeys(channelsFile);
     assert.deepEqual(Object.keys(saved), ['general', 'random']);
@@ -396,7 +419,7 @@ test('auto-keygen: send to an unknown channel persists keys; a second instance j
       assert.ok(hub.channelMembers.get('general')?.has(extB.client.agentId));
 
       const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
-      await tool(a, 'dap_send').execute({ channel: 'general', text: 'second message' });
+      await run(a, 'dap_send', { channel: 'general', text: 'second message' });
       await inbound;
       assert.equal(b.sent.length, 1, 'B decrypted the channel message');
       assert.match(b.sent[0].msg, /#general/);
@@ -426,8 +449,8 @@ test('invite: A auto-creates #general, dap_invite DMs the chankey to B; B joins 
 
     // dap_invite on a channel A doesn't hold yet: zero-config creation inlined.
     const joinedA = nextEvent<{ channel: string }>(extA.client, 'joined');
-    const invite = await tool(a, 'dap_invite').execute({ channel: 'general', to: extB.client.agentId });
-    assert.equal((invite as { ok: boolean }).ok, true);
+    const invite = await run<{ ok: boolean }>(a, 'dap_invite', { channel: 'general', to: extB.client.agentId });
+    assert.equal(invite.ok, true);
     assert.equal((await joinedA).channel, 'general', 'A created + joined #general');
     assert.ok(loadChannelKeys(fileA).general?.pub, 'creator keypair persisted');
     await nextEvent(extB.client, 'inbound'); // invite DM fully processed (deterministic)
@@ -438,7 +461,7 @@ test('invite: A auto-creates #general, dap_invite DMs the chankey to B; B joins 
       b.sent[0].msg.includes('[dap] invited to #general by ' + extA.client.agentId),
       'notice text: ' + b.sent[0].msg,
     );
-    assert.equal(b.sent[0].opts?.type, 'steer');
+    assert.equal(b.sent[0].opts?.deliverAs, 'steer');
     assert.equal(b.entries.length, 0, 'chankey DM is not chat: no inbox entry');
     assert.equal(
       loadChannelKeys(fileB).general?.pub,
@@ -452,10 +475,54 @@ test('invite: A auto-creates #general, dap_invite DMs the chankey to B; B joins 
     assert.ok(dmSend && !dmSend.ciphertext.includes('chankey'), 'hub never sees the invite plaintext');
 
     const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
-    await tool(a, 'dap_send').execute({ channel: 'general', text: 'welcome aboard' });
+    await run(a, 'dap_send', { channel: 'general', text: 'welcome aboard' });
     await inbound;
     assert.match(b.sent.at(-1)!.msg, /#general/);
     assert.match(b.sent.at(-1)!.msg, /welcome aboard/);
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('idle agent: inbound wakes it via steer+triggerTurn; session_start notifies when hasUI', async () => {
+  const hub = await new FakeHub().listen();
+  const chan = newChannelKeypair();
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channels: { general: chan.pub }, name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelPrivs: { general: chan.priv }, name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+
+    // Visible liveness: label set at load, notify on session_start when a UI exists.
+    assert.deepEqual(b.labels, ['DAP — distributed agents']);
+    const notifications: string[] = [];
+    const timers = { setInterval: (): number => 0, clearTimer: (): void => {} };
+    b.fire('session_start', {
+      ui: { notify: (text: string) => void notifications.push(text) },
+      hasUI: true,
+      isIdle: () => true,
+      ...timers,
+    });
+    assert.equal(notifications.length, 1);
+    assert.ok(
+      notifications[0] === `DAP connected as ${extB.client.agentId} (bob)`,
+      'notify text: ' + notifications[0],
+    );
+    // Headless session: the hasUI guard suppresses the notify, no crash.
+    b.fire('session_start', { hasUI: false, isIdle: () => false, ...timers });
+    assert.equal(notifications.length, 1);
+
+    // Inbound while idle: steer + triggerTurn — without it an idle agent shows nothing.
+    const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
+    await run(a, 'dap_send', { channel: 'general', text: 'wake up' });
+    await inbound;
+    assert.equal(b.sent.length, 1);
+    assert.deepEqual(b.sent[0].opts, { deliverAs: 'steer', triggerTurn: true });
+    assert.equal(b.entries.at(-1)!.type, 'io.dap.message');
   } finally {
     extA.dispose();
     extB.dispose();
