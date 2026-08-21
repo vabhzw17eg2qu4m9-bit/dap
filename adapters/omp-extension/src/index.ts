@@ -1,7 +1,4 @@
-import os from 'node:os';
-import path from 'node:path';
-import { readFileSync } from 'node:fs';
-import { loadOrCreateKeys, type KeyPair } from './crypto.ts';
+import { loadOrCreateKeys, x25519, b64, unb64, type KeyPair } from './crypto.ts';
 import { DapClient, type Backoff, type Timers, type AgentInfo } from './conn.ts';
 import { Inbox, type InboxEntry } from './inbox.ts';
 import {
@@ -10,33 +7,26 @@ import {
   decryptInbound,
   type PayloadCryptoContext,
 } from './codec.ts';
+import { resolveDapSettings, optStr } from './config.ts';
+import {
+  loadChannelKeys,
+  persistChannelKeys,
+  newChannelKeypair,
+  type ChannelKeys,
+} from './channels.ts';
 import type { ExtensionAPI } from './types.ts';
 
 export interface ExtensionOptions {
-  /** Test/config overrides; env DAP_HUB_URL / DAP_KEY_PATH / DAP_AGENT_NAME otherwise. */
+  /** Test/config overrides; otherwise env (DAP_HUB_URL / DAP_KEY_PATH /
+   *  DAP_AGENT_NAME / DAP_CHANNELS_FILE) > ~/.dap/config.json > defaults. */
   url?: string;
   keyPath?: string;
   name?: string;
+  channelsFile?: string;
   channels?: Record<string, string>;
   channelPrivs?: Record<string, string>;
   backoff?: Partial<Backoff>;
   timers?: Timers;
-}
-
-/** DAP_CHANNELS_FILE: JSON { "<channel>": { "pub": "<b64>", "priv": "<b64>" } }.
- * Members hold the channel private key (needed to decrypt); share the file
- * with every member. Only used when no override passed (omp loads with none). */
-function channelsFromEnv(): { channels: Record<string, string>; channelPrivs: Record<string, string> } {
-  const file = optStr(process.env.DAP_CHANNELS_FILE);
-  if (!file) return { channels: {}, channelPrivs: {} };
-  const raw: Record<string, { pub?: string; priv?: string }> = JSON.parse(readFileSync(file, 'utf8'));
-  const channels: Record<string, string> = {};
-  const channelPrivs: Record<string, string> = {};
-  for (const [name, keys] of Object.entries(raw)) {
-    if (keys.pub) channels[name] = keys.pub;
-    if (keys.priv) channelPrivs[name] = keys.priv;
-  }
-  return { channels, channelPrivs };
 }
 
 export interface DapExtension {
@@ -49,8 +39,6 @@ const str = (v: unknown): string => {
   if (typeof v !== 'string' || v.length === 0) throw new Error('expected non-empty string');
   return v;
 };
-
-const optStr = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
 
 function resolveTimers(ctx: ExtensionAPI, overrides?: Timers): Timers {
   if (overrides) return overrides;
@@ -72,33 +60,103 @@ function formatEntry(entry: InboxEntry, peerName: string): string {
   return `[dap] ${where} from ${peerName}: ${entry.text}`;
 }
 
+/** Channels file -> cryptoCtx maps (pub for sending, priv for decrypting). */
+function channelsFromFile(file: string): { channels: Record<string, string>; channelPrivs: Record<string, string> } {
+  const channels: Record<string, string> = {};
+  const channelPrivs: Record<string, string> = {};
+  for (const [name, keys] of Object.entries(loadChannelKeys(file))) {
+    channels[name] = keys.pub;
+    channelPrivs[name] = keys.priv;
+  }
+  return { channels, channelPrivs };
+}
+
+/** A DM whose decrypted text is exactly a channel-invite payload. */
+function parseChankeyInvite(text: string): { channel: string; pub: string; priv: string } | undefined {
+  if (text.charCodeAt(0) !== 0x7b) return undefined; // not JSON — regular chat
+  try {
+    const v = JSON.parse(text) as { t?: unknown; channel?: unknown; pub?: unknown; priv?: unknown };
+    if (v.t !== 'chankey') return undefined;
+    if (typeof v.channel !== 'string' || typeof v.pub !== 'string' || typeof v.priv !== 'string') {
+      return undefined;
+    }
+    if (unb64(v.pub).length !== 32 || unb64(v.priv).length !== 32) return undefined;
+    return { channel: v.channel, pub: v.pub, priv: v.priv };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * oh-my-pi DAP/1 extension. Default-export factory:
- * registers dap_send/dap_dm/dap_inbox/dap_whois tools, keeps one outbound WS
- * to the hub (signed hello, flush after welcome, setInterval reconnect),
- * and delivers inbound msg frames as steer injections + durable inbox entries.
+ * registers dap_send/dap_dm/dap_invite/dap_inbox/dap_whois tools, keeps one
+ * outbound WS to the hub (signed hello, flush after welcome, setInterval
+ * reconnect), and delivers inbound msg frames as steer injections + durable
+ * inbox entries. Channel keys auto-generate on first send and persist to
+ * ~/.dap/channels.json; invites travel as E2E DMs (see dap_invite).
  */
 export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOptions = {}): DapExtension {
-  const url = overrides.url ?? process.env.DAP_HUB_URL ?? 'ws://127.0.0.1:8787/ws';
-  const keyPath =
-    overrides.keyPath ?? process.env.DAP_KEY_PATH ?? path.join(os.homedir(), '.omp', 'dap-key.json');
-  const name = overrides.name ?? optStr(process.env.DAP_AGENT_NAME);
-  const keys: KeyPair = loadOrCreateKeys(keyPath);
+  const settings = resolveDapSettings(overrides);
+  const keys: KeyPair = loadOrCreateKeys(settings.keyPath);
 
-  const client = new DapClient({ url, keys, name, backoff: overrides.backoff, timers: resolveTimers(ctx, overrides.timers) });
+  const client = new DapClient({
+    url: settings.url,
+    keys,
+    name: settings.name,
+    backoff: overrides.backoff,
+    timers: resolveTimers(ctx, overrides.timers),
+  });
   const inbox = new Inbox(100, (entry) => ctx.appendEntry(entry));
-  const envChannels = overrides.channels || overrides.channelPrivs ? null : channelsFromEnv();
+  // Explicit channel maps (tests) opt out of the channels-file lifecycle;
+  // otherwise keys live in settings.channelsFile (default ~/.dap/channels.json).
+  const useChannelFile = !(overrides.channels || overrides.channelPrivs);
+  const fromFile = useChannelFile ? channelsFromFile(settings.channelsFile) : null;
   const cryptoCtx: PayloadCryptoContext = {
     keys,
     selfAgentId: client.agentId,
-    channels: overrides.channels ?? envChannels?.channels ?? {},
-    channelPrivs: overrides.channelPrivs ?? envChannels?.channelPrivs ?? {},
+    channels: overrides.channels ?? fromFile?.channels ?? {},
+    channelPrivs: overrides.channelPrivs ?? fromFile?.channelPrivs ?? {},
     peerXPub: async (agentId) => (await client.whois(agentId))?.x25519,
+  };
+
+  /** Zero-config channel creation: the first user generates the keypair,
+   *  persists it (read-modify-write, keeps other channels) and joins —
+   *  creating the channel. */
+  const createChannel = (channel: string): ChannelKeys => {
+    const created = newChannelKeypair();
+    cryptoCtx.channels[channel] = created.pub;
+    cryptoCtx.channelPrivs[channel] = created.priv;
+    if (useChannelFile) persistChannelKeys(settings.channelsFile, channel, created);
+    client.join(channel, created.pub);
+    return created;
+  };
+
+  /** Full keypair for inviting: create the channel zero-config when its
+   *  private key isn't held; derive pub from priv when only priv is known. */
+  const channelKeysFor = (channel: string): ChannelKeys => {
+    const priv = cryptoCtx.channelPrivs[channel];
+    if (!priv) return createChannel(channel);
+    return { pub: cryptoCtx.channels[channel] ?? b64(x25519.getPublicKey(unb64(priv))), priv };
+  };
+
+  // Trust model: possession of the channel private key IS v1 membership; the
+  // introducer is whoever DM'd you (same trust as manually sharing the file).
+  const acceptInvite = (invite: { channel: string; pub: string; priv: string }, from: string): void => {
+    cryptoCtx.channels[invite.channel] = invite.pub;
+    cryptoCtx.channelPrivs[invite.channel] = invite.priv;
+    if (useChannelFile) persistChannelKeys(settings.channelsFile, invite.channel, invite);
+    client.join(invite.channel, invite.pub);
+    ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { type: 'steer' });
   };
 
   client.onMessage = (frame) =>
     decryptInbound(frame, cryptoCtx)
       .then((payload) => {
+        const invite = payload.dm ? parseChankeyInvite(payload.text) : undefined;
+        if (invite) {
+          acceptInvite(invite, frame.from); // not chat: no inbox entry, just the notice
+          return;
+        }
         const entry = inbox.add({
           id: frame.id,
           ts: frame.ts,
@@ -133,6 +191,9 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
     execute: async (args) => {
       const channel = str(args.channel);
+      // Unknown channel -> zero-config keygen + persist + join (spec § join:
+      // senders only need the channel public key).
+      if (!cryptoCtx.channels[channel]) cryptoCtx.channels[channel] = createChannel(channel).pub;
       const frameId = crypto.randomUUID();
       const ciphertext = await encryptForChannel(str(args.text), channel, frameId, cryptoCtx);
       const ts = client.signedSend({ channel, id: frameId, ciphertext });
@@ -157,6 +218,29 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       const ciphertext = await encryptForDM(str(args.text), to, frameId, cryptoCtx);
       const ts = client.signedSend({ to, id: frameId, ciphertext });
       return { ok: true, to, id: frameId, ts };
+    },
+  });
+
+  ctx.registerTool({
+    name: 'dap_invite',
+    description: 'Invite another agent to a channel: DMs them the channel keypair (normal E2E DM encryption; the text payload happens to be JSON).',
+    parameters: {
+      type: 'object',
+      properties: {
+        channel: { type: 'string', description: 'Channel name, e.g. general' },
+        to: { type: 'string', description: 'Recipient agentId' },
+      },
+      required: ['channel', 'to'],
+    },
+    execute: async (args) => {
+      const channel = str(args.channel);
+      const to = str(args.to);
+      const keys = channelKeysFor(channel);
+      const frameId = crypto.randomUUID();
+      const payload = JSON.stringify({ t: 'chankey', channel, pub: keys.pub, priv: keys.priv });
+      const ciphertext = await encryptForDM(payload, to, frameId, cryptoCtx);
+      const ts = client.signedSend({ to, id: frameId, ciphertext });
+      return { ok: true, channel, to, id: frameId, ts };
     },
   });
 

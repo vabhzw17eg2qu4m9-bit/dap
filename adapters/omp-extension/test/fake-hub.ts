@@ -36,6 +36,8 @@ interface SendFrame {
  */
 export class FakeHub {
   readonly agents = new Map<string, HubAgent>();
+  /** channel -> member agentIds (spec § join). */
+  readonly channelMembers = new Map<string, Set<string>>();
   readonly mailboxes = new Map<string, Record<string, unknown>[]>();
   readonly verifiedSends: SendFrame[] = [];
   readonly rejected: { code: string; agentId?: string }[] = [];
@@ -126,6 +128,7 @@ export class FakeHub {
       return undefined;
     }
     if (frame.op === 'whois') return this.whois(ws, String(frame.agentId));
+    if (frame.op === 'join') return this.join(agentId, ws, frame);
     if (frame.op === 'presence_query') return this.presence(ws);
     if (frame.op === 'send') return this.send(agentId, ws, frame as unknown as SendFrame);
     if (frame.op === 'flush') return this.flush(ws, agentId);
@@ -164,6 +167,16 @@ export class FakeHub {
     this.log.push('hello-verified:' + id);
     ws.send(JSON.stringify({ op: 'welcome', agentId: id, resumeToken: bytesToHex(randomBytes(16)) }));
     return id;
+  }
+
+  private join(agentId: string, ws: WebSocket, frame: Record<string, unknown>): undefined {
+    const name = String(frame.channel);
+    const members = this.channelMembers.get(name) ?? new Set<string>();
+    members.add(agentId);
+    this.channelMembers.set(name, members);
+    this.log.push('join:' + name + ':' + agentId);
+    ws.send(JSON.stringify({ op: 'joined', channel: name })); // first join creates it
+    return undefined;
   }
 
   private whois(ws: WebSocket, agentId: string): undefined {

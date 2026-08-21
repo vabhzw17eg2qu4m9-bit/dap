@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { x25519 } from '@noble/curves/ed25519';
 import dapExtension from '../src/index.ts';
-import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys } from '../src/crypto.ts';
+import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.ts';
+import { resolveDapSettings } from '../src/config.ts';
+import { loadChannelKeys, newChannelKeypair } from '../src/channels.ts';
 import type { DapClient, MsgFrame, Timers } from '../src/conn.ts';
 import type { ExtensionAPI, ToolDefinition } from '../src/types.ts';
 import { FakeHub } from './fake-hub.ts';
@@ -14,7 +15,20 @@ const KEYDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-test-'));
 let keySeq = 0;
 const nextKeyPath = (): string => path.join(KEYDIR, 'key-' + ++keySeq + '.json');
 
-test.after(() => fs.rmSync(KEYDIR, { recursive: true, force: true }));
+// Determinism: pin HOME (defaults resolve under KEYDIR) and clear any DAP_*
+// env leaked in from the machine running the tests.
+process.env.HOME = KEYDIR;
+const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE'];
+const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
+for (const k of DAP_ENV_KEYS) delete process.env[k];
+
+test.after(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  fs.rmSync(KEYDIR, { recursive: true, force: true });
+});
 
 /** Wait for the next emission of `event` after this call — race-free. */
 function nextEvent<T>(client: DapClient, event: string): Promise<T> {
@@ -57,11 +71,6 @@ class ManualTimers {
   }
 }
 
-function channelKeypair(): { pub: string; priv: string } {
-  const priv = x25519.utils.randomPrivateKey();
-  return { pub: b64(x25519.getPublicKey(priv)), priv: b64(priv) };
-}
-
 const tool = (c: Captured, name: string): ToolDefinition => {
   const t = c.tools.get(name);
   assert.ok(t, 'tool not registered: ' + name);
@@ -97,7 +106,7 @@ test('hello handshake: signed hello -> welcome, key file created 0600', async ()
 
 test('signed channel send accepted; E2E fan-out, hub sees ciphertext only', async () => {
   const hub = await new FakeHub().listen();
-  const chan = channelKeypair();
+  const chan = newChannelKeypair();
   const a = fakeCtx();
   const b = fakeCtx();
   const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channels: { general: chan.pub } });
@@ -298,6 +307,156 @@ test('offline mailbox: flush after welcome -> steer + durable inbox; inbox/whois
     }
   } finally {
     extA.dispose();
+    await hub.close();
+  }
+});
+
+test('settings precedence: override > env > ~/.dap/config.json > defaults; channelsFile default ~/.dap/channels.json', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-cfg-'));
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // No config file, no env: plain defaults.
+    let s = resolveDapSettings();
+    assert.equal(s.url, 'ws://127.0.0.1:8787/ws');
+    assert.equal(s.keyPath, path.join(home, '.omp', 'dap-key.json'));
+    assert.equal(s.channelsFile, path.join(home, '.dap', 'channels.json'));
+    assert.equal(s.name, undefined);
+
+    // Config file fills every unset field.
+    fs.mkdirSync(path.join(home, '.dap'), { recursive: true });
+    const cfgFile = path.join(home, '.dap', 'config.json');
+    fs.writeFileSync(
+      cfgFile,
+      JSON.stringify({ url: 'ws://cfg:1/ws', name: 'cfg-agent', keyPath: '/cfg/key.json', channelsFile: '/cfg/channels.json' }),
+    );
+    s = resolveDapSettings();
+    assert.equal(s.url, 'ws://cfg:1/ws');
+    assert.equal(s.name, 'cfg-agent');
+    assert.equal(s.keyPath, '/cfg/key.json');
+    assert.equal(s.channelsFile, '/cfg/channels.json');
+
+    // Env beats the file; the file still beats the defaults.
+    process.env.DAP_HUB_URL = 'ws://env:2/ws';
+    process.env.DAP_CHANNELS_FILE = '/env/channels.json';
+    s = resolveDapSettings();
+    assert.equal(s.url, 'ws://env:2/ws');
+    assert.equal(s.channelsFile, '/env/channels.json');
+    assert.equal(s.keyPath, '/cfg/key.json', 'file beats default when env is silent');
+
+    // Explicit override beats env.
+    assert.equal(resolveDapSettings({ url: 'ws://ov:3/ws' }).url, 'ws://ov:3/ws');
+
+    // An invalid config file counts as absent.
+    fs.writeFileSync(cfgFile, '{not json');
+    delete process.env.DAP_HUB_URL;
+    delete process.env.DAP_CHANNELS_FILE;
+    s = resolveDapSettings();
+    assert.equal(s.url, 'ws://127.0.0.1:8787/ws');
+    assert.equal(s.channelsFile, path.join(home, '.dap', 'channels.json'));
+  } finally {
+    process.env.HOME = prevHome;
+    delete process.env.DAP_HUB_URL;
+    delete process.env.DAP_CHANNELS_FILE;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('auto-keygen: send to an unknown channel persists keys; a second instance joins and decrypts', async () => {
+  const hub = await new FakeHub().listen();
+  const channelsFile = path.join(KEYDIR, 'auto-keygen-' + ++keySeq + '.json');
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile });
+  try {
+    await nextEvent(extA.client, 'welcome');
+
+    // First-ever use of #general: keygen + persist + join, then the send works.
+    const joinedGeneral = nextEvent<{ channel: string }>(extA.client, 'joined');
+    const result = await tool(a, 'dap_send').execute({ channel: 'general', text: 'zero config' });
+    assert.equal((result as { ok: boolean }).ok, true);
+    assert.equal((await joinedGeneral).channel, 'general');
+    // A second unknown channel: read-modify-write keeps the first one.
+    const joinedRandom = nextEvent<{ channel: string }>(extA.client, 'joined');
+    await tool(a, 'dap_send').execute({ channel: 'random', text: 'still zero config' });
+    assert.equal((await joinedRandom).channel, 'random');
+    const saved = loadChannelKeys(channelsFile);
+    assert.deepEqual(Object.keys(saved), ['general', 'random']);
+    assert.equal(unb64(saved.general.pub).length, 32, 'x25519 public key persisted');
+    assert.equal(unb64(saved.general.priv).length, 32, 'x25519 private key persisted');
+    assert.ok(hub.channelMembers.get('general')?.has(extA.client.agentId), 'creator joined');
+
+    // Fresh factory, same channels file: picks the keys up with zero config.
+    const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile });
+    try {
+      await nextEvent(extB.client, 'welcome');
+      await nextEvent(extB.client, 'joined'); // auto-joined #general + #random from the file
+      assert.ok(hub.channelMembers.get('general')?.has(extB.client.agentId));
+
+      const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
+      await tool(a, 'dap_send').execute({ channel: 'general', text: 'second message' });
+      await inbound;
+      assert.equal(b.sent.length, 1, 'B decrypted the channel message');
+      assert.match(b.sent[0].msg, /#general/);
+      assert.match(b.sent[0].msg, /second message/);
+    } finally {
+      extB.dispose();
+    }
+  } finally {
+    extA.dispose();
+    await hub.close();
+  }
+});
+
+test('invite: A auto-creates #general, dap_invite DMs the chankey to B; B joins and decrypts later sends', async () => {
+  const hub = await new FakeHub().listen();
+  const fileA = path.join(KEYDIR, 'invite-a-' + ++keySeq + '.json');
+  const fileB = path.join(KEYDIR, 'invite-b-' + ++keySeq + '.json');
+  fs.writeFileSync(fileB, '{}'); // B literally starts with an empty channels file
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileB, name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    assert.equal(Object.keys(loadChannelKeys(fileB)).length, 0, 'B holds no channel keys yet');
+
+    // dap_invite on a channel A doesn't hold yet: zero-config creation inlined.
+    const joinedA = nextEvent<{ channel: string }>(extA.client, 'joined');
+    const invite = await tool(a, 'dap_invite').execute({ channel: 'general', to: extB.client.agentId });
+    assert.equal((invite as { ok: boolean }).ok, true);
+    assert.equal((await joinedA).channel, 'general', 'A created + joined #general');
+    assert.ok(loadChannelKeys(fileA).general?.pub, 'creator keypair persisted');
+    await nextEvent(extB.client, 'inbound'); // invite DM fully processed (deterministic)
+    await nextEvent(extB.client, 'joined');
+
+    assert.equal(b.sent.length, 1, 'one steer so far: the invite notice');
+    assert.ok(
+      b.sent[0].msg.includes('[dap] invited to #general by ' + extA.client.agentId),
+      'notice text: ' + b.sent[0].msg,
+    );
+    assert.equal(b.sent[0].opts?.type, 'steer');
+    assert.equal(b.entries.length, 0, 'chankey DM is not chat: no inbox entry');
+    assert.equal(
+      loadChannelKeys(fileB).general?.pub,
+      loadChannelKeys(fileA).general?.pub,
+      'B persisted the invited keypair',
+    );
+    assert.ok(hub.channelMembers.get('general')?.has(extB.client.agentId), 'B joined after the invite');
+
+    // The actual payload the hub routed was ciphertext-wrapped JSON over E2E DM.
+    const dmSend = hub.verifiedSends.find((f) => f.to === extB.client.agentId);
+    assert.ok(dmSend && !dmSend.ciphertext.includes('chankey'), 'hub never sees the invite plaintext');
+
+    const inbound = nextEvent<MsgFrame>(extB.client, 'inbound');
+    await tool(a, 'dap_send').execute({ channel: 'general', text: 'welcome aboard' });
+    await inbound;
+    assert.match(b.sent.at(-1)!.msg, /#general/);
+    assert.match(b.sent.at(-1)!.msg, /welcome aboard/);
+  } finally {
+    extA.dispose();
+    extB.dispose();
     await hub.close();
   }
 });
