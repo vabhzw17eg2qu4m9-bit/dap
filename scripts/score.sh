@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fitness function for GOAL.md. Score = count of passing criteria (max 17).
+# Fitness function for GOAL.md. Score = count of passing criteria (max 18).
 # Exit 0 ALWAYS: non-zero exit means this script broke, not that the repo is unhealthy.
 set -u
 cd "$(dirname "$0")/.."
@@ -138,8 +138,17 @@ if [ "$mcp_rc" = 0 ] && grep -qi 'glossary' docs/protocol.md 2>/dev/null \
   && ! grep -rqi 'DICTIONARY *=' adapters/mcp-bridge/src 2>/dev/null; then
   R[c17_min_token_protocol]=pass; else R[c17_min_token_protocol]=fail; fi
 
+# c18: zero-config onboarding — omp extension self-configures (identity from agent name,
+# auto channel keygen + persistence, channel keys distributed via E2E-DM invites);
+# an omp agent needs at most DAP_AGENT_NAME
+if [ "$omp_rc" = 0 ] && grep -rq 'dap_invite' adapters/omp-extension/src 2>/dev/null \
+  && grep -rq 'defaultKeyPath' adapters/omp-extension/src 2>/dev/null \
+  && grep -rqiE 'auto.?keygen|newChannelKeypair' adapters/omp-extension/src 2>/dev/null \
+  && grep -rqiE 'invite|auto.?keygen' adapters/omp-extension/test 2>/dev/null; then
+  R[c18_zero_config]=pass; else R[c18_zero_config]=fail; fi
+
 # --- JSON output ---
-ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links c17_min_token_protocol"
+ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links c17_min_token_protocol c18_zero_config"
 score=0
 parts=""
 for k in $ORDER; do
@@ -150,5 +159,5 @@ notes_json=""
 for n in "${NOTES[@]:-}"; do
   [ -n "$n" ] && notes_json="${notes_json:+$notes_json, }\"$n\""
 done
-echo "{\"score\": $score, \"max\": 17, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
+echo "{\"score\": $score, \"max\": 18, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
 exit 0

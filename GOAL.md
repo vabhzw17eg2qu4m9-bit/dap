@@ -9,12 +9,12 @@ A self-hosted Go hub where any agent harness on any server connects with an Ed25
 ./scripts/score.sh
 ```
 
-Outputs `{"score": N, "max": 17, "breakdown": {...}}`. Score = count of passing criteria.
+Outputs `{"score": N, "max": 18, "breakdown": {...}}`. Score = count of passing criteria.
 
 ### Metric Definition
 
 ```
-score = passing_criteria / 17
+score = passing_criteria / 18
 ```
 
 | # | Criterion | How it verifies |
@@ -36,20 +36,22 @@ score = passing_criteria / 17
 | c15 | **Public site content** | `site/index.html` presents the project: name + what it is, E2E encryption + adapters, quickstart |
 | c16 | **Public site integrity** | every local `href`/`src` in `site/**/*.html` resolves to an existing file |
 | c17 | **Self-developed agent language** | agents develop the language themselves at runtime: two agents negotiate a shared glossary (propose→ack, no human-fixed dictionary), then converse in it; mcp-bridge tests prove (1) comprehension — B expands A's compacted messages correctly using only what they negotiated, (2) ≥50% token/size reduction vs unnegotiated prose across the conversation, (3) round-trip fidelity of the negotiated glossary |
+| c18 | **Zero-config onboarding** | omp-extension suite green AND `dap_invite` in `src` AND name-derived default identity (`defaultKeyPath`) AND auto channel keygen in `src` AND invite/auto-keygen covered by tests — an omp agent needs at most `DAP_AGENT_NAME` |
 
 ### Metric Mutability
 
-- [x] **Locked** — The 17 criteria are the spec. `scripts/score.sh` and this table are non-editable.
+- [x] **Locked** — The criteria are the spec. `scripts/score.sh` and this table are non-editable.
   - Amendment 2026-08-21 by goal owner: c17 added — agents themselves develop a minimal-token language to communicate; max 16 → 17. (Supersedes first wording: a fixed human-authored codec is NOT the goal — the language must be negotiated by the agents at runtime.)
+  - Amendment 2026-08-21 (second) by goal owner: **c18 added — zero-config onboarding** (max 17 → 18). Post-completion testing showed v1 shipped the protocol layer raw: manual keygen one-liners, per-terminal env boilerplate, file-copy key distribution. Now required of the omp extension: identity file derived from agent name (`~/.dap/keys/<name|hostname>.key`, auto-created 0600), channel x25519 keypairs auto-generated and persisted on first send, channel membership distributed over E2E-DM invites (`dap_invite`, `{t:chankey}` payload), optional persisted config (`~/.dap/config.json`; precedence env > file > defaults). An agent must need at most `DAP_AGENT_NAME`. Verified live against the real hub (commits 0a9316d, 2ddeb02, 5f79aa9).
 
 ## Operating Mode
 
-- [x] **Converge** — Stop when all 17 criteria pass.
+- [x] **Converge** — Stop when all 18 criteria pass.
 
 ### Stopping Conditions
 
 Stop and report when ANY of:
-- All 17 criteria pass (score = 17)
+- All 18 criteria pass (score = 18)
 - 3 consecutive iterations with no criterion flipping pass
 - 25 iterations completed
 - A required toolchain or upstream repo becomes unavailable (report exactly what)
@@ -78,7 +80,7 @@ repeat:
   10. Continue
 ```
 
-Convergence steering: when ≥75% of criteria pass (≥13/17), stop adding optional surface and converge — remaining failures only.
+Convergence steering: when ≥75% of criteria pass (≥14/18), stop adding optional surface and converge — remaining failures only.
 
 Commit messages: `[S:N→N] cN-slug: what you did`
 
@@ -116,6 +118,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 | Action | Impact | How |
 |---|---|---|
 | omp extension | c9 | ExtensionAPI: `registerTool` (send/dm/inbox), inbound → `sendMessage` steer injection wakes idle turn, `ctx.setInterval` reconnect, `appendEntry` durable inbox state |
+| omp zero-config UX | c18 | `~/.dap/config.json` (env > file > defaults); identity `~/.dap/keys/<name|hostname>.key` auto 0600; channel keypair auto-keygen + persist on first send; `dap_invite` ships the channel key inside an E2E DM (`{t:chankey}`), recipient auto-persists + auto-joins |
 | fah hub client | c10 | Implement `MessagingRepository` over WSS + `FahPlugin`; `hub:` yaml config section; delivery via `Agent.externalSteeringSource`; add `cryptography` dep for ed25519 — shape as upstreamable PR to IstiN/flutter_agent_harness |
 | dsh plugin | c11 | Cordis `apply(ctx)`: `ctx.tools.register()` + inbound wake via `Agent.followup()`; package as `dsh.bundle` |
 
@@ -166,11 +169,11 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 
 ```
 Starting score: 1/16
-Ending score:   NN/17
+Ending score:   NN/18
 Iterations:     N
 Criteria met:   (list of passing)
 Remaining gaps: (list of failing with blockers)
 Next actions:   (what a human or future agent should do next)
 ```
 
-Anti-premature-completion: complete only when score = 17 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.
+Anti-premature-completion: complete only when score = 18 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.
