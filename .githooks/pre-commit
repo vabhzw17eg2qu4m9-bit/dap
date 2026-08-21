@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Quality gate: crap4go CRAP check on hub Go code. Activate once: git config core.hooksPath .githooks
+# Hard max CRAP 12 (target 8). Blocks commit on exit 2 from crap4go.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+staged_go=$(git diff --cached --name-only --diff-filter=ACM -- 'hub/*.go' 'hub/**/*.go' || true)
+if [ -z "$staged_go" ]; then
+  exit 0
+fi
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "warning: go toolchain not found; skipping crap4go pre-commit check" >&2
+  exit 0
+fi
+
+BIN=bin/crap4go
+SRC=.tools/crap4go
+if [ ! -x "$BIN" ]; then
+  mkdir -p bin .tools
+  [ -d "$SRC/.git" ] || git clone --depth 1 https://github.com/vabhzw17eg2qu4m9-bit/crap4go "$SRC"
+  (cd "$SRC" && go build -o "$OLDPWD/$BIN" .)
+fi
+
+set +e
+(cd hub && "../$BIN" --run-tests --threshold 12 .)
+status=$?
+set -e
+
+if [ "$status" -eq 2 ]; then
+  echo "commit blocked: hub max CRAP exceeds 12 (target 8). Refactor or add tests." >&2
+  exit 1
+fi
+exit 0
