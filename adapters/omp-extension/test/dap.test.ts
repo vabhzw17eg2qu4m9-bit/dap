@@ -316,10 +316,12 @@ test('settings precedence: override > env > ~/.dap/config.json > defaults; chann
   const prevHome = process.env.HOME;
   process.env.HOME = home;
   try {
-    // No config file, no env: plain defaults.
+    // No config file, no env: plain defaults. Identity file is derived from
+    // the agent name (hostname when unnamed) — two agents on one machine
+    // never collide, and it is auto-generated on first use.
     let s = resolveDapSettings();
     assert.equal(s.url, 'ws://127.0.0.1:8787/ws');
-    assert.equal(s.keyPath, path.join(home, '.omp', 'dap-key.json'));
+    assert.equal(s.keyPath, path.join(home, '.dap', 'keys', `${os.hostname()}.key`));
     assert.equal(s.channelsFile, path.join(home, '.dap', 'channels.json'));
     assert.equal(s.name, undefined);
 

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { dirname } from 'node:path';
 import { ed25519, x25519 } from '@noble/curves/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
 import { hkdf } from '@noble/hashes/hkdf';
@@ -80,6 +81,7 @@ export function loadOrCreateKeys(path: string): KeyPair {
   };
   keys.pub = ed25519.getPublicKey(keys.priv);
   keys.xpub = x25519.getPublicKey(keys.xpriv);
+  fs.mkdirSync(dirname(path), { recursive: true }); // e.g. ~/.dap/keys/
   fs.writeFileSync(path, JSON.stringify({
     priv: b64(keys.priv),
     pub: b64(keys.pub),
