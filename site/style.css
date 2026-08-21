@@ -1,0 +1,104 @@
+/* DAP site — plain CSS, no framework, no build step */
+
+:root {
+  --bg: #0b0e14;
+  --surface: #131922;
+  --surface-2: #0f141d;
+  --border: #243044;
+  --text: #e8eef5;
+  --muted: #97a5b6;
+  --accent: #53d49a;
+  --accent-dim: rgba(83, 212, 154, 0.12);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+main { max-width: 60rem; margin: 0 auto; padding: 0 1.5rem 4rem; }
+
+/* Hero */
+.hero { padding: 5.5rem 0 3.5rem; border-bottom: 1px solid var(--border); }
+.hero .kicker {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.9rem;
+}
+.hero h1 { font-size: clamp(2.1rem, 5vw, 3.2rem); line-height: 1.15; margin: 0 0 1.1rem; }
+.hero p.lede { font-size: 1.13rem; color: var(--muted); max-width: 46rem; margin: 0; }
+.hero p.lede strong { color: var(--text); font-weight: 600; }
+
+/* Sections */
+section { padding: 3.2rem 0; border-bottom: 1px solid var(--border); }
+section:last-of-type { border-bottom: none; }
+h2 { font-size: 1.45rem; margin: 0 0 1.4rem; }
+h2 .num { font-family: var(--mono); color: var(--accent); font-size: 1rem; margin-right: 0.6rem; }
+section p.note { color: var(--muted); max-width: 46rem; }
+
+/* Feature cards */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.2rem 1.3rem;
+}
+.card h3 { margin: 0 0 0.5rem; font-size: 1.02rem; }
+.card p { margin: 0; color: var(--muted); font-size: 0.93rem; }
+.card code { font-family: var(--mono); font-size: 0.84em; color: var(--accent); background: var(--accent-dim); padding: 0.1em 0.4em; border-radius: 4px; }
+
+/* Adapter matrix */
+table { width: 100%; border-collapse: collapse; font-size: 0.94rem; }
+th, td { text-align: left; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-family: var(--mono); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+td.harness { font-weight: 600; white-space: nowrap; }
+td.harness span.x { font-family: var(--mono); color: var(--accent); margin-right: 0.45rem; }
+td.method { white-space: nowrap; }
+td.method span {
+  font-family: var(--mono); font-size: 0.78rem; padding: 0.18em 0.55em; border-radius: 99px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+td.method span.native { color: var(--accent); border-color: rgba(83, 212, 154, 0.4); background: var(--accent-dim); }
+tbody tr:last-child td { border-bottom: none; }
+
+/* Quickstart */
+.step { margin-bottom: 2rem; }
+.step .steplabel { font-family: var(--mono); color: var(--accent); font-size: 0.85rem; margin-bottom: 0.5rem; }
+.codeblock { position: relative; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.codeblock button.copy {
+  position: absolute; top: 0.55rem; right: 0.55rem;
+  font: 600 0.72rem/1 var(--mono);
+  color: var(--muted); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 0.38rem 0.65rem; cursor: pointer;
+}
+.codeblock button.copy:hover { color: var(--text); border-color: var(--accent); }
+.codeblock pre { margin: 0; padding: 1.1rem 1.2rem; overflow-x: auto; }
+.codeblock code { font-family: var(--mono); font-size: 0.86rem; line-height: 1.6; color: #c9d7e5; }
+
+/* Footer */
+footer { border-top: 1px solid var(--border); color: var(--muted); font-size: 0.88rem; }
+footer .inner { max-width: 60rem; margin: 0 auto; padding: 2rem 1.5rem; }
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+a.ext { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(83, 212, 154, 0.35); }
+a.ext:hover { border-bottom-color: var(--accent); }
+
+@media (max-width: 40rem) {
+  td.harness, td.method { white-space: normal; }
+  .hero { padding: 3.5rem 0 2.5rem; }
+}
