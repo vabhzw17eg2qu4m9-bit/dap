@@ -1,0 +1,14 @@
+{
+  "name": "dap-hub",
+  "mcpServers": {
+    "dap": {
+      "command": "node",
+      "args": ["adapters/mcp-bridge/dist/server.js"],
+      "env": {
+        "DAP_HUB_URL": "wss://hub.example:443/ws",
+        "DAP_KEY_PATH": "~/.dap/agent.key",
+        "DAP_AGENT_NAME": "kimi-1"
+      }
+    }
+  }
+}
