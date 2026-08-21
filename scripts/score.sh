@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fitness function for GOAL.md. Score = count of passing criteria (max 14).
+# Fitness function for GOAL.md. Score = count of passing criteria (max 16).
 # Exit 0 ALWAYS: non-zero exit means this script broke, not that the repo is unhealthy.
 set -u
 cd "$(dirname "$0")/.."
@@ -45,6 +45,19 @@ if [ "$DART_OK" = 1 ] && [ -f adapters/fah-hub-client/pubspec.yaml ]; then
   (cd adapters/fah-hub-client && timeout 180 dart test >/dev/null 2>&1); fah_rc=$?
 else
   [ "$DART_OK" = 0 ] && NOTES+=("dart toolchain missing")
+fi
+
+# site link integrity: every local href/src in site/**/*.html resolves to a file
+site_links_rc=1
+if [ -f site/index.html ]; then
+  site_links_rc=0
+  while IFS= read -r link; do
+    case "$link" in
+      http://*|https://*|mailto:*|//*) continue ;;
+    esac
+    [ -e "site/$link" ] || site_links_rc=1
+  done < <(grep -rhoE '(href|src)="[^"#]*"' site --include='*.html' 2>/dev/null \
+           | sed -E 's/^(href|src)="([^"]*)"/\2/' | sort -u)
 fi
 
 # --- criteria ---
@@ -107,8 +120,18 @@ if [ -f docs/research.md ] && grep -qi 'kimi-code' docs/research.md && grep -qi 
   && grep -qi 'opencode' docs/research.md; then
   R[c14_research_doc]=pass; else R[c14_research_doc]=fail; fi
 
+# c15: public presentation site — content complete (what it is, features, adapters, quickstart)
+if [ -f site/index.html ] && grep -qi 'distributed agents' site/index.html \
+  && grep -qiE 'end-to-end|e2e' site/index.html \
+  && grep -qiE 'adapter|mcp|omp' site/index.html \
+  && grep -qiE 'quickstart|getting started' site/index.html; then
+  R[c15_site_content]=pass; else R[c15_site_content]=fail; fi
+
+# c16: site integrity — every local href/src in site HTML resolves
+[ "$site_links_rc" = 0 ] && R[c16_site_links]=pass || R[c16_site_links]=fail
+
 # --- JSON output ---
-ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc"
+ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links"
 score=0
 parts=""
 for k in $ORDER; do
@@ -119,5 +142,5 @@ notes_json=""
 for n in "${NOTES[@]:-}"; do
   [ -n "$n" ] && notes_json="${notes_json:+$notes_json, }\"$n\""
 done
-echo "{\"score\": $score, \"max\": 14, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
+echo "{\"score\": $score, \"max\": 16, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
 exit 0

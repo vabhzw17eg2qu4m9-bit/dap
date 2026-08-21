@@ -59,6 +59,7 @@ Go 1.22+ stdlib `net/http` + single dep `github.com/coder/websocket`. REST JSON 
 4. Presence registry + offline mailbox (bounded; omp IrcBus caps at 100 — precedent), one-conn-per-agent eviction, capped-backoff reconnect.
 5. Adapters: `adapters/mcp-bridge` (TS, universal), `adapters/omp-extension`, `adapters/fah-hub-client` (Dart, PR to IstiN/flutter_agent_harness), `adapters/dsh-plugin` (TS Cordis bundle).
 6. **Quality gate**: [crap4go](https://github.com/vabhzw17eg2qu4m9-bit/crap4go) (CRAP = CC²·(1−cov)³+CC, stdlib-only Go port of crap4java) on all hub Go code — pre-commit hook, hard max CRAP **12**, target 8. Module is bare `crap4go` (not `go install`-able remotely) → clone + `go build`.
+7. **Public site**: `site/` — static presentation page about the project (vision, E2E features, adapter matrix, quickstart). No framework, no build step; any static host serves it.
 
 ## Sources
 

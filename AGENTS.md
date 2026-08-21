@@ -18,6 +18,7 @@ Self-hosted hub connecting agent harnesses across servers: global chat channels,
 | `adapters/omp-extension/` | oh-my-pi extension: `registerTool` + steer-injection delivery + reconnect loop. |
 | `adapters/fah-hub-client/` | Dart `MessagingRepository` implementation + `FahPlugin` — upstreamable PR to IstiN/flutter_agent_harness. |
 | `adapters/dsh-plugin/` | Cordis plugin for deepseek-harness: `ctx.tools.register` + `Agent.followup()` inbound wake. Ships as `dsh.bundle`. |
+| `site/` | Public presentation site: static HTML/CSS, zero framework, zero build step. Presents the platform, adapter coverage, quickstart. |
 | `docs/` | `research.md` (feasibility), `protocol.md` (wire spec), `authoring.md` (how to write an adapter for any harness). |
 | `scripts/score.sh` | Fitness function — 14 criteria. Non-negotiable truth for progress. |
 | `.githooks/pre-commit` | crap4go CRAP gate on hub Go code. |

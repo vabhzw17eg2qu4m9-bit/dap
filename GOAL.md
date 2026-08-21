@@ -1,6 +1,6 @@
-# Goal: distributed agents platform — self-hosted hub + 4 harness adapters
+# Goal: distributed agents platform — self-hosted hub + 4 harness adapters + public site
 
-A self-hosted Go hub where any agent harness on any server connects with an Ed25519 identity, joins global chat channels, sends end-to-end-encrypted direct messages, and cooperates on distributed tasks — plus working hub-client adapters for pi/omp, kimi-code (and 7 more CLIs via one MCP bridge), flutter_agent_harness, and deepseek-harness, and the documented flow for writing new adapters. Nobody ships this today (A2A/ACP cover request-response task interop, not pubkey-ACL'd persistent chat; see `docs/research.md`).
+A self-hosted Go hub where any agent harness on any server connects with an Ed25519 identity, joins global chat channels, sends end-to-end-encrypted direct messages, and cooperates on distributed tasks — plus working hub-client adapters for pi/omp, kimi-code (and 7 more CLIs via one MCP bridge), flutter_agent_harness, and deepseek-harness, the documented flow for writing new adapters, and a public presentation site for the project. Nobody ships this today (A2A/ACP cover request-response task interop, not pubkey-ACL'd persistent chat; see `docs/research.md`).
 
 ## Fitness Function
 
@@ -9,12 +9,12 @@ A self-hosted Go hub where any agent harness on any server connects with an Ed25
 ./scripts/score.sh
 ```
 
-Outputs `{"score": N, "max": 14, "breakdown": {...}}`. Score = count of passing criteria.
+Outputs `{"score": N, "max": 16, "breakdown": {...}}`. Score = count of passing criteria.
 
 ### Metric Definition
 
 ```
-score = passing_criteria / 14
+score = passing_criteria / 16
 ```
 
 | # | Criterion | How it verifies |
@@ -33,19 +33,21 @@ score = passing_criteria / 14
 | c12 | **Authoring guide** | `docs/authoring.md` covers omp, MCP, fah, dsh paths + envelope contract |
 | c13 | **Protocol spec** | `docs/protocol.md` covers ed25519, x25519, channel, DM |
 | c14 | **Research list** | `docs/research.md` feasibility matrix present |
+| c15 | **Public site content** | `site/index.html` presents the project: name + what it is, E2E encryption + adapters, quickstart |
+| c16 | **Public site integrity** | every local `href`/`src` in `site/**/*.html` resolves to an existing file |
 
 ### Metric Mutability
 
-- [x] **Locked** — The 14 criteria are the spec. `scripts/score.sh` and this table are non-editable.
+- [x] **Locked** — The 16 criteria are the spec. `scripts/score.sh` and this table are non-editable.
 
 ## Operating Mode
 
-- [x] **Converge** — Stop when all 14 criteria pass.
+- [x] **Converge** — Stop when all 16 criteria pass.
 
 ### Stopping Conditions
 
 Stop and report when ANY of:
-- All 14 criteria pass (score = 14)
+- All 16 criteria pass (score = 16)
 - 3 consecutive iterations with no criterion flipping pass
 - 25 iterations completed
 - A required toolchain or upstream repo becomes unavailable (report exactly what)
@@ -74,7 +76,7 @@ repeat:
   10. Continue
 ```
 
-Convergence steering: when ≥75% of criteria pass (≥11/14), stop adding optional surface and converge — remaining failures only.
+Convergence steering: when ≥75% of criteria pass (≥12/16), stop adding optional surface and converge — remaining failures only.
 
 Commit messages: `[S:N→N] cN-slug: what you did`
 
@@ -121,6 +123,13 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 | Protocol spec | c13 | `docs/protocol.md`: envelope schema, signing canonicalization, X25519 key derivation, channel/DM wire ops, presence/reconnect semantics |
 | Authoring guide | c12 | `docs/authoring.md`: envelope contract + per-harness walkthroughs (omp, MCP-universal, fah, dsh) + "new harness in 5 steps" |
 
+### Public site (c15, c16)
+
+| Action | Impact | How |
+|---|---|---|
+| Presentation page | c15 | `site/index.html` (+ plain CSS, zero framework, zero build step): what the platform is, E2E-encrypted channels/DM, pubkey ACLs, adapter coverage matrix (omp, MCP bridge/kimi-code +7, fah, dsh), quickstart (`docker compose up` + connect snippet) |
+| Site integrity | c16 | All local `href`/`src` point at files in `site/` (score.sh checks); deploy = any static host / GitHub Pages, no pipeline |
+
 ## Constraints
 
 1. **Hub cannot read payloads** — E2E by construction; a test proves no plaintext exists in hub stores/logs. Never weaken.
@@ -130,6 +139,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 5. **Deterministic offline tests** — no network beyond localhost; no sleeps as synchronization.
 6. **Locked scoring** — `scripts/score.sh`, criteria table, and this file's metric definition are non-editable.
 7. **One WS per agent** — new connection evicts old; constant-time key compares on auth paths.
+8. **Site is static and honest** — no framework, no build step; claims only what passing criteria already prove.
 
 ## File Map
 
@@ -140,6 +150,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 | `adapters/omp-extension/**` | omp extension | Yes |
 | `adapters/fah-hub-client/**` | flutter_agent_harness client (PR source) | Yes |
 | `adapters/dsh-plugin/**` | deepseek-harness Cordis plugin | Yes |
+| `site/**` | Public presentation site (static) | Yes |
 | `docs/research.md` | Feasibility study (done) | No — historical record |
 | `docs/protocol.md`, `docs/authoring.md` | Spec + guide deliverables | Yes |
 | `scripts/score.sh` | Fitness function | **No** |
@@ -150,12 +161,12 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 ## When to Stop
 
 ```
-Starting score: 1/14
-Ending score:   NN/14
+Starting score: 1/16
+Ending score:   NN/16
 Iterations:     N
 Criteria met:   (list of passing)
 Remaining gaps: (list of failing with blockers)
 Next actions:   (what a human or future agent should do next)
 ```
 
-Anti-premature-completion: complete only when score = 14 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.
+Anti-premature-completion: complete only when score = 16 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.
