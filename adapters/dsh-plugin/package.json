@@ -1,0 +1,25 @@
+{
+  "name": "dsh-dap-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "deepseek-harness (Cordis) plugin for the Distributed Agents Platform (DAP/1)",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/dsh.bundle",
+    "test": "node --import tsx tests/run.test.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "1.3.0",
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.10",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.27.3",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}
