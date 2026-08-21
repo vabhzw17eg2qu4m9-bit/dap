@@ -74,7 +74,7 @@ export class FakeHub {
       this.send({ op: 'error', code: 'bad_frame', msg: 'nonce' });
       return;
     }
-    this.send({ op: 'welcome', agentId: this.pluginAgentId, resumeToken: 'ab'.repeat(16) });
+    this.send({ op: 'welcome', agentId: this.pluginAgentId });
   }
 
   private onWhois(frame: dap.Frame): void {

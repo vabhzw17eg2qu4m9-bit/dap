@@ -44,8 +44,26 @@ export default {
       const where = m.dm ? 'dm' : m.channel;
       ctx.agent?.followup(`[dap:${where}] ${m.from}: ${m.text}`);
     };
-    const client = new DapClient({ url, keyPath, name, channels: config.channels, backoff: config.backoff, onMessage: announce });
+    // Hub rejections (unknown_agent, access_denied, replay, …) must never be
+    // silent: the sending tool already returned — the verdict arrives here.
+    const client = new DapClient({
+      url,
+      keyPath,
+      name,
+      channels: config.channels,
+      backoff: config.backoff,
+      onMessage: announce,
+      onHubError: (e) => {
+        ctx.logger?.warn(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
+        ctx.agent?.followup(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
+      },
+    });
     client.start();
+
+    /** Honest failure: never report ok for a frame that went nowhere —
+     *  sends while disconnected never reach the wire. */
+    const requireConnected = (): { ok: false; error: string } | undefined =>
+      client.connected ? undefined : { ok: false, error: 'not connected to the hub (reconnecting with backoff — retry in a moment)' };
 
     ctx.tools.register({
       name: 'dap_send',
@@ -55,7 +73,11 @@ export default {
         properties: { channel: { type: 'string' }, text: { type: 'string' } },
         required: ['channel', 'text'],
       },
-      execute: (a) => client.send(S(a.channel), S(a.text)),
+      execute: async (a) => {
+        const down = requireConnected();
+        if (down) return down;
+        return client.send(S(a.channel), S(a.text));
+      },
     });
     ctx.tools.register({
       name: 'dap_dm',
@@ -65,13 +87,17 @@ export default {
         properties: { to: { type: 'string' }, text: { type: 'string' } },
         required: ['to', 'text'],
       },
-      execute: (a) => client.dm(S(a.to), S(a.text)),
+      execute: async (a) => {
+        const down = requireConnected();
+        if (down) return down;
+        return client.dm(S(a.to), S(a.text));
+      },
     });
     ctx.tools.register({
       name: 'dap_inbox',
-      description: 'List the most recent decrypted DAP messages (channel + DM)',
+      description: 'List the most recent decrypted DAP messages (channel + DM) plus recent hub error frames',
       inputSchema: { type: 'object', properties: {} },
-      execute: async () => client.inbox(),
+      execute: async () => ({ messages: client.inbox(), errors: client.drainErrors() }),
     });
     ctx.tools.register({
       name: 'dap_whois',

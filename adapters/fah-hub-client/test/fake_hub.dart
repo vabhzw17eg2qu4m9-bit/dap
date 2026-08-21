@@ -41,6 +41,13 @@ class FakeHub {
     if (ws != null) await ws.close();
   }
 
+  /// Pushes a raw hub `error` frame to an agent's live connection
+  /// (error-surfacing tests).
+  void pushError(String agentId, String code, String msg) {
+    final ws = _conns[agentId];
+    if (ws != null) _reply(ws, {'op': 'error', 'code': code, 'msg': msg});
+  }
+
   Stream<String> get hellos => _helloEvents.stream;
 
   Future<void> start() async {
@@ -137,7 +144,6 @@ class FakeHub {
     _reply(ws, {
       'op': 'welcome',
       'agentId': agentId,
-      'resumeToken': 'deadbeef',
     });
     return agentId;
   }

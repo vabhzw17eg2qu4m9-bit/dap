@@ -10,6 +10,7 @@
 /// ```
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import '../fah/messaging.dart';
@@ -31,6 +32,7 @@ class HubPlugin implements FahPlugin {
   HubClient? _client;
   HubMessagingRepository? _repository;
   HubIdentity? _identity;
+  StreamSubscription<HubError>? _errorSub;
 
   @override
   String get name => 'hub';
@@ -57,6 +59,10 @@ class HubPlugin implements FahPlugin {
     }
     _identity = identity ?? await HubIdentity.load(_config.keyPath!);
     _client = HubClient(config: _config, identity: _identity!);
+    // Hub rejections must never be silent: print them to the host terminal.
+    _errorSub = _client!.errors.listen(
+      (e) => _io?.writeln('[hub] hub rejected a frame — ${e.code}: ${e.msg}'),
+    );
     _repository = HubMessagingRepository(_client!);
     await _repository!.start();
     _io?.writeln('[hub] connected as ${_client!.agentId}');
@@ -82,6 +88,7 @@ class HubPlugin implements FahPlugin {
   String? get agentId => _client?.agentId;
 
   Future<void> dispose() async {
+    await _errorSub?.cancel();
     await _repository?.dispose();
     _repository = null;
     _client = null;

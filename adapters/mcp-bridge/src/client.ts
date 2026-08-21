@@ -10,6 +10,14 @@ import { homedir } from 'node:os';
 import { randomUUID, randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 import * as dap from './crypto.js';
+import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog } from './keepalive.js';
+
+/** A hub `error` frame observed on the wire (unknown_agent, access_denied, …). */
+export interface HubErrorEvent {
+  code: string;
+  msg: string;
+  ts: number;
+}
 
 export interface ChannelKey {
   /** Channel name; the channel x25519 public key (hub stores this one). */
@@ -53,6 +61,8 @@ export interface ClientOpts {
   name?: string;
   channels?: ChannelKey[];
   backoff?: { initialMs?: number; maxMs?: number };
+  /** Fired for every hub `error` frame (surfacing hook — see drainErrors). */
+  onHubError?: (e: HubErrorEvent) => void;
 }
 
 interface PeerInfo extends WhoisInfo {
@@ -67,7 +77,9 @@ interface Identity {
 }
 
 const INBOX_CAP = 100;
+const ERRORS_CAP = 20;
 const WAIT_MS = 5000;
+const NOT_CONNECTED = 'not connected to the hub (reconnecting with backoff — retry in a moment)';
 
 function loadIdentity(keyPath: string): Identity {
   if (existsSync(keyPath)) {
@@ -92,6 +104,8 @@ export class DapClient {
   lastError = '';
   private readonly id: Identity;
   private readonly opts: ClientOpts;
+  private readonly watchdog: KeepAliveWatchdog;
+  private readonly errorRing: HubErrorEvent[] = [];
   private readonly channels = new Map<string, ChannelKey>();
   private readonly joined = new Set<string>();
   private readonly inboxMsgs: MsgEvent[] = [];
@@ -116,6 +130,12 @@ export class DapClient {
     this.initialMs = opts.backoff?.initialMs ?? 1000;
     this.maxMs = opts.backoff?.maxMs ?? 30_000;
     this.delay = this.initialMs;
+    this.watchdog = new KeepAliveWatchdog(DEFAULT_KEEP_ALIVE);
+  }
+
+  /** True while the welcome handshake is done on an open socket. */
+  get connected(): boolean {
+    return this.welcomed && this.ws?.readyState === WebSocket.OPEN;
   }
 
   /** Observe every decrypted inbound message (raw plaintext string). */
@@ -131,6 +151,7 @@ export class DapClient {
 
   stop(): void {
     this.stopped = true;
+    this.watchdog.stop();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     this.ws?.close();
@@ -197,6 +218,7 @@ export class DapClient {
 
   /** Send an E2E-encrypted message to a channel (creates it on first use). */
   async send(channel: string, text: string): Promise<SendResult> {
+    if (!this.connected) throw new Error(NOT_CONNECTED);
     const ch = await this.ensureChannel(channel);
     await this.ready();
     const id = randomUUID();
@@ -214,6 +236,7 @@ export class DapClient {
 
   /** Direct message: whois the peer first, then ECDH with their x25519 key. */
   async dm(to: string, text: string): Promise<SendResult> {
+    if (!this.connected) throw new Error(NOT_CONNECTED);
     const info = await this.agentInfo(to);
     if (!info.xPub.length) throw new Error(`agent ${to} has no x25519 key`);
     await this.ready();
@@ -239,6 +262,11 @@ export class DapClient {
     return this.inboxMsgs.splice(0);
   }
 
+  /** Drain observed hub `error` frames (surfaced via `dap_inbox` too). */
+  drainErrors(): HubErrorEvent[] {
+    return this.errorRing.splice(0);
+  }
+
   // --- internals ---
 
   private sendFrame(frame: dap.Frame): void {
@@ -254,7 +282,10 @@ export class DapClient {
   private connect(): void {
     if (this.stopped) return;
     this.ws = new WebSocket(this.opts.url);
-    this.ws.on('open', () => this.sendHello());
+    this.ws.on('open', () => {
+      this.watchdog.start(this.ws!); // refresh while idle; terminate a dead conn
+      this.sendHello();
+    });
     this.ws.on('message', (data) => this.handleRaw(String(data)));
     this.ws.on('close', () => this.onDisconnect());
     this.ws.on('error', (err) => { this.lastError = String(err); }); // close always follows
@@ -308,6 +339,11 @@ export class DapClient {
 
   private onError(frame: dap.Frame): void {
     this.lastError = `hub error ${frame.code}: ${frame.msg}`;
+    // Never silent: keep a bounded ring (drained by dap_inbox) and fire the hook.
+    const event: HubErrorEvent = { code: String(frame.code), msg: String(frame.msg), ts: Date.now() };
+    this.errorRing.push(event);
+    if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
+    this.opts.onHubError?.(event);
     if (frame.code === 'unknown_channel' || frame.code === 'access_denied') {
       const err = new Error(this.lastError);
       for (const done of this.joinWaiters.get(String(frame.channel)) ?? []) done(err);
@@ -320,6 +356,7 @@ export class DapClient {
   }
 
   private onDisconnect(): void {
+    this.watchdog.stop();
     this.welcomed = false;
     if (this.stopped) return;
     const wait = this.delay;

@@ -59,11 +59,11 @@ export function buildServer(dap: DapClient): McpServer {
 
   server.registerTool('dap_inbox', {
     title: 'DAP inbox drain',
-    description: 'Drain decrypted inbound messages (channel + DM) received since the last call; returns raw payload strings.',
+    description: 'Drain decrypted inbound messages (channel + DM) received since the last call, plus any hub error frames observed since then; returns raw payload strings.',
     inputSchema: {},
   }, () => run(async () => {
     const messages: MsgEvent[] = dap.drainInbox();
-    return { count: messages.length, messages };
+    return { count: messages.length, messages, errors: dap.drainErrors() };
   }));
 
   server.registerTool('dap_whois', {
@@ -84,6 +84,7 @@ async function main(): Promise<void> {
     keyPath: env.DAP_KEY_PATH ?? defaultKeyPath(),
     name: env.DAP_AGENT_NAME,
     channels: parseChannels(env.DAP_CHANNELS),
+    onHubError: (e) => console.error(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`),
   });
   if (env.DAP_HUB_URL) dap.start();
 

@@ -72,11 +72,19 @@ class HubClient {
     required this.config,
     required this.identity,
     Duration Function(int attempt)? backoff,
+    this.pingInterval = const Duration(seconds: 20),
   }) : backoff = backoff ?? HubClient.defaultBackoff;
 
   final HubConfig config;
   final HubIdentity identity;
   final Duration Function(int attempt) backoff;
+
+  /// Client keepalive interval. Native mechanism: dart:io WebSocket
+  /// auto-pings the hub every [pingInterval] and closes the socket when the
+  /// pong does not come back in time — which drops us into the reconnect
+  /// loop below (re-hello → flush → hold) before a user send buffers into a
+  /// half-open corpse. Null disables it.
+  final Duration? pingInterval;
 
   WebSocket? _ws;
   StreamSubscription? _subscription;
@@ -92,9 +100,18 @@ class HubClient {
   final _whoisCache = <String, AgentInfo>{};
 
   final _inbound = StreamController<InboundMessage>.broadcast();
+  final _errors = StreamController<HubError>.broadcast();
 
   /// All inbound `msg` frames, oldest first.
   Stream<InboundMessage> get inbound => _inbound.stream;
+
+  /// Every hub `error` frame received (unknown_agent, access_denied, …).
+  /// Hub rejections must never be silent — listeners surface them.
+  Stream<HubError> get errors => _errors.stream;
+
+  /// True while a welcome was received on a currently open socket.
+  bool get connected =>
+      _ws != null && _ws!.readyState == WebSocket.open && _firstWelcome.isCompleted;
 
   /// Completes with our agent id after the first welcome.
   Future<String> get welcomed => _firstWelcome.future;
@@ -159,6 +176,7 @@ class HubClient {
       return false;
     }
     _ws = ws;
+    ws.pingInterval = pingInterval; // native liveness watchdog (see field doc)
     final welcomed = Completer<bool>();
     final done = Completer<void>();
     _welcomeCompleter = welcomed;
@@ -210,6 +228,7 @@ class HubClient {
       _firstWelcome.completeError(StateError('disconnected'));
     }
     await _inbound.close();
+    await _errors.close();
   }
 
   // ---- outbound ----
@@ -287,7 +306,12 @@ class HubClient {
     if (cached != null) return cached;
     final completer = Completer<AgentInfo>();
     _pendingWhois[targetAgentId] = completer;
-    _send({'op': 'whois', 'agentId': targetAgentId});
+    try {
+      _send({'op': 'whois', 'agentId': targetAgentId});
+    } on Object {
+      _pendingWhois.remove(targetAgentId); // never answered — don't leak it
+      rethrow;
+    }
     final info = await completer.future;
     _whoisCache[targetAgentId] = info;
     return info;
@@ -309,7 +333,14 @@ class HubClient {
     return completer.future.then((_) => _presenceResult ?? const []);
   }
 
-  void _send(Map<String, dynamic> frame) => _ws?.add(jsonEncode(frame));
+  void _send(Map<String, dynamic> frame) {
+    final ws = _ws;
+    if (ws == null || ws.readyState != WebSocket.open) {
+      throw StateError(
+          'not connected to the hub (reconnecting with backoff — retry in a moment)');
+    }
+    ws.add(jsonEncode(frame));
+  }
 
   // ---- inbound ----
 
@@ -346,6 +377,7 @@ class HubClient {
       frame['code'] as String? ?? 'unknown',
       frame['msg'] as String? ?? '',
     );
+    if (!_errors.isClosed) _errors.add(error); // never silent
     final welcome = _welcomeCompleter;
     if (welcome != null && !welcome.isCompleted) {
       _welcomeCompleter = null;
