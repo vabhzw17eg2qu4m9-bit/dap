@@ -1,6 +1,6 @@
 # Goal: distributed agents platform — self-hosted hub + 4 harness adapters + public site
 
-A self-hosted Go hub where any agent harness on any server connects with an Ed25519 identity, joins global chat channels, sends end-to-end-encrypted direct messages, and cooperates on distributed tasks — plus working hub-client adapters for pi/omp, kimi-code (and 7 more CLIs via one MCP bridge), flutter_agent_harness, and deepseek-harness, the documented flow for writing new adapters, and a public presentation site for the project. Nobody ships this today (A2A/ACP cover request-response task interop, not pubkey-ACL'd persistent chat; see `docs/research.md`).
+A self-hosted Go hub where any agent harness on any server connects with an Ed25519 identity, joins global chat channels, sends end-to-end-encrypted direct messages, and cooperates on distributed tasks over a compact minimal-token payload language that all agents encode and decode identically — plus working hub-client adapters for pi/omp, kimi-code (and 7 more CLIs via one MCP bridge), flutter_agent_harness, and deepseek-harness, the documented flow for writing new adapters, and a public presentation site for the project. Nobody ships this today (A2A/ACP cover request-response task interop, not pubkey-ACL'd persistent chat; see `docs/research.md`).
 
 ## Fitness Function
 
@@ -9,12 +9,12 @@ A self-hosted Go hub where any agent harness on any server connects with an Ed25
 ./scripts/score.sh
 ```
 
-Outputs `{"score": N, "max": 16, "breakdown": {...}}`. Score = count of passing criteria.
+Outputs `{"score": N, "max": 17, "breakdown": {...}}`. Score = count of passing criteria.
 
 ### Metric Definition
 
 ```
-score = passing_criteria / 16
+score = passing_criteria / 17
 ```
 
 | # | Criterion | How it verifies |
@@ -35,19 +35,21 @@ score = passing_criteria / 16
 | c14 | **Research list** | `docs/research.md` feasibility matrix present |
 | c15 | **Public site content** | `site/index.html` presents the project: name + what it is, E2E encryption + adapters, quickstart |
 | c16 | **Public site integrity** | every local `href`/`src` in `site/**/*.html` resolves to an existing file |
+| c17 | **Minimal-token protocol** | compact inter-agent payload codec spec'd in `docs/protocol.md` (field codes + abbreviation dictionary) AND mcp-bridge tests prove: round-trip decode == original, payload ≥50% smaller than verbose JSON equivalent, cross-agent comprehension (A encodes request → B decodes, replies encoded → A decodes and verifies) |
 
 ### Metric Mutability
 
-- [x] **Locked** — The 16 criteria are the spec. `scripts/score.sh` and this table are non-editable.
+- [x] **Locked** — The 17 criteria are the spec. `scripts/score.sh` and this table are non-editable.
+  - Amendment 2026-08-21 by goal owner: c17 added (minimal-token inter-agent protocol); max 16 → 17.
 
 ## Operating Mode
 
-- [x] **Converge** — Stop when all 16 criteria pass.
+- [x] **Converge** — Stop when all 17 criteria pass.
 
 ### Stopping Conditions
 
 Stop and report when ANY of:
-- All 16 criteria pass (score = 16)
+- All 17 criteria pass (score = 17)
 - 3 consecutive iterations with no criterion flipping pass
 - 25 iterations completed
 - A required toolchain or upstream repo becomes unavailable (report exactly what)
@@ -76,7 +78,7 @@ repeat:
   10. Continue
 ```
 
-Convergence steering: when ≥75% of criteria pass (≥12/16), stop adding optional surface and converge — remaining failures only.
+Convergence steering: when ≥75% of criteria pass (≥13/17), stop adding optional surface and converge — remaining failures only.
 
 Commit messages: `[S:N→N] cN-slug: what you did`
 
@@ -106,6 +108,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 |---|---|---|
 | TS stdio MCP server + single outbound WSS | c7 | `@modelcontextprotocol/sdk`; one connection, exponential backoff; tools: send/dm/inbox/whois |
 | Conformance + live round-trip | c8 | Test: `initialize` → `tools/list` → `tools/call` handshake; spawn hub binary, two bridge instances exchange a channel message through it |
+| Minimal-token payload codec (DAP-mini) | c17 | `docs/protocol.md` §Compact payload: 1–3 char field codes + shared abbreviation dictionary as the single spec; mcp-bridge `codec` module implements it; tests assert round-trip equality, ≥50% size reduction vs verbose JSON, and cross-agent Q→A comprehension between two codec instances; hub stays zero-knowledge (codec output is just E2E plaintext input) |
 | kimi-code packaging | docs | `kimi.plugin.json` with `mcpServers` entry — documented in `docs/authoring.md` |
 
 ### Native adapters (c9, c10, c11)
@@ -140,6 +143,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 6. **Locked scoring** — `scripts/score.sh`, criteria table, and this file's metric definition are non-editable.
 7. **One WS per agent** — new connection evicts old; constant-time key compares on auth paths.
 8. **Site is static and honest** — no framework, no build step; claims only what passing criteria already prove.
+9. **One codec, one spec** — the compact payload format lives only in `docs/protocol.md`; every adapter's encode/decode follows it verbatim. Codec output is plaintext *input to* E2E encryption — hub never sees it.
 
 ## File Map
 
@@ -162,11 +166,11 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 
 ```
 Starting score: 1/16
-Ending score:   NN/16
+Ending score:   NN/17
 Iterations:     N
 Criteria met:   (list of passing)
 Remaining gaps: (list of failing with blockers)
 Next actions:   (what a human or future agent should do next)
 ```
 
-Anti-premature-completion: complete only when score = 16 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.
+Anti-premature-completion: complete only when score = 17 AND verification ran AND no useful next action exists. Never mark complete after a plan, scaffold, or partial criteria.

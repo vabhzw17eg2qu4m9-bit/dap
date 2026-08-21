@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fitness function for GOAL.md. Score = count of passing criteria (max 16).
+# Fitness function for GOAL.md. Score = count of passing criteria (max 17).
 # Exit 0 ALWAYS: non-zero exit means this script broke, not that the repo is unhealthy.
 set -u
 cd "$(dirname "$0")/.."
@@ -130,8 +130,15 @@ if [ -f site/index.html ] && grep -qi 'distributed agents' site/index.html \
 # c16: site integrity — every local href/src in site HTML resolves
 [ "$site_links_rc" = 0 ] && R[c16_site_links]=pass || R[c16_site_links]=fail
 
+# c17: minimal-token inter-agent protocol — compact payload codec spec'd in protocol.md,
+# implemented+tested in mcp-bridge: round-trip equality, >=50% size cut, cross-agent comprehension
+if [ "$mcp_rc" = 0 ] && grep -qi 'compact' docs/protocol.md 2>/dev/null \
+  && grep -rqiE 'compact|minitok|codec' adapters/mcp-bridge/src adapters/mcp-bridge/tests 2>/dev/null \
+  && grep -rqiE '0\.5|reduction|smaller' adapters/mcp-bridge/tests 2>/dev/null; then
+  R[c17_min_token_protocol]=pass; else R[c17_min_token_protocol]=fail; fi
+
 # --- JSON output ---
-ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links"
+ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links c17_min_token_protocol"
 score=0
 parts=""
 for k in $ORDER; do
@@ -142,5 +149,5 @@ notes_json=""
 for n in "${NOTES[@]:-}"; do
   [ -n "$n" ] && notes_json="${notes_json:+$notes_json, }\"$n\""
 done
-echo "{\"score\": $score, \"max\": 16, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
+echo "{\"score\": $score, \"max\": 17, \"breakdown\": {$parts}${notes_json:+, \"notes\": [$notes_json]}}"
 exit 0

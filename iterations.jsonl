@@ -1,0 +1,1 @@
+{"before":{"score":2,"max":16},"after":{"score":2,"max":17},"action":"owner amendment: added c17 minimal-token inter-agent protocol to GOAL.md + score.sh (max 16→17)","result":"c17 fail (pending codec spec+impl)","note":"no criterion regressed; c17 spec: round-trip equality, >=50% size cut vs verbose JSON, cross-agent comprehension in mcp-bridge tests"}
