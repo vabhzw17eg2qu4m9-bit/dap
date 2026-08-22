@@ -1,19 +1,23 @@
 // Universal MCP stdio bridge for DAP/1: ONE outbound WebSocket to the hub,
-// four tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush, Amp,
+// five tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush, Amp,
 // Cline, Roo Code, kimi-code — same entry in each MCP config).
 //
 //   stdin/stdout ← MCP (initialize handled by the SDK)   WSS → DAP hub
 //
-// Env contract (docs/authoring.md): DAP_HUB_URL, DAP_KEY_PATH (default
-// ~/.dap/agent.key), DAP_AGENT_NAME. Optional DAP_CHANNELS: JSON array of
-// {"name","pub","priv?"} channel keys (out-of-band membership).
+// Zero-config (config.ts): explicit arg > DAP_* env (DAP_HUB_URL,
+// DAP_KEY_PATH, DAP_AGENT_NAME, DAP_CHANNELS_FILE) > ~/.dap/config.json >
+// defaults (url ws://127.0.0.1:8787/ws, key ~/.dap/keys/mcp/<name|host>.key,
+// channels ~/.dap/channels.json shared across adapters). An agent needs at
+// most DAP_AGENT_NAME. Legacy DAP_CHANNELS (JSON array of {name,pub,priv?})
+// still works and overrides the channels file.
 import { realpathSync } from 'node:fs';
 import { env } from 'node:process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { DapClient, defaultKeyPath, type ChannelKey, type MsgEvent } from './client.js';
+import { DapClient, type ChannelKey, type MsgEvent } from './client.js';
+import { resolveDapSettings } from './config.js';
 
 interface TextResult extends CallToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -57,6 +61,15 @@ export function buildServer(dap: DapClient): McpServer {
     inputSchema: { agent: z.string().min(1).describe('recipient agentId (a_xxxx)'), text: z.string().min(1).describe('plaintext message') },
   }, ({ agent, text }) => run(() => dap.dm(agent, text)));
 
+  server.registerTool('dap_invite', {
+    title: 'DAP channel invite',
+    description: 'Invite an agent to a channel: DMs them the channel keypair inside a normal E2E DM (the plaintext happens to be JSON). Creates the channel (fresh keypair) on first use.',
+    inputSchema: {
+      channel: z.string().min(1).describe('channel name'),
+      agent: z.string().min(1).describe('recipient agentId (a_xxxx)'),
+    },
+  }, ({ channel, agent }) => run(() => dap.invite(channel, agent)));
+
   server.registerTool('dap_inbox', {
     title: 'DAP inbox drain',
     description: 'Drain decrypted inbound messages (channel + DM) received since the last call, plus any hub error frames observed since then; returns raw payload strings.',
@@ -76,17 +89,18 @@ export function buildServer(dap: DapClient): McpServer {
 }
 
 async function main(): Promise<void> {
-  if (!env.DAP_HUB_URL) {
-    console.error('dap-mcp-bridge: DAP_HUB_URL is not set — tools will return errors until it is');
-  }
+  // Identity bootstrap happens in the DapClient constructor: the key file is
+  // generated 0600 (parents on demand) under the resolved default path.
+  const settings = resolveDapSettings();
   const dap = new DapClient({
-    url: env.DAP_HUB_URL ?? '',
-    keyPath: env.DAP_KEY_PATH ?? defaultKeyPath(),
-    name: env.DAP_AGENT_NAME,
+    url: settings.url,
+    keyPath: settings.keyPath,
+    name: settings.name,
+    channelsFile: settings.channelsFile,
     channels: parseChannels(env.DAP_CHANNELS),
     onHubError: (e) => console.error(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`),
   });
-  if (env.DAP_HUB_URL) dap.start();
+  dap.start(); // zero-config: defaults point at the local hub; backoff covers a down hub
 
   const server = buildServer(dap);
   const transport = new StdioServerTransport();

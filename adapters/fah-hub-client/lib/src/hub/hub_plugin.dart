@@ -15,17 +15,23 @@ import 'dart:io';
 
 import '../fah/messaging.dart';
 import '../fah/plugin.dart';
+import 'channels.dart';
+import 'dap_settings.dart';
 import 'hub_client.dart';
 import 'hub_config.dart';
 import 'hub_messaging_repository.dart';
 import 'identity.dart';
 
 class HubPlugin implements FahPlugin {
-  HubPlugin({Map<String, String>? environment})
+  HubPlugin({Map<String, String>? environment, this.home})
       : environment = environment ?? Platform.environment;
 
   /// Injected environment (defaults to `Platform.environment`).
   final Map<String, String> environment;
+
+  /// Home directory for the `~/.dap` zero-config layout (test seam;
+  /// defaults to the platform home).
+  final String? home;
 
   HubConfig _config = const HubConfig();
   PluginIO? _io;
@@ -47,18 +53,26 @@ class HubPlugin implements FahPlugin {
     _io = context.io;
   }
 
-  /// Loads the identity, connects to the hub, and starts inbox delivery.
-  /// Idempotent.
+  /// Loads the identity, connects to the hub, and starts inbox delivery —
+  /// zero-config: url/keyPath default per [resolveDapSettings] (env >
+  /// `~/.dap/config.json` > `ws://127.0.0.1:8787/ws` /
+  /// `~/.dap/keys/fah/<name|hostname>.key`), and the channel store picks up
+  /// the machine-shared `~/.dap/channels.json`. Idempotent.
   Future<void> start({HubIdentity? identity}) async {
     if (_repository != null) return;
-    if (_config.url == null) {
-      throw StateError('hub.url (or DAP_HUB_URL) is not configured');
-    }
-    if (_config.keyPath == null) {
-      throw StateError('hub.keyPath (or DAP_KEY_PATH) is not configured');
-    }
-    _identity = identity ?? await HubIdentity.load(_config.keyPath!);
-    _client = HubClient(config: _config, identity: _identity!);
+    final settings =
+        resolveDapSettings(config: _config, environment: environment, home: home);
+    _identity = identity ?? await HubIdentity.load(settings.keyPath);
+    _client = HubClient(
+      config: HubConfig(
+        url: settings.url,
+        name: settings.name,
+        channels: _config.channels,
+        channelSecrets: _config.channelSecrets,
+      ),
+      identity: _identity!,
+      channelStore: await ChannelStore.fromFile(settings.channelsFile),
+    );
     // Hub rejections must never be silent: print them to the host terminal.
     _errorSub = _client!.errors.listen(
       (e) => _io?.writeln('[hub] hub rejected a frame — ${e.code}: ${e.msg}'),
@@ -83,6 +97,18 @@ class HubPlugin implements FahPlugin {
 
   /// The backing repository (exposed for hosts that prefer direct access).
   HubMessagingRepository? get repository => _repository;
+
+  /// Invites [agentId] to [channel] (see [HubClient.inviteTo]). The
+  /// mirrored [PluginContext] subset carries no tool registry, so hosts
+  /// register their `invite` tool around this one-liner; the upstream PR
+  /// would wire `registerTool` directly.
+  Future<void> inviteTo(String channel, String agentId) async {
+    final repository = _repository;
+    if (repository == null) {
+      throw StateError('plugin not started — call start() first');
+    }
+    await repository.inviteTo(channel, agentId);
+  }
 
   /// Our hub agent id once connected.
   String? get agentId => _client?.agentId;

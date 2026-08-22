@@ -8,6 +8,8 @@ library;
 export 'src/fah/messaging.dart';
 export 'src/fah/plugin.dart';
 export 'src/hub/canonical.dart';
+export 'src/hub/channels.dart';
+export 'src/hub/dap_settings.dart';
 export 'src/hub/hub_client.dart';
 export 'src/hub/hub_config.dart';
 export 'src/hub/hub_messaging_repository.dart';

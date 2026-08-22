@@ -4,13 +4,17 @@
 // sends, whois-before-DM, inbound decryption to RAW plaintext strings (payload
 // shaping — e.g. glossary negotiation — layers on top, see docs/protocol.md).
 // Identity on disk: one JSON file {priv,pub,xpriv,xpub}, permissions 0600.
+// Zero-config channels: keys load from / persist to the channels file
+// (default ~/.dap/channels.json, see config.ts); unknown channels keygen on
+// first send, known channels auto-join after every welcome, and chankey DMs
+// (dap_invite) are accepted by persisting + joining + surfacing a notice.
 import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { dirname } from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 import * as dap from './crypto.js';
 import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog } from './keepalive.js';
+import { loadChannelKeys, parseChankeyInvite, persistChannelKeys } from './channels.js';
 
 /** A hub `error` frame observed on the wire (unknown_agent, access_denied, …). */
 export interface HubErrorEvent {
@@ -33,6 +37,9 @@ export interface MsgEvent {
   from: string;
   text: string;
   ts: number;
+  /** Set when this entry is a channel-invite notice (not chat): the invited
+   *  channel's name. The raw chankey DM never reaches the inbox as text. */
+  invite?: string;
 }
 
 export interface WhoisInfo {
@@ -60,6 +67,9 @@ export interface ClientOpts {
   keyPath: string;
   name?: string;
   channels?: ChannelKey[];
+  /** Channels file (default ~/.dap/channels.json via config.ts): known
+   *  channels load from it; created/invited keypairs persist to it. */
+  channelsFile?: string;
   backoff?: { initialMs?: number; maxMs?: number };
   /** Fired for every hub `error` frame (surfacing hook — see drainErrors). */
   onHubError?: (e: HubErrorEvent) => void;
@@ -126,6 +136,13 @@ export class DapClient {
     this.opts = opts;
     this.id = loadIdentity(opts.keyPath);
     this.agentId = dap.agentIdOf(this.id.pub);
+    // File first, then explicit DAP_CHANNELS entries — explicit wins per the
+    // settings precedence (config.ts).
+    if (opts.channelsFile) {
+      for (const [name, keys] of Object.entries(loadChannelKeys(opts.channelsFile))) {
+        this.channels.set(name, { name, ...keys });
+      }
+    }
     for (const ch of opts.channels ?? []) this.channels.set(ch.name, ch);
     this.initialMs = opts.backoff?.initialMs ?? 1000;
     this.maxMs = opts.backoff?.maxMs ?? 30_000;
@@ -182,6 +199,11 @@ export class DapClient {
     return this.channels.get(name);
   }
 
+  /** Channels the hub confirmed we joined on this connection. */
+  get joinedChannels(): string[] {
+    return [...this.joined];
+  }
+
   /** Join a channel. First join ever creates it and registers chanPubkey. */
   async join(name: string, chanPubkey: string): Promise<void> {
     await this.ready();
@@ -201,6 +223,8 @@ export class DapClient {
   }
 
   /** Ensure the channel exists and we are a member; create it if unknown.
+   *  Creation is zero-config: fresh keypair persisted to the channels file
+   *  (read-modify-write, keeps the other channels).
    *  ponytail: on a name collision the hub keeps the ORIGINAL channel pubkey
    *  and ours is ignored — the creator effectively owns the channel (v1). */
   async ensureChannel(name: string): Promise<ChannelKey & { created: boolean }> {
@@ -210,9 +234,11 @@ export class DapClient {
       return { ...known, created: false };
     }
     const kp = dap.newX25519Keypair();
-    const ch: ChannelKey = { name, pub: dap.b64e(kp.pub), priv: dap.b64e(kp.priv) };
+    const keys = { pub: dap.b64e(kp.pub), priv: dap.b64e(kp.priv) };
+    const ch: ChannelKey = { name, ...keys };
     await this.join(name, ch.pub); // first join registers the channel pubkey
     this.channels.set(name, ch);
+    if (this.opts.channelsFile) persistChannelKeys(this.opts.channelsFile, name, keys);
     return { ...ch, created: true };
   }
 
@@ -249,6 +275,20 @@ export class DapClient {
       ciphertext: dap.seal(text, id, to, this.id.xpriv, info.xPub),
     });
     return { ok: true, id, from: this.agentId, to };
+  }
+
+  /** Invite an agent to a channel: DMs them the channel keypair inside a
+   *  normal E2E DM (the plaintext happens to be JSON, see channels.ts).
+   *  Creates the channel zero-config when unknown; pub-only membership
+   *  (out-of-band pubkey, no priv) cannot invite — that needs a member. */
+  async invite(channel: string, to: string): Promise<SendResult> {
+    const ch = await this.ensureChannel(channel);
+    if (!ch.priv) throw new Error(`no private key for channel ${channel} — ask a member to invite you`);
+    const payload = JSON.stringify({ t: 'chankey', channel, pub: ch.pub, priv: ch.priv });
+    const res = await this.dm(to, payload);
+    const out: SendResult = { ...res, channel, chanPubkey: ch.pub };
+    if (ch.created) out.created = true;
+    return out;
   }
 
   /** Pubkey directory lookup (needed for DM key agreement). */
@@ -329,6 +369,10 @@ export class DapClient {
     this.joined.clear(); // hub membership is in-memory: re-join on demand
     this.ws?.send(JSON.stringify({ op: 'flush' })); // drain offline mailbox
     for (const wake of this.readyWaiters.splice(0)) wake();
+    // Membership: join every known channel after each welcome (idempotent;
+    // reconnect-safe — the hub's live membership dies with the connection).
+    // Join failures surface via the error ring / onHubError, never silently.
+    for (const [name, ch] of this.channels) void this.join(name, ch.pub).catch(() => {});
   }
 
   private onJoined(channel: string): void {
@@ -400,12 +444,32 @@ export class DapClient {
   private async onMsg(frame: dap.Frame): Promise<void> {
     try {
       const ev = await this.decryptMsg(frame);
-      this.inboxMsgs.push(ev);
-      if (this.inboxMsgs.length > INBOX_CAP) this.inboxMsgs.shift();
-      for (const cb of this.listeners) cb(ev);
+      // A DM carrying a channel keypair is an invite, not chat: persist the
+      // keys, join, surface a notice. Trust model: possession of the channel
+      // private key IS v1 membership; the introducer is whoever DM'd us
+      // (same trust as manually sharing the channels file).
+      const invite = ev.dm ? parseChankeyInvite(ev.text) : undefined;
+      if (invite) {
+        const keys = { name: invite.channel, pub: invite.pub, priv: invite.priv };
+        this.channels.set(invite.channel, keys);
+        if (this.opts.channelsFile) {
+          persistChannelKeys(this.opts.channelsFile, invite.channel, { pub: invite.pub, priv: invite.priv });
+        }
+        void this.join(invite.channel, invite.pub).catch(() => {}); // failure -> error ring
+        this.deliver({ ...ev, invite: invite.channel, text: `[dap] invited to #${invite.channel} by ${ev.from}` });
+        return;
+      }
+      this.deliver(ev);
     } catch (err) {
       this.lastError = `undecryptable msg: ${String(err)}`;
     }
+  }
+
+  /** One inbound message -> bounded inbox + every listener. */
+  private deliver(ev: MsgEvent): void {
+    this.inboxMsgs.push(ev);
+    if (this.inboxMsgs.length > INBOX_CAP) this.inboxMsgs.shift();
+    for (const cb of this.listeners) cb(ev);
   }
 
   private async decryptMsg(frame: dap.Frame): Promise<MsgEvent> {
@@ -425,5 +489,3 @@ export class DapClient {
     return { dm: true, from, text, ts: Number(frame.ts) };
   }
 }
-
-export const defaultKeyPath = (): string => join(homedir(), '.dap', 'agent.key');

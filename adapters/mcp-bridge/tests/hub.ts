@@ -57,8 +57,10 @@ function pollHealth(url: string, deadlineMs: number): Promise<void> {
 async function boot(): Promise<HubProc> {
   const dir = mkdtempSync(join(tmpdir(), 'dap-mcp-hub-'));
   const bin = join(dir, 'dap-hub');
-  // Build the live hub from source (cached per test process; GOCACHE dedupes work).
-  execFileSync('go', ['build', '-o', bin, '.'], { cwd: join(repoRoot, 'hub'), stdio: 'pipe' });
+  // Build the live hub from source (cached per test process; GOCACHE dedupes
+  // work). -buildvcs=false: no git probing — hermetic and immune to
+  // concurrent `git status` index-lock races from sibling test runs.
+  execFileSync('go', ['build', '-buildvcs=false', '-o', bin, '.'], { cwd: join(repoRoot, 'hub'), stdio: 'pipe' });
 
   const port = await freePort();
   const adminToken = randomBytes(16).toString('hex');

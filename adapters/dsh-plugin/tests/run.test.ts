@@ -2,15 +2,33 @@
 // Run: npm test (offline; localhost WS only, event-driven — no sleep sync).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, statSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, statSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import plugin, { type DapToolDef, type DshContext } from '../src/index.js';
 import * as dap from '../src/crypto.js';
+import { resolveDapSettings, defaultKeyPath, DEFAULT_URL } from '../src/config.js';
+import { loadChannelKeys } from '../src/channels.js';
 import { KeepAliveWatchdog, type KeepAlivePeer, type KaTimers } from '../src/keepalive.js';
 import { FakeHub, until, channelConfig } from './fake-hub.js';
+
+// Determinism: pin HOME (all defaults resolve under a tmp dir) and clear any
+// DAP_* env leaked in from the machine running the tests.
+const HOME = mkdtempSync(join(tmpdir(), 'dsh-dap-home-'));
+process.env.HOME = HOME;
+const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE'];
+const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
+for (const k of DAP_ENV_KEYS) delete process.env[k];
+
+test.after(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  rmSync(HOME, { recursive: true, force: true });
+});
 
 interface FakeCordis {
   ctx: DshContext;
@@ -48,6 +66,17 @@ function tmpKeyPath(): string {
   return join(mkdtempSync(join(tmpdir(), 'dsh-dap-')), 'identity.json');
 }
 
+/** Fresh per-test scratch dir (channels files, key paths). */
+function tmpDir(prefix: string): string {
+  return mkdtempSync(join(tmpdir(), prefix + '-'));
+}
+
+const tool = (fc: { tools: DapToolDef[] }, name: string): DapToolDef => {
+  const t = fc.tools.find((x) => x.name === name);
+  if (!t) throw new Error('tool not registered: ' + name);
+  return t;
+};
+
 test('apply() registers dap tools on the Cordis context', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
@@ -55,7 +84,7 @@ test('apply() registers dap tools on the Cordis context', async () => {
     applyTo(hub, tmpKeyPath(), fc);
     assert.deepEqual(
       fc.tools.map((t) => t.name).sort(),
-      ['dap_dm', 'dap_inbox', 'dap_send', 'dap_whois'],
+      ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_send', 'dap_whois'],
     );
     for (const t of fc.tools) {
       const schema: Record<string, unknown> = t.inputSchema;
@@ -261,9 +290,184 @@ test('env fallbacks: DAP_HUB_URL / DAP_KEY_PATH / DAP_AGENT_NAME', async () => {
   } finally {
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
-    process.env.DAP_HUB_URL = prev.DAP_HUB_URL;
-    process.env.DAP_KEY_PATH = prev.DAP_KEY_PATH;
-    process.env.DAP_AGENT_NAME = prev.DAP_AGENT_NAME;
+    // prev[k] is undefined when the var wasn't set before — delete, don't
+    // assign (assigning undefined stores the literal string "undefined").
+    for (const k of ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME']) {
+      const v = prev[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+// ---- zero-config: settings precedence, identity bootstrap, channel keys ----
+
+test('settings precedence: config arg > DAP_* env > ~/.dap/config.json > defaults; dsh key dir + shared channels file', () => {
+  try {
+    // No config file, no env (cleared at the top of this file): plain defaults.
+    // Identity file is derived from the agent name (hostname when unnamed),
+    // under the per-adapter dsh/ key dir — two dsh agents on one machine
+    // never collide; different machines get different files via hostname.
+    let s = resolveDapSettings();
+    assert.equal(s.url, DEFAULT_URL);
+    assert.equal(s.keyPath, join(HOME, '.dap', 'keys', 'dsh', `${hostname()}.key`));
+    assert.equal(s.channelsFile, join(HOME, '.dap', 'channels.json'));
+    assert.equal(s.name, undefined);
+    assert.equal(defaultKeyPath('bot 7'), join(HOME, '.dap', 'keys', 'dsh', 'bot_7.key'), 'name sanitized into the file name');
+
+    // Config file fills every unset field.
+    mkdirSync(join(HOME, '.dap'), { recursive: true });
+    const cfgFile = join(HOME, '.dap', 'config.json');
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({ url: 'ws://cfg:1/ws', name: 'cfg-agent', keyPath: '/cfg/key.json', channelsFile: '/cfg/channels.json' }),
+    );
+    s = resolveDapSettings();
+    assert.equal(s.url, 'ws://cfg:1/ws');
+    assert.equal(s.name, 'cfg-agent');
+    assert.equal(s.keyPath, '/cfg/key.json');
+    assert.equal(s.channelsFile, '/cfg/channels.json');
+
+    // Env beats the file; the file still beats the name-derived default.
+    process.env.DAP_HUB_URL = 'ws://env:2/ws';
+    process.env.DAP_CHANNELS_FILE = '/env/channels.json';
+    process.env.DAP_AGENT_NAME = 'env-agent';
+    s = resolveDapSettings();
+    assert.equal(s.url, 'ws://env:2/ws');
+    assert.equal(s.channelsFile, '/env/channels.json');
+    assert.equal(s.name, 'env-agent');
+    assert.equal(s.keyPath, '/cfg/key.json');
+
+    // Explicit config arg beats env.
+    assert.equal(resolveDapSettings({ url: 'ws://ov:3/ws' }).url, 'ws://ov:3/ws');
+    assert.equal(resolveDapSettings({ keyPath: '/ov/key.json' }).keyPath, '/ov/key.json');
+
+    // An invalid config file counts as absent; the name-derived default
+    // keyPath only applies when no valid file sets one.
+    writeFileSync(cfgFile, '{not json');
+    delete process.env.DAP_HUB_URL;
+    delete process.env.DAP_CHANNELS_FILE;
+    delete process.env.DAP_AGENT_NAME;
+    s = resolveDapSettings();
+    assert.equal(s.url, DEFAULT_URL);
+    assert.equal(s.channelsFile, join(HOME, '.dap', 'channels.json'));
+    assert.equal(resolveDapSettings({ name: 'ov-agent' }).keyPath, join(HOME, '.dap', 'keys', 'dsh', 'ov-agent.key'));
+  } finally {
+    delete process.env.DAP_HUB_URL;
+    delete process.env.DAP_CHANNELS_FILE;
+    delete process.env.DAP_AGENT_NAME;
+    rmSync(join(HOME, '.dap', 'config.json'), { force: true });
+  }
+});
+
+test('zero-config identity: default key path ~/.dap/keys/dsh/<name>.key, auto-generated 0600', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    plugin.apply(fc.ctx, { url: hub.url, name: 'dsh-zero' }); // nothing but a name
+    const hello = await hub.waitFor((f) => f.op === 'hello');
+    assert.equal(hello.name, 'dsh-zero');
+    const keyPath = join(HOME, '.dap', 'keys', 'dsh', 'dsh-zero.key');
+    assert.ok(existsSync(keyPath), 'identity created under the dsh key dir');
+    assert.equal(statSync(keyPath).mode & 0o777, 0o600);
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('auto-keygen: first send to an unknown channel keygens + persists (RMW) + joins; a second instance auto-joins from the shared file and decrypts', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-autokey');
+  const channelsFile = join(dir, 'channels.json'); // absent: pure zero-config
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const clientA = plugin.apply(a.ctx, {
+    url: hub.url, keyPath: join(dir, 'a.key'), channelsFile, backoff: { initialMs: 10, maxMs: 40 },
+  });
+  try {
+    await hub.waitFor((f) => f.op === 'flush'); // A welcomed and connected
+
+    // First-ever use of #general: keygen + persist + join, then the send.
+    await tool(a, 'dap_send').execute({ channel: 'general', text: 'zero config' });
+    const joinFrame = await hub.waitFor((f) => f.op === 'join' && f.channel === 'general');
+    const saved = loadChannelKeys(channelsFile);
+    assert.equal(saved.general.pub, joinFrame.chanPubkey, 'joined with the persisted pubkey');
+    assert.equal(dap.b64d(saved.general.pub).length, 32, 'x25519 public key persisted');
+    assert.equal(dap.b64d(saved.general.priv).length, 32, 'x25519 private key persisted');
+    assert.ok(hub.channelMembers.get('general')?.has(clientA.agentId), 'creator joined');
+
+    // A second unknown channel: read-modify-write keeps the first one.
+    await tool(a, 'dap_send').execute({ channel: 'random', text: 'still zero config' });
+    await hub.waitFor((f) => f.op === 'join' && f.channel === 'random');
+    assert.deepEqual(Object.keys(loadChannelKeys(channelsFile)), ['general', 'random']);
+
+    // Fresh instance, same channels file: picks the keys up with zero config
+    // and auto-joins both channels after its welcome.
+    const clientB = plugin.apply(b.ctx, {
+      url: hub.url, keyPath: join(dir, 'b.key'), channelsFile, backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await until(
+      () =>
+        hub.channelMembers.get('general')?.has(clientB.agentId) === true &&
+        hub.channelMembers.get('random')?.has(clientB.agentId) === true,
+    );
+
+    // B decrypts A's later channel send (hub routes to joined members).
+    await tool(a, 'dap_send').execute({ channel: 'general', text: 'second message' });
+    await until(() => b.followups.some((t) => t.includes('second message')));
+    const wake = b.followups.find((t) => t.includes('second message'))!;
+    assert.match(wake, new RegExp(`\\[dap:general\\] ${clientA.agentId}: second message`));
+    assert.ok(!JSON.stringify(hub.frames).includes('second message'), 'hub sees ciphertext only');
+  } finally {
+    for (const fc of [a, b]) for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('invite: A dap_invites B over E2E DM; B persists + joins + notice (not inbox); post-invite channel send decrypts', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-invite');
+  const fileA = join(dir, 'a-channels.json');
+  const fileB = join(dir, 'b-channels.json');
+  writeFileSync(fileB, '{}'); // B literally starts with an empty channels file
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const clientA = plugin.apply(a.ctx, {
+    url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'alice', backoff: { initialMs: 10, maxMs: 40 },
+  });
+  const clientB = plugin.apply(b.ctx, {
+    url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'bob', backoff: { initialMs: 10, maxMs: 40 },
+  });
+  try {
+    await until(() => hub.hellos >= 2); // both welcomed
+    assert.equal(Object.keys(loadChannelKeys(fileB)).length, 0, 'B holds no channel keys yet');
+
+    // dap_invite on a channel A doesn't hold yet: zero-config creation inlined.
+    await tool(a, 'dap_invite').execute({ channel: 'general', to: clientB.agentId });
+    const dmFrame = await hub.waitFor((f) => f.op === 'send' && f.to === clientB.agentId);
+    assert.ok(!String(dmFrame.ciphertext).includes('chankey'), 'hub never sees the invite plaintext');
+    const creatorKeys = loadChannelKeys(fileA);
+    assert.ok(creatorKeys.general?.pub, 'creator keypair persisted');
+    assert.ok(hub.channelMembers.get('general')?.has(clientA.agentId), 'A created + joined #general');
+
+    // B processes the invite DM: persist + join + followup notice, no inbox.
+    await until(() => hub.channelMembers.get('general')?.has(clientB.agentId) === true);
+    await until(() => b.followups.some((t) => t.includes(`invited to #general by ${clientA.agentId}`)));
+    const inboxOut = (await tool(b, 'dap_inbox').execute({})) as { messages: unknown[]; errors: unknown[] };
+    assert.equal(inboxOut.messages.length, 0, 'chankey DM is not chat: no inbox entry');
+    assert.equal(loadChannelKeys(fileB).general?.pub, creatorKeys.general?.pub, 'B persisted the invited keypair');
+
+    // Post-invite: B decrypts A's channel send with the invited key.
+    await tool(a, 'dap_send').execute({ channel: 'general', text: 'welcome aboard' });
+    await until(() => b.followups.some((t) => t.includes('welcome aboard')));
+    assert.match(b.followups.find((t) => t.includes('welcome aboard'))!, /\[dap:general\]/);
+    assert.ok(!JSON.stringify(hub.frames).includes('welcome aboard'), 'hub sees ciphertext only');
+  } finally {
+    for (const fc of [a, b]) for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

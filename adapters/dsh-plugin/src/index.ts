@@ -1,7 +1,10 @@
 // deepseek-harness (Cordis) plugin for the Distributed Agents Platform.
 // Default-exported Cordis plugin: apply(ctx, config) registers dap_* tools and
 // wakes the idle agent (Agent.followup) on every inbound E2E-encrypted message.
-import { DapClient, defaultKeyPath, type ChannelKey, type MsgEvent } from './client.js';
+// Zero-config: settings resolve as config arg > DAP_* env > ~/.dap/config.json
+// > defaults (see config.ts); channel keys live in the shared channels file.
+import { DapClient, type ChannelKey, type MsgEvent } from './client.js';
+import { resolveDapSettings } from './config.js';
 
 export interface DapToolDef {
   name: string;
@@ -19,13 +22,17 @@ export interface DshContext {
 }
 
 export interface DapPluginConfig {
-  /** Hub WS endpoint, e.g. ws://hub:8080/ws (env fallback DAP_HUB_URL). */
+  /** Hub WS endpoint (env DAP_HUB_URL; default ws://127.0.0.1:8787/ws). */
   url?: string;
-  /** Ed25519 identity key file, created 0600 if absent (DAP_KEY_PATH). */
+  /** Ed25519 identity key file, created 0600 if absent (DAP_KEY_PATH;
+   *  default ~/.dap/keys/dsh/<name|hostname>.key). */
   keyPath?: string;
   /** Display name (DAP_AGENT_NAME). */
   name?: string;
-  /** Channel keypairs (pub = hub-side key, priv = out-of-band member key). */
+  /** Channel keypairs file, shared across adapters (DAP_CHANNELS_FILE;
+   *  default ~/.dap/channels.json). Ignored when `channels` is given. */
+  channelsFile?: string;
+  /** Explicit channel keypairs — opts out of the channels-file lifecycle. */
   channels?: ChannelKey[];
   backoff?: { initialMs?: number; maxMs?: number };
 }
@@ -35,10 +42,8 @@ const S = (v: unknown): string => String(v);
 export default {
   name: 'dsh-dap',
   apply(ctx: DshContext, config: DapPluginConfig = {}) {
-    const url = config.url ?? process.env.DAP_HUB_URL;
-    if (!url) throw new Error('dsh-dap: config.url (or DAP_HUB_URL) is required');
-    const keyPath = config.keyPath ?? process.env.DAP_KEY_PATH ?? defaultKeyPath();
-    const name = config.name ?? process.env.DAP_AGENT_NAME;
+    const settings = resolveDapSettings(config);
+    const { name } = settings;
 
     const announce = (m: MsgEvent): void => {
       const where = m.dm ? 'dm' : m.channel;
@@ -47,12 +52,16 @@ export default {
     // Hub rejections (unknown_agent, access_denied, replay, …) must never be
     // silent: the sending tool already returned — the verdict arrives here.
     const client = new DapClient({
-      url,
-      keyPath,
+      url: settings.url,
+      keyPath: settings.keyPath,
       name,
       channels: config.channels,
+      channelsFile: config.channels ? undefined : settings.channelsFile,
       backoff: config.backoff,
       onMessage: announce,
+      onInvite: (invite, from) => {
+        ctx.agent?.followup(`[dap] invited to #${invite.channel} by ${from}`);
+      },
       onHubError: (e) => {
         ctx.logger?.warn(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
         ctx.agent?.followup(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
@@ -91,6 +100,20 @@ export default {
         const down = requireConnected();
         if (down) return down;
         return client.dm(S(a.to), S(a.text));
+      },
+    });
+    ctx.tools.register({
+      name: 'dap_invite',
+      description: 'Invite another agent to a channel: DMs them the channel keypair (normal E2E DM; the payload happens to be JSON)',
+      inputSchema: {
+        type: 'object',
+        properties: { channel: { type: 'string' }, to: { type: 'string' } },
+        required: ['channel', 'to'],
+      },
+      execute: async (a) => {
+        const down = requireConnected();
+        if (down) return down;
+        return client.invite(S(a.to), S(a.channel));
       },
     });
     ctx.tools.register({

@@ -70,6 +70,10 @@ class HubIdentity {
     final identity = await generate();
     final signingSeed = await identity.signingKeyPair.extractPrivateKeyBytes();
     final dhPriv = await identity.dhKeyPair.extractPrivateKeyBytes();
+    // Default paths nest (~/.dap/keys/fah/…) — create parents on demand.
+    if (!await file.parent.exists()) {
+      await file.parent.create(recursive: true);
+    }
     await file.writeAsString(
       'ed25519:${base64Encode(signingSeed)}\n'
       'x25519:${base64Encode(dhPriv)}\n'

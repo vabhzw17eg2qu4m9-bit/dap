@@ -1,7 +1,8 @@
 /// In-memory DAP/1 hub for tests: HttpServer + WebSocketTransformer on
 /// 127.0.0.1 ephemeral port. Implements hello (independent per-spec
 /// signature + ts-freshness + nonce-replay checks), welcome, eviction,
-/// channel fan-out, DM routing, offline mailboxes, flush, whois, presence.
+/// channel fan-out, DM routing, join, offline mailboxes, flush, whois,
+/// presence.
 ///
 /// Signature verification here is deliberately re-implemented (not shared
 /// with the client library) so wire-format bugs cannot cancel out.
@@ -31,6 +32,13 @@ class FakeHub {
   final List<String> whoisQueries = [];
   final List<String> deliveredTo = [];
   final _offlineEvents = StreamController<String>.broadcast();
+  final _joinEvents = StreamController<HubJoin>.broadcast();
+
+  /// Channel membership per spec § join (first join creates the channel).
+  final channelMembers = <String, Set<String>>{};
+
+  /// Fires for every accepted join (deterministic test waits).
+  Stream<HubJoin> get joins => _joinEvents.stream;
 
   /// Fires when a live connection for an agent goes away.
   Stream<String> get agentOffline => _offlineEvents.stream;
@@ -63,6 +71,7 @@ class FakeHub {
     }
     await _helloEvents.close();
     await _offlineEvents.close();
+    await _joinEvents.close();
     await _server?.close(force: true);
   }
 
@@ -102,6 +111,8 @@ class FakeHub {
             _whois(ws, frame);
           case 'send' when agentId != null:
             await _send(ws, agentId, frame);
+          case 'join' when agentId != null:
+            _join(ws, agentId, frame);
           case 'flush' when agentId != null:
             _flush(ws, agentId);
           case 'presence_query':
@@ -268,6 +279,15 @@ class FakeHub {
     }
   }
 
+  void _join(WebSocket ws, String agentId, Map<String, dynamic> frame) {
+    final channel = frame['channel'] as String;
+    channelMembers.putIfAbsent(channel, () => {}).add(agentId);
+    if (!_joinEvents.isClosed) {
+      _joinEvents.add(HubJoin(agentId: agentId, channel: channel));
+    }
+    _reply(ws, {'op': 'joined', 'channel': channel});
+  }
+
   void _flush(WebSocket ws, String agentId) {
     final queued = _mailboxes.remove(agentId) ?? const <Map<String, dynamic>>[];
     for (final msg in queued) {
@@ -302,4 +322,12 @@ class _RegistryEntry {
   final String pubkeyB64;
   final String x25519B64;
   final String? name;
+}
+
+/// One accepted `join` (spec § join).
+class HubJoin {
+  HubJoin({required this.agentId, required this.channel});
+
+  final String agentId;
+  final String channel;
 }

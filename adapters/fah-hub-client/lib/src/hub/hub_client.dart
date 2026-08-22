@@ -11,6 +11,7 @@ import 'dart:io';
 import 'package:cryptography/cryptography.dart';
 
 import 'canonical.dart';
+import 'channels.dart';
 import 'hub_config.dart';
 import 'identity.dart';
 import 'payload_crypto.dart';
@@ -71,12 +72,18 @@ class HubClient {
   HubClient({
     required this.config,
     required this.identity,
+    this.channelStore,
     Duration Function(int attempt)? backoff,
     this.pingInterval = const Duration(seconds: 20),
   }) : backoff = backoff ?? HubClient.defaultBackoff;
 
   final HubConfig config;
   final HubIdentity identity;
+
+  /// Zero-config channel-key lifecycle (auto-keygen on first send, invite
+  /// accept, auto-join). Null keeps the explicit-config-only behavior:
+  /// unknown channels fail honestly with [ArgumentError].
+  final ChannelStore? channelStore;
   final Duration Function(int attempt) backoff;
 
   /// Client keepalive interval. Native mechanism: dart:io WebSocket
@@ -203,6 +210,7 @@ class HubClient {
     if (ok) {
       agentId = _welcomedAgentId;
       if (!_firstWelcome.isCompleted) _firstWelcome.complete(agentId);
+      await _joinKnownChannels();
       await _flushAfterWelcome();
     }
     await done.future;
@@ -247,17 +255,93 @@ class HubClient {
     return frame;
   }
 
-  Future<void> sendToChannel(String channel, String text) async {
-    final pubkeyB64 = config.channels[channel];
-    if (pubkeyB64 == null) {
-      throw ArgumentError('no channel pubkey configured for "$channel"');
+  /// Channel membership (spec § join): the first join creates the channel
+  /// and registers [chanPubkeyB64]; re-join is idempotent — safe after
+  /// every reconnect.
+  void join(String channel, String chanPubkeyB64) =>
+      _send({'op': 'join', 'channel': channel, 'chanPubkey': chanPubkeyB64});
+
+  /// Membership: join every known channel after each welcome (idempotent,
+  /// reconnect-safe). A failed join is transient — the reconnect loop
+  /// retries after the next welcome.
+  Future<void> _joinKnownChannels() async {
+    try {
+      final store = channelStore;
+      if (store != null) {
+        for (final entry in store.all.entries) {
+          join(entry.key, entry.value.pub);
+        }
+      }
+      for (final entry in config.channels.entries) {
+        if (store == null || !store.knows(entry.key)) join(entry.key, entry.value);
+      }
+    } on Object {
+      // socket dropped mid-join — the reconnect loop re-runs us
     }
+  }
+
+  Future<void> sendToChannel(String channel, String text) async {
+    final pubkeyB64 = await _channelPubFor(channel);
     await _sendEncrypted(
       extra: {'channel': channel},
       recipientDhPubkey: _dhPubkey(pubkeyB64),
       aadTarget: channel,
       text: text,
     );
+  }
+
+  /// Explicit config first; otherwise the store auto-generates + persists
+  /// the keypair and joins — creating the channel (spec § join: senders
+  /// only need the channel public key).
+  Future<String> _channelPubFor(String channel) async {
+    final explicit = config.channels[channel];
+    if (explicit != null) return explicit;
+    final store = channelStore;
+    if (store == null) {
+      throw ArgumentError('no channel pubkey configured for "$channel"');
+    }
+    final keys = await _channelKeysOrCreate(channel, store);
+    return keys.pub;
+  }
+
+  /// Keys for [channel] via [store], joining too when the keypair was just
+  /// created (zero-config channel creation).
+  Future<ChannelKeys> _channelKeysOrCreate(
+      String channel, ChannelStore store) async {
+    final existed = store.knows(channel);
+    final keys = await store.keysFor(channel);
+    if (!existed) join(channel, keys.pub);
+    return keys;
+  }
+
+  /// Invites [toAgentId] to [channel]: DMs them the channel keypair as a
+  /// normal E2E DM whose plaintext is the chankey JSON (spec § "Channel key
+  /// distribution"). Trust model: possession of the channel private key IS
+  /// v1 membership; the introducer is whoever DM'd you the key.
+  Future<void> inviteTo(String channel, String toAgentId) async {
+    final store = channelStore;
+    final keys = store != null
+        ? await _channelKeysOrCreate(channel, store)
+        : await _keysFromConfig(channel);
+    await sendDm(
+      toAgentId,
+      jsonEncode(
+          {'t': 'chankey', 'channel': channel, 'pub': keys.pub, 'priv': keys.priv}),
+    );
+  }
+
+  /// Explicit-config fallback: priv is required (it is the invite payload),
+  /// pub is derived from it when only the secret is configured.
+  Future<ChannelKeys> _keysFromConfig(String channel) async {
+    final priv = config.channelSecrets[channel];
+    if (priv == null) {
+      throw StateError(
+          'no channel key for "$channel" — an invite needs the private key');
+    }
+    var pub = config.channels[channel];
+    final fromSeed = await X25519().newKeyPairFromSeed(base64Decode(priv));
+    pub ??= base64Encode((await fromSeed.extractPublicKey()).bytes);
+    return ChannelKeys(pub: pub, priv: priv);
   }
 
   /// Sends an E2E DM. Whois resolves the peer's X25519 pubkey on first use.
@@ -401,6 +485,20 @@ class HubClient {
       plaintext = null; // no key or tampered payload — deliver opaque
     }
     if (_inbound.isClosed) return;
+    // A chankey DM is an invite, not chat: persist the keypair, join, and
+    // surface a short notice — never the raw key JSON.
+    if (channel == null && plaintext != null) {
+      final store = channelStore;
+      final invite = parseChankeyInvite(plaintext);
+      if (invite != null && store != null) {
+        await store.accept(
+          invite.channel,
+          ChannelKeys(pub: invite.pub, priv: invite.priv),
+        );
+        join(invite.channel, invite.pub);
+        plaintext = '[hub] invited to #${invite.channel} by ${frame['from']}';
+      }
+    }
     _inbound.add(InboundMessage(
       id: frame['id'] as String? ?? '',
       from: frame['from'] as String? ?? '',
@@ -412,8 +510,8 @@ class HubClient {
   }
 
   Future<String> _decryptChannel(String channel, Map frame) async {
-    final privB64 = config.channelSecrets[channel];
-    final pubB64 = config.channels[channel];
+    final privB64 = channelStore?.privOf(channel) ?? config.channelSecrets[channel];
+    final pubB64 = channelStore?.pubOf(channel) ?? config.channels[channel];
     if (privB64 == null || pubB64 == null) throw StateError('no channel key');
     // Sender encrypted with senderPriv x channelPub; we decrypt with
     // channelPriv x senderPub (the sender is a registered agent).

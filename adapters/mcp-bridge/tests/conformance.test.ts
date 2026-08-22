@@ -26,14 +26,17 @@ const textOf = (result: { content?: Array<{ type: string; text?: string }> }): R
 
 test('MCP conformance: initialize → tools/list → tools/call dap_send round-trip', async () => {
   const hub = await startHub(); // builds + spawns the real hub binary, polls /healthz
-  const keyPath = join(mkdtempSync(join(tmpdir(), 'dap-conf-')), 'agent.key');
+  // Pin EVERY writable default (key file AND the shared channels file) under
+  // a tmp dir — never touch the machine's real ~/.dap.
+  const dir = mkdtempSync(join(tmpdir(), 'dap-conf-'));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [resolve(here, '..', 'dist', 'server.js')],
     env: {
       ...process.env,
       DAP_HUB_URL: hub.url,
-      DAP_KEY_PATH: keyPath,
+      DAP_KEY_PATH: join(dir, 'agent.key'),
+      DAP_CHANNELS_FILE: join(dir, 'channels.json'),
       DAP_AGENT_NAME: 'conformance-1',
     } as Record<string, string>,
     stderr: 'ignore',
@@ -41,10 +44,10 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
   const client = new Client({ name: 'dap-conformance-check', version: '0.1.0' });
   await client.connect(transport); // performs the MCP initialize handshake
 
-  // tools/list: exactly the four dap tools
+  // tools/list: exactly the five dap tools
   const listed = await client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema);
   const names = listed.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['dap_dm', 'dap_inbox', 'dap_send', 'dap_whois']);
+  assert.deepEqual(names, ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_send', 'dap_whois']);
 
   // tools/call dap_send: creates the channel, E2E round-trips through the live hub
   const sent = textOf(await client.callTool({ name: 'dap_send', arguments: { channel: 'conformance', text: 'round-trip through the live hub' } }));
