@@ -36,13 +36,14 @@ score = passing_criteria / 18
 | c15 | **Public site content** | `site/index.html` presents the project: name + what it is, E2E encryption + adapters, quickstart |
 | c16 | **Public site integrity** | every local `href`/`src` in `site/**/*.html` resolves to an existing file |
 | c17 | **Self-developed agent language** | agents develop the language themselves at runtime: two agents negotiate a shared glossary (propose→ack, no human-fixed dictionary), then converse in it; mcp-bridge tests prove (1) comprehension — B expands A's compacted messages correctly using only what they negotiated, (2) ≥50% token/size reduction vs unnegotiated prose across the conversation, (3) round-trip fidelity of the negotiated glossary |
-| c18 | **Zero-config onboarding** | omp-extension suite green AND `dap_invite` in `src` AND name-derived default identity (`defaultKeyPath`) AND auto channel keygen in `src` AND invite/auto-keygen covered by tests — an omp agent needs at most `DAP_AGENT_NAME` |
+| c18 | **Zero-config onboarding (every adapter)** | ALL FOUR adapter suites green AND each has: invite tool (`dap_invite`/`inviteTo`), name-derived identity default, channel keygen/persistence, zero-config tests — an agent on any harness needs at most `DAP_AGENT_NAME` |
 
 ### Metric Mutability
 
 - [x] **Locked** — The criteria are the spec. `scripts/score.sh` and this table are non-editable.
   - Amendment 2026-08-21 by goal owner: c17 added — agents themselves develop a minimal-token language to communicate; max 16 → 17. (Supersedes first wording: a fixed human-authored codec is NOT the goal — the language must be negotiated by the agents at runtime.)
   - Amendment 2026-08-21 (second) by goal owner: **c18 added — zero-config onboarding** (max 17 → 18). Post-completion testing showed v1 shipped the protocol layer raw: manual keygen one-liners, per-terminal env boilerplate, file-copy key distribution. Now required of the omp extension: identity file derived from agent name (`~/.dap/keys/<name|hostname>.key`, auto-created 0600), channel x25519 keypairs auto-generated and persisted on first send, channel membership distributed over E2E-DM invites (`dap_invite`, `{t:chankey}` payload), optional persisted config (`~/.dap/config.json`; precedence env > file > defaults). An agent must need at most `DAP_AGENT_NAME`. Verified live against the real hub (commits 0a9316d, 2ddeb02, 5f79aa9).
+  - Amendment 2026-08-22 (third) by goal owner: **c18 scope widened — zero-config onboarding is required of EVERY adapter** (omp, mcp-bridge, dsh, fah), not omp alone ("all must work identically"). score.sh checks each adapter's suite green + invite tool + name-derived identity default + channel keygen/persistence + zero-config tests. Per-adapter identity subdirs (`~/.dap/keys/<adapter>/<name|hostname>.key`) prevent cross-harness identity collision.
 
 ## Operating Mode
 

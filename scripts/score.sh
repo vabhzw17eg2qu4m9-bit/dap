@@ -138,13 +138,20 @@ if [ "$mcp_rc" = 0 ] && grep -qi 'glossary' docs/protocol.md 2>/dev/null \
   && ! grep -rqi 'DICTIONARY *=' adapters/mcp-bridge/src 2>/dev/null; then
   R[c17_min_token_protocol]=pass; else R[c17_min_token_protocol]=fail; fi
 
-# c18: zero-config onboarding — omp extension self-configures (identity from agent name,
-# auto channel keygen + persistence, channel keys distributed via E2E-DM invites);
-# an omp agent needs at most DAP_AGENT_NAME
-if [ "$omp_rc" = 0 ] && grep -rq 'dap_invite' adapters/omp-extension/src 2>/dev/null \
-  && grep -rq 'defaultKeyPath' adapters/omp-extension/src 2>/dev/null \
-  && grep -rqiE 'auto.?keygen|newChannelKeypair' adapters/omp-extension/src 2>/dev/null \
-  && grep -rqiE 'invite|auto.?keygen' adapters/omp-extension/test 2>/dev/null; then
+# c18: zero-config onboarding — EVERY adapter self-configures (identity from agent
+# name under ~/.dap/keys/<adapter>/, channel auto-keygen + persistence, channel
+# keys distributed via E2E-DM invites); an agent needs at most DAP_AGENT_NAME
+zero_config_ok() { # <src-dir> <test-dir> <suite-rc>
+  [ "$3" = 0 ] || return 1
+  grep -rqE 'dap_invite|inviteTo' "$1" 2>/dev/null || return 1
+  grep -rqE 'defaultKeyPath|keys/fah' "$1" 2>/dev/null || return 1
+  grep -rqE 'newChannelKeypair|ChannelStore' "$1" 2>/dev/null || return 1
+  grep -rqE 'invite|zero.?config|auto.?keygen' "$2" 2>/dev/null || return 1
+}
+if zero_config_ok adapters/omp-extension/src adapters/omp-extension/test "$omp_rc" \
+  && zero_config_ok adapters/mcp-bridge/src adapters/mcp-bridge/tests "$mcp_rc" \
+  && zero_config_ok adapters/dsh-plugin/src adapters/dsh-plugin/tests "$dsh_rc" \
+  && zero_config_ok adapters/fah-hub-client/lib adapters/fah-hub-client/test "$fah_rc"; then
   R[c18_zero_config]=pass; else R[c18_zero_config]=fail; fi
 
 # --- JSON output ---
