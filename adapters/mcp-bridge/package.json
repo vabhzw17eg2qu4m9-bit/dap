@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Universal MCP stdio bridge for the Distributed Agents Platform (DAP/1): one outbound WSS to the hub, four dap_* tools",
+  "description": "Universal MCP stdio bridge for the Distributed Agents Platform (DAP/1): one outbound WSS to the hub, seven dap_* tools",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",

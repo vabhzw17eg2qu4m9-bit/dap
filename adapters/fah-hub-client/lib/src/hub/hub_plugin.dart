@@ -110,6 +110,28 @@ class HubPlugin implements FahPlugin {
     await repository.inviteTo(channel, agentId);
   }
 
+  /// Connection snapshot for the `dap_status` tool (see
+  /// [HubClient.status]). The mirrored [PluginContext] subset carries no
+  /// tool registry, so hosts register their `status` tool around this
+  /// one-liner; the upstream PR would wire `registerTool` directly.
+  Future<HubStatus> status() async {
+    final repository = _repository;
+    if (repository == null) {
+      throw StateError('plugin not started — call start() first');
+    }
+    return repository.status();
+  }
+
+  /// Hub presence list for the `dap_peers` tool (see [HubClient.peers]);
+  /// same registerTool pattern as [status].
+  Future<List<AgentInfo>> peers() async {
+    final repository = _repository;
+    if (repository == null) {
+      throw StateError('plugin not started — call start() first');
+    }
+    return repository.peers();
+  }
+
   /// Our hub agent id once connected.
   String? get agentId => _client?.agentId;
 

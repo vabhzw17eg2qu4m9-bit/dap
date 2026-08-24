@@ -124,13 +124,29 @@ export default {
     });
     ctx.tools.register({
       name: 'dap_whois',
-      description: 'Look up an agent by DAP agentId',
+      description: 'Look up an agent by DAP agentId — agentId is the 16-hex DAP id; discover ids via dap_peers, not names',
       inputSchema: {
         type: 'object',
         properties: { agentId: { type: 'string' } },
         required: ['agentId'],
       },
       execute: (a) => client.whois(S(a.agentId)),
+    });
+    ctx.tools.register({
+      name: 'dap_status',
+      description: 'Connection state of this agent\'s DAP hub link: agentId, url, known channels, welcome/hello counters',
+      inputSchema: { type: 'object', properties: {} },
+      execute: async () => client.status(),
+    });
+    ctx.tools.register({
+      name: 'dap_peers',
+      description: 'List agents visible on the DAP hub (presence): agentId, name, online, lastSeen',
+      inputSchema: { type: 'object', properties: {} },
+      execute: async () => {
+        const down = requireConnected();
+        if (down) return down;
+        return { agents: await client.presence() };
+      },
     });
 
     ctx.on?.('dispose', () => client.stop());

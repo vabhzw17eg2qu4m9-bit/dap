@@ -36,6 +36,14 @@ export interface MsgEvent {
   ts: number;
 }
 
+/** One entry of a hub `presence` frame (spec § presence). */
+export interface PresenceAgent {
+  agentId: string;
+  name?: string;
+  online: boolean;
+  lastSeen: number;
+}
+
 export interface ClientOpts {
   url: string;
   keyPath: string;
@@ -123,6 +131,10 @@ export class DapClient {
   private delay: number;
   private welcomed = false;
   private stopped = false;
+  /** hello frames sent (connection attempts) / welcome frames received. */
+  hellos = 0;
+  welcomes = 0;
+  private readonly presenceWaiters: ((f: dap.Frame) => void)[] = [];
   lastError = '';
 
   constructor(opts: ClientOpts) {
@@ -180,6 +192,40 @@ export class DapClient {
       name: info.name,
       online: info.online,
     };
+  }
+
+  /** Self-reported connection state (identity, link, known channels, counters). */
+  status(): { connected: boolean; agentId: string; name: string; url: string; channels: string[]; welcomes: number; hellos: number } {
+    return {
+      connected: this.connected,
+      agentId: this.agentId,
+      name: this.opts.name ?? '',
+      url: this.opts.url,
+      channels: [...this.channels.keys()],
+      welcomes: this.welcomes,
+      hellos: this.hellos,
+    };
+  }
+
+  /** Presence list from the hub (spec § presence); bounded wait for the reply. */
+  async presence(): Promise<PresenceAgent[]> {
+    if (!this.connected) throw new Error(NOT_CONNECTED);
+    const { promise, resolve, reject } = Promise.withResolvers<dap.Frame>();
+    const timer = setTimeout(() => {
+      const i = this.presenceWaiters.indexOf(resolve);
+      if (i >= 0) this.presenceWaiters.splice(i, 1);
+      reject(new Error('presence: hub did not reply'));
+    }, READY_TIMEOUT_MS);
+    this.presenceWaiters.push(resolve);
+    this.ws?.send(JSON.stringify({ op: 'presence_query' }));
+    const frame = await promise.finally(() => clearTimeout(timer));
+    const agents = Array.isArray(frame.agents) ? (frame.agents as Record<string, unknown>[]) : [];
+    return agents.map((a) => ({
+      agentId: String(a.agentId),
+      name: a.name === undefined ? undefined : String(a.name),
+      online: Boolean(a.online),
+      lastSeen: Number(a.lastSeen),
+    }));
   }
 
   /** Send an E2E-encrypted message to a channel. Unknown channel = zero-config
@@ -273,6 +319,7 @@ export class DapClient {
   }
 
   private sendHello(): void {
+    this.hellos++;
     const frame: dap.Frame = {
       op: 'hello',
       v: 1,
@@ -307,8 +354,11 @@ export class DapClient {
       case 'error':
         this.onHubErrorFrame(frame);
         break;
+      case 'presence':
+        for (const r of this.presenceWaiters.splice(0)) r(frame);
+        break;
       default:
-        break; // presence / flushed: nothing to do
+        break; // flushed: nothing to do
     }
   }
 
@@ -328,6 +378,7 @@ export class DapClient {
 
   private onWelcome(): void {
     this.welcomed = true;
+    this.welcomes++;
     this.delay = this.initialMs; // backoff resets after a successful welcome
     this.ws?.send(JSON.stringify({ op: 'flush' }));
     // Membership: join every known channel after each welcome (idempotent;

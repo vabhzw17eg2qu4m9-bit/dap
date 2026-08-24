@@ -47,6 +47,34 @@ class AgentInfo {
   final SimplePublicKey? dhPublicKey;
 }
 
+/// Connection snapshot for the `dap_status` tool: who we are, where we
+/// are connected, what we can send to, and how the handshake is going.
+class HubStatus {
+  const HubStatus({
+    required this.connected,
+    required this.agentId,
+    required this.name,
+    required this.url,
+    required this.channels,
+    required this.welcomes,
+    required this.hellos,
+  });
+
+  final bool connected;
+  final String? agentId;
+  final String? name;
+  final String? url;
+
+  /// Names of every channel we hold a key for (store ∪ explicit config).
+  final List<String> channels;
+
+  /// Successful handshakes (hub `welcome` frames received).
+  final int welcomes;
+
+  /// Connection attempts — one signed `hello` sent per attempt.
+  final int hellos;
+}
+
 /// One inbound `msg` frame: decrypted when a key is available.
 class InboundMessage {
   InboundMessage({
@@ -98,6 +126,11 @@ class HubClient {
   bool _closing = false;
   int _reconnectAttempt = 0;
 
+  /// Handshake counters (see [status]): one hello per connection attempt,
+  /// one welcome per accepted handshake.
+  int _hellos = 0;
+  int _welcomes = 0;
+
   final _firstWelcome = Completer<String>();
   Completer<bool>? _welcomeCompleter;
   Completer<int>? _flushCompleter;
@@ -116,9 +149,16 @@ class HubClient {
   /// Hub rejections must never be silent — listeners surface them.
   Stream<HubError> get errors => _errors.stream;
 
-  /// True while a welcome was received on a currently open socket.
+  /// True while a welcome was received on a currently open socket and the
+  /// client was not deliberately disconnected ([disconnect]). The
+  /// `!_closing` guard matters: dart:io can leave `readyState` at `open`
+  /// even after `close()` completed, so without it a post-disconnect
+  /// [status] would claim `connected: true`.
   bool get connected =>
-      _ws != null && _ws!.readyState == WebSocket.open && _firstWelcome.isCompleted;
+      !_closing &&
+      _ws != null &&
+      _ws!.readyState == WebSocket.open &&
+      _firstWelcome.isCompleted;
 
   /// Completes with our agent id after the first welcome.
   Future<String> get welcomed => _firstWelcome.future;
@@ -193,6 +233,7 @@ class HubClient {
       onError: (Object _) => _abandon(welcomed, done),
       cancelOnError: true,
     );
+    _hellos++;
     ws.add(jsonEncode(await _helloFrame()));
     final bool ok;
     try {
@@ -385,6 +426,8 @@ class HubClient {
   }
 
   /// Whois with caching — the spec-required lookup before a first DM.
+  /// [targetAgentId] is the 16-hex DAP id — discover ids via [peers]
+  /// (presence), not names.
   Future<AgentInfo> whois(String targetAgentId) async {
     final cached = _whoisCache[targetAgentId];
     if (cached != null) return cached;
@@ -417,6 +460,32 @@ class HubClient {
     return completer.future.then((_) => _presenceResult ?? const []);
   }
 
+  /// Presence list from the hub (`dap_peers`): one [AgentInfo] per known
+  /// agent, self included, each flagged online/offline. Same wire op as
+  /// [presenceQuery].
+  Future<List<AgentInfo>> peers() => presenceQuery();
+
+  /// Snapshot for the `dap_status` tool — safe to call any time, also
+  /// before the first welcome or after a drop (then `connected` is false
+  /// and the counters tell the reconnect story).
+  HubStatus status() => HubStatus(
+        connected: connected,
+        agentId: agentId,
+        name: config.name,
+        url: config.url,
+        channels: knownChannels,
+        welcomes: _welcomes,
+        hellos: _hellos,
+      );
+
+  /// Every channel this client can send to: store keys (zero-config
+  /// lifecycle) ∪ explicit config keys, sorted.
+  List<String> get knownChannels => {
+        ...?channelStore?.all.keys,
+        ...config.channels.keys,
+      }.toList()
+        ..sort();
+
   void _send(Map<String, dynamic> frame) {
     final ws = _ws;
     if (ws == null || ws.readyState != WebSocket.open) {
@@ -437,6 +506,7 @@ class HubClient {
     }
     switch (frame['op'] as String?) {
       case 'welcome':
+        _welcomes++;
         _welcomedAgentId = frame['agentId'] as String?;
         _completeWelcome(true);
       case 'error':

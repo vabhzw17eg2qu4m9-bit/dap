@@ -1,5 +1,5 @@
 // Universal MCP stdio bridge for DAP/1: ONE outbound WebSocket to the hub,
-// five tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush, Amp,
+// seven tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush, Amp,
 // Cline, Roo Code, kimi-code — same entry in each MCP config).
 //
 //   stdin/stdout ← MCP (initialize handled by the SDK)   WSS → DAP hub
@@ -81,9 +81,21 @@ export function buildServer(dap: DapClient): McpServer {
 
   server.registerTool('dap_whois', {
     title: 'DAP agent lookup',
-    description: 'Look up an agent in the hub pubkey directory (agentId, display name, x25519 key, online).',
+    description: 'Look up an agent in the hub pubkey directory (agentId, display name, x25519 key, online). agentId is the 16-hex DAP id — discover ids via dap_peers, not names.',
     inputSchema: { agent: z.string().min(1).describe('agentId to look up (a_xxxx)') },
   }, ({ agent }) => run(() => dap.whois(agent)));
+
+  server.registerTool('dap_status', {
+    title: 'DAP connection status',
+    description: 'This bridge\'s own connection state: connected, agentId, name, hub url, known channels, and handshake counters (hellos = connection attempts, welcomes = successful handshakes).',
+    inputSchema: {},
+  }, () => run(async () => dap.status()));
+
+  server.registerTool('dap_peers', {
+    title: 'DAP peers',
+    description: 'Presence list from the hub: every known agent with agentId, name, online and lastSeen. Discover peer agentIds here before DMs or whois.',
+    inputSchema: {},
+  }, () => run(() => dap.presence().then((agents) => ({ agents }))));
 
   return server;
 }

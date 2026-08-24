@@ -84,6 +84,7 @@ export class FakeHub {
     if (!agentId) return undefined;
     if (frame.op === 'flush') ws.send(JSON.stringify({ op: 'flushed', count: 0 }));
     else if (frame.op === 'whois') this.onWhois(frame, ws);
+    else if (frame.op === 'presence_query') this.onPresenceQuery(ws);
     else if (frame.op === 'join') this.onJoin(frame, ws, agentId);
     else if (frame.op === 'send') this.onSend(frame, ws, agentId);
     return undefined;
@@ -124,6 +125,19 @@ export class FakeHub {
         online: true,
       }),
     );
+  }
+
+  /** Spec § presence: registry = connected plugins + the synthetic peer
+   *  (a hub-lifetime agent, always online). */
+  private onPresenceQuery(ws: WebSocket): void {
+    const agents = [...this.agents.entries()].map(([agentId, a]) => ({
+      agentId,
+      name: a.name,
+      online: a.ws !== null,
+      lastSeen: Date.now(),
+    }));
+    agents.push({ agentId: this.peerId, name: 'peer', online: true, lastSeen: Date.now() });
+    ws.send(JSON.stringify({ op: 'presence', agents }));
   }
 
   /** Spec § join: first join creates the channel and registers chanPubkey;

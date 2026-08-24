@@ -64,6 +64,13 @@ class HubMessagingRepository implements MessagingRepository {
   Future<void> inviteTo(String channel, String agentId) =>
       client.inviteTo(channel, agentId);
 
+  /// `dap_status` passthrough (see [HubClient.status]): connection state,
+  /// identity, known channels, and hello/welcome counters.
+  HubStatus status() => client.status();
+
+  /// `dap_peers` passthrough (see [HubClient.peers]): hub presence list.
+  Future<List<AgentInfo>> peers() => client.peers();
+
   @override
   Future<void> register(String agentId) => start();
 

@@ -1,7 +1,7 @@
 // MCP conformance: drive the BUILT server artifact (`node dist/server.js`)
 // over real stdio with the SDK client against the LIVE hub binary.
-// initialize handshake → tools/list (four dap tools) → tools/call dap_send
-// round-trip → dap_dm / dap_whois / dap_inbox.
+// initialize handshake → tools/list (the seven dap tools) → tools/call
+// dap_send round-trip → dap_dm / dap_whois / dap_status / dap_peers / dap_inbox.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -44,10 +44,10 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
   const client = new Client({ name: 'dap-conformance-check', version: '0.1.0' });
   await client.connect(transport); // performs the MCP initialize handshake
 
-  // tools/list: exactly the five dap tools
+  // tools/list: exactly the seven dap tools
   const listed = await client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema);
   const names = listed.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_send', 'dap_whois']);
+  assert.deepEqual(names, ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois']);
 
   // tools/call dap_send: creates the channel, E2E round-trips through the live hub
   const sent = textOf(await client.callTool({ name: 'dap_send', arguments: { channel: 'conformance', text: 'round-trip through the live hub' } }));
@@ -64,6 +64,21 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
   assert.equal(who.agentId, sent.from);
   assert.equal(who.name, 'conformance-1');
   assert.equal(who.online, true);
+
+  // tools/call dap_status: live snapshot of the bridge's own connection
+  const st = textOf(await client.callTool({ name: 'dap_status', arguments: {} }));
+  assert.equal(st.connected, true);
+  assert.equal(st.agentId, sent.from);
+  assert.equal(st.url, hub.url);
+  assert.equal(st.name, 'conformance-1');
+  assert.ok(st.hellos >= 1, 'at least one connection attempt');
+  assert.ok(st.welcomes >= 1, 'at least one successful handshake');
+  assert.deepEqual(st.channels, ['conformance']);
+
+  // tools/call dap_peers: the hub registry lists us online
+  const peers = textOf(await client.callTool({ name: 'dap_peers', arguments: {} })) as unknown as { agents: Array<{ agentId: string; online?: boolean }> };
+  const self = (peers.agents ?? []).find((a) => a.agentId === sent.from);
+  assert.equal(self?.online, true);
 
   // tools/call dap_inbox: sender echo of the channel send + the self-DM
   let inbox = {} as InboxResult;

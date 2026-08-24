@@ -50,6 +50,25 @@ export interface WhoisInfo {
   online?: boolean;
 }
 
+export interface PresenceAgent {
+  agentId: string;
+  name?: string;
+  online?: boolean;
+  lastSeen?: number;
+}
+
+export interface StatusInfo {
+  connected: boolean;
+  agentId: string;
+  name?: string;
+  url: string;
+  channels: string[];
+  /** Successful welcome handshakes (one per authenticated connection). */
+  welcomes: number;
+  /** Connection attempts (one hello per socket open). */
+  hellos: number;
+}
+
 export interface SendResult {
   ok: true;
   id: string;
@@ -120,7 +139,11 @@ export class DapClient {
   private readonly joined = new Set<string>();
   private readonly inboxMsgs: MsgEvent[] = [];
   private readonly known = new Map<string, PeerInfo>();
+  /** Connection attempts (hellos sent); `welcomes` counts the ones that authenticated. */
+  hellos = 0;
+  welcomes = 0;
   private readonly whoisWaiters = new Map<string, Array<(info?: PeerInfo) => void>>();
+  private readonly presenceWaiters: Array<(err?: Error, agents?: PresenceAgent[]) => void> = [];
   private readonly joinWaiters = new Map<string, Array<(err?: Error) => void>>();
   private readonly readyWaiters: Array<() => void> = [];
   private readonly listeners = new Set<(m: MsgEvent) => void>();
@@ -297,6 +320,44 @@ export class DapClient {
     return out;
   }
 
+  /** Snapshot of this client's connection state (the MCP `dap_status` tool). */
+  status(): StatusInfo {
+    return {
+      connected: this.connected,
+      agentId: this.agentId,
+      name: this.opts.name,
+      url: this.opts.url,
+      channels: [...this.channels.keys()],
+      welcomes: this.welcomes,
+      hellos: this.hellos,
+    };
+  }
+
+  /** Hub presence list (the MCP `dap_peers` tool): every agent in the
+   *  registry with online/lastSeen. Bounded wait, like whois. */
+  async presence(): Promise<PresenceAgent[]> {
+    if (!this.connected) throw new Error(NOT_CONNECTED);
+    const { promise, resolve, reject } = Promise.withResolvers<PresenceAgent[]>();
+    const done = (err?: Error, agents?: PresenceAgent[]) => {
+      clearTimeout(timer);
+      if (err) reject(err); else resolve(agents ?? []);
+    };
+    const timer = setTimeout(() => {
+      const i = this.presenceWaiters.indexOf(done);
+      if (i >= 0) this.presenceWaiters.splice(i, 1);
+      reject(new Error('timeout waiting for presence'));
+    }, WAIT_MS);
+    this.presenceWaiters.push(done);
+    try {
+      this.sendFrame({ op: 'presence_query' });
+    } catch (err) {
+      const i = this.presenceWaiters.indexOf(done);
+      if (i >= 0) this.presenceWaiters.splice(i, 1);
+      done(err as Error);
+    }
+    return promise;
+  }
+
   /** Drain the decrypted inbox (pull-mode inbound — the MCP `dap_inbox` tool). */
   drainInbox(): MsgEvent[] {
     return this.inboxMsgs.splice(0);
@@ -332,6 +393,7 @@ export class DapClient {
   }
 
   private sendHello(): void {
+    this.hellos++;
     const frame: dap.Frame = {
       op: 'hello',
       v: 1,
@@ -357,14 +419,16 @@ export class DapClient {
       case 'welcome': this.onWelcome(); break;
       case 'joined': this.onJoined(String(frame.channel)); break;
       case 'agent_info': this.onAgentInfo(frame); break;
+      case 'presence': this.onPresence(frame); break;
       case 'msg': void this.onMsg(frame); break;
       case 'error': this.onError(frame); break;
-      default: break; // presence / flushed: nothing to do
+      default: break; // flushed: nothing to do
     }
   }
 
   private onWelcome(): void {
     this.welcomed = true;
+    this.welcomes++;
     this.delay = this.initialMs; // backoff resets after a successful welcome
     this.joined.clear(); // hub membership is in-memory: re-join on demand
     this.ws?.send(JSON.stringify({ op: 'flush' })); // drain offline mailbox
@@ -379,6 +443,22 @@ export class DapClient {
     this.joined.add(channel);
     for (const done of this.joinWaiters.get(channel) ?? []) done();
     this.joinWaiters.delete(channel);
+  }
+
+  /** A presence frame either answers our `presence_query` (full registry
+   *  snapshot) or broadcasts a peer's online/offline to channel-mates —
+   *  both carry the same shape, so both resolve pending waiters. */
+  private onPresence(frame: dap.Frame): void {
+    const agents = (Array.isArray(frame.agents) ? frame.agents : []).map((a) => {
+      const e = a as Record<string, unknown>;
+      return {
+        agentId: String(e.agentId),
+        name: e.name as string | undefined,
+        online: e.online as boolean | undefined,
+        lastSeen: e.lastSeen as number | undefined,
+      };
+    });
+    for (const done of this.presenceWaiters.splice(0)) done(undefined, agents);
   }
 
   private onError(frame: dap.Frame): void {

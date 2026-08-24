@@ -188,4 +188,48 @@ void main() {
     await alice.disconnect();
     await bob.disconnect();
   }, timeout: timeout);
+
+  test('status: connected, identity, url, known channels, counters', () async {
+    final client = HubClient(
+      config: HubConfig(url: hub.url.toString(), channels: {'general': 'AA'}),
+      identity: await HubIdentity.generate(),
+      backoff: tinyBackoff,
+    );
+
+    // Before connecting: honest offline snapshot, channels already known.
+    final before = client.status();
+    expect(before.connected, isFalse);
+    expect(before.agentId, isNull);
+    expect(before.name, isNull);
+    expect(before.url, hub.url.toString());
+    expect(before.channels, ['general']);
+    expect(before.hellos, 0);
+    expect(before.welcomes, 0);
+
+    await client.connect();
+    final status = client.status();
+    expect(status.connected, isTrue);
+    expect(status.agentId, client.agentId);
+    expect(status.url, hub.url.toString());
+    expect(status.channels, ['general']);
+    expect(status.hellos, 1); // one connection attempt so far
+    expect(status.welcomes, 1); // and it was accepted
+
+    await client.disconnect();
+    final after = client.status();
+    expect(after.connected, isFalse); // disconnect() is synchronous truth
+    expect(after.agentId, client.agentId); // identity survives the drop
+    expect(after.hellos, 1); // disconnect() disarms the reconnect loop
+  }, timeout: timeout);
+
+  test('peers: includes self with online=true', () async {
+    final client = await connect(hub, await HubIdentity.generate());
+
+    final peers = await client.peers();
+    final self = peers.firstWhere((p) => p.agentId == client.agentId);
+    expect(self.online, isTrue);
+    expect(peers.length, greaterThanOrEqualTo(1));
+
+    await client.disconnect();
+  }, timeout: timeout);
 }

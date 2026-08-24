@@ -84,12 +84,56 @@ test('apply() registers dap tools on the Cordis context', async () => {
     applyTo(hub, tmpKeyPath(), fc);
     assert.deepEqual(
       fc.tools.map((t) => t.name).sort(),
-      ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_send', 'dap_whois'],
+      ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois'],
     );
     for (const t of fc.tools) {
       const schema: Record<string, unknown> = t.inputSchema;
       assert.equal(schema.type, 'object');
     }
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('dap_status: identity, link state, channels and handshake counters', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush'); // handshake done, channels joined
+    const st = (await tool(fc, 'dap_status').execute({})) as Record<string, unknown>;
+    assert.equal(st.connected, true);
+    assert.equal(st.agentId, hub.pluginAgentId);
+    assert.equal(st.name, 'dsh-test');
+    assert.equal(st.url, hub.url);
+    assert.deepEqual(st.channels, ['general']);
+    assert.equal(st.hellos, 1, 'one connection attempt');
+    assert.equal(st.welcomes, 1, 'one successful handshake');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('dap_peers: presence_query -> presence frame; lists itself + the fake-hub peer', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    const out = (await tool(fc, 'dap_peers').execute({})) as { agents: Record<string, unknown>[] };
+    const wire = await hub.waitFor((f) => f.op === 'presence_query');
+    assert.equal(wire.op, 'presence_query', 'asks the hub, not local cache');
+    const byId = new Map(out.agents.map((a) => [String(a.agentId), a]));
+    assert.ok(byId.has(hub.pluginAgentId), 'lists itself');
+    assert.ok(byId.has(hub.peerId), 'lists the second fake-hub agent');
+    const self = byId.get(hub.pluginAgentId)!;
+    assert.equal(self.name, 'dsh-test');
+    assert.equal(self.online, true);
+    assert.ok(Number(self.lastSeen) > 0);
+    const peer = byId.get(hub.peerId)!;
+    assert.equal(peer.online, true);
   } finally {
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
