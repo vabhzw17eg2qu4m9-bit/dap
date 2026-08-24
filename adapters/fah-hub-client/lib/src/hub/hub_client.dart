@@ -460,10 +460,18 @@ class HubClient {
     return completer.future.then((_) => _presenceResult ?? const []);
   }
 
-  /// Presence list from the hub (`dap_peers`): one [AgentInfo] per known
-  /// agent, self included, each flagged online/offline. Same wire op as
+  /// Presence list from the hub (`dap_peers`): ONLINE ONLY by default —
+  /// one [AgentInfo] per connected agent, self included, each flagged
+  /// online/offline. Set [includeOffline] to true to also list offline
+  /// agents (their DMs queue to the hub mailbox). Same wire op as
   /// [presenceQuery].
-  Future<List<AgentInfo>> peers() => presenceQuery();
+  Future<List<AgentInfo>> peers({bool includeOffline = false}) async {
+    final agents = await presenceQuery();
+    return includeOffline ? agents : [
+        for (final agent in agents)
+          if (agent.online) agent,
+      ];
+  }
 
   /// Snapshot for the `dap_status` tool — safe to call any time, also
   /// before the first welcome or after a drop (then `connected` is false

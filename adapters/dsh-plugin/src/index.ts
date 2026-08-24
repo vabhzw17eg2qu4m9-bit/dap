@@ -140,12 +140,16 @@ export default {
     });
     ctx.tools.register({
       name: 'dap_peers',
-      description: 'List agents visible on the DAP hub (presence): agentId, name, online, lastSeen',
-      inputSchema: { type: 'object', properties: {} },
-      execute: async () => {
+      description: 'Agents on the hub, ONLINE ONLY by default (agentId, name, online, lastSeen). Set includeOffline:true to also list offline agents (their DMs queue to the hub mailbox).',
+      inputSchema: {
+        type: 'object',
+        properties: { includeOffline: { type: 'boolean', description: 'Also list offline agents (default false)' } },
+      },
+      execute: async (a) => {
         const down = requireConnected();
         if (down) return down;
-        return { agents: await client.presence() };
+        const all = await client.presence();
+        return { agents: a.includeOffline === true ? all : all.filter((p) => p.online) };
       },
     });
 

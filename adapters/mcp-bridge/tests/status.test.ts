@@ -2,13 +2,19 @@
 // connected false→true across start()/welcome (hellos = connection attempts,
 // welcomes = successful handshakes), and the presence query (presence_query
 // op → presence frame) lists the agent itself with agentId + online.
+// dap_peers tool offline filter: default lists online agents only;
+// includeOffline:true also lists offline peers (in-memory MCP transport).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DapClient } from '../src/client.js';
+import { buildServer } from '../src/server.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { startHub } from './hub.js';
+import { pollUntil } from './util.js';
 
 const hub = await startHub(); // one hub per test file (hub.ts caches)
 after(() => hub.stop().then((exit) => {
@@ -56,4 +62,43 @@ test('dap_peers: presence query lists itself (agentId + online) via the real hub
   assert.equal(self?.online, true);
 
   c.stop();
+});
+
+test('dap_peers tool: offline agent excluded by default, listed with includeOffline:true', async () => {
+  const survivor = newClient('peers-survivor');
+  const leaver = newClient('peers-leaver');
+  survivor.start();
+  leaver.start();
+  await Promise.all([survivor.ready(), leaver.ready()]);
+
+  // The hub registry must see the leaver online before dropping it.
+  const seen = async (online: boolean) =>
+    (await survivor.presence()).find((a) => a.agentId === leaver.agentId)?.online === online;
+  await pollUntil(() => seen(true));
+
+  // Drop the leaver; poll presence until the hub marks it offline (no sleeps).
+  leaver.stop();
+  await pollUntil(() => seen(false));
+
+  // Drive the real dap_peers tool through an in-memory MCP transport.
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  const mcp = new Client({ name: 'dap-peers-test', version: '0.1.0' });
+  await buildServer(survivor).connect(serverSide);
+  await mcp.connect(clientSide);
+  const peers = async (args: Record<string, unknown>) => {
+    const res = await mcp.callTool({ name: 'dap_peers', arguments: args });
+    return JSON.parse(res.content?.find((c) => c.type === 'text')?.text ?? '{}') as { agents: Array<{ agentId: string; online?: boolean }> };
+  };
+
+  const online = await peers({});
+  assert.ok(online.agents.some((a) => a.agentId === survivor.agentId), 'survivor listed by default');
+  assert.ok(online.agents.every((a) => a.online === true), 'default dap_peers lists online agents only');
+  assert.ok(!online.agents.some((a) => a.agentId === leaver.agentId), 'offline leaver excluded by default');
+
+  const all = await peers({ includeOffline: true });
+  const dropped = all.agents.find((a) => a.agentId === leaver.agentId);
+  assert.equal(dropped?.online, false, 'includeOffline:true lists the leaver as offline');
+
+  await mcp.close();
+  survivor.stop();
 });

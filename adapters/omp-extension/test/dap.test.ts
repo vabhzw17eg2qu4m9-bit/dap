@@ -653,3 +653,32 @@ test('footer status line: persistent connection info visible without asking', as
     await hub.close();
   }
 });
+
+test('dap_peers: online-only by default, includeOffline lists everyone', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'online-a' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'gone-b' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    hub.drop(extB.client.agentId);
+    await hub.waitOffline(extB.client.agentId);
+
+    const online = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(a, 'dap_peers');
+    assert.ok(online.agents.some((x) => x.agentId === extA.client.agentId), 'self listed');
+    assert.ok(!online.agents.some((x) => x.agentId === extB.client.agentId), 'offline agent hidden by default');
+    assert.ok(online.agents.every((x) => x.online === true), 'all entries online');
+
+    const all = await run<{ agents: string[] }>(a, 'dap_peers', { includeOffline: true });
+    assert.ok(
+      (all.agents as unknown as Array<{ agentId: string }>).some((x) => x.agentId === extB.client.agentId),
+      'includeOffline:true lists the offline agent',
+    );
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});

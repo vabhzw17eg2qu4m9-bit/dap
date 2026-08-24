@@ -68,8 +68,10 @@ class HubMessagingRepository implements MessagingRepository {
   /// identity, known channels, and hello/welcome counters.
   HubStatus status() => client.status();
 
-  /// `dap_peers` passthrough (see [HubClient.peers]): hub presence list.
-  Future<List<AgentInfo>> peers() => client.peers();
+  /// `dap_peers` passthrough (see [HubClient.peers]): online-only hub
+  /// presence list unless [includeOffline] is true.
+  Future<List<AgentInfo>> peers({bool includeOffline = false}) =>
+      client.peers(includeOffline: includeOffline);
 
   @override
   Future<void> register(String agentId) => start();

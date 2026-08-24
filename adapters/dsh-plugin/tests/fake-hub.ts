@@ -246,6 +246,11 @@ export class FakeHub {
     if (a) a.ws = null;
   }
 
+  /** Server-side view: is this agent's socket still open? */
+  isOnline(agentId: string): boolean {
+    return this.agents.get(agentId)?.ws != null;
+  }
+
   async stop(): Promise<void> {
     for (const a of this.agents.values()) a.ws?.terminate();
     for (const c of this.wss.clients) c.terminate();

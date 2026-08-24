@@ -338,9 +338,16 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_peers',
-    description: 'All agents on the hub (id, name, online, lastSeen). Discover agentIds here — they are 16-hex ids, never names.',
-    parameters: { type: 'object', properties: {} },
-    execute: async () => toolResult({ agents: await client.presence() }),
+    description: 'Agents on the hub, ONLINE ONLY by default (id, name, lastSeen). Discover agentIds here — they are 16-hex ids, never names. Set includeOffline:true to also list offline agents (their DMs queue to the hub mailbox).',
+    parameters: {
+      type: 'object',
+      properties: { includeOffline: { type: 'boolean', description: 'Also list offline agents (default false)' } },
+    },
+    execute: async (_toolCallId, params) => {
+      const all = await client.presence();
+      const agents = params.includeOffline === true ? all : all.filter((a) => a.online);
+      return toolResult({ agents });
+    },
   });
 
   const dispose = (): void => client.stop();

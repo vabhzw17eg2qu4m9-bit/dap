@@ -93,9 +93,11 @@ export function buildServer(dap: DapClient): McpServer {
 
   server.registerTool('dap_peers', {
     title: 'DAP peers',
-    description: 'Presence list from the hub: every known agent with agentId, name, online and lastSeen. Discover peer agentIds here before DMs or whois.',
-    inputSchema: {},
-  }, () => run(() => dap.presence().then((agents) => ({ agents }))));
+    description: 'Presence list from the hub, ONLINE ONLY by default: agents with agentId, name, online and lastSeen. Discover peer agentIds here before DMs or whois. Set includeOffline:true to also list offline agents (their DMs queue to the hub mailbox).',
+    inputSchema: { includeOffline: z.boolean().optional().describe('Also list offline agents (default false)') },
+  }, ({ includeOffline }) => run(() => dap.presence().then((all) => ({
+    agents: includeOffline === true ? all : all.filter((a) => a.online === true),
+  }))));
 
   return server;
 }

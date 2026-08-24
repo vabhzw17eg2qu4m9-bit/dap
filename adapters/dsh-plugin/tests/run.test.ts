@@ -116,26 +116,47 @@ test('dap_status: identity, link state, channels and handshake counters', async 
   }
 });
 
-test('dap_peers: presence_query -> presence frame; lists itself + the fake-hub peer', async () => {
+test('dap_peers: online only by default; includeOffline:true also lists a dropped agent', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
+  const other = fakeCtx();
   try {
     applyTo(hub, tmpKeyPath(), fc);
     await hub.waitFor((f) => f.op === 'flush');
-    const out = (await tool(fc, 'dap_peers').execute({})) as { agents: Record<string, unknown>[] };
+    const selfId = hub.pluginAgentId; // before the second client takes lastAgentId
+
+    // Second client handshakes, then goes away for good: the hub keeps it in
+    // the presence registry, marked offline.
+    const clientOther = plugin.apply(other.ctx, {
+      url: hub.url,
+      keyPath: tmpKeyPath(),
+      name: 'dsh-other',
+      channels: channelConfig(hub),
+      backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await until(() => hub.hellos === 2);
+    for (const cb of other.disposeCbs.splice(0)) cb(); // client.stop(): no reconnect
+    await until(() => !hub.isOnline(clientOther.agentId));
+
+    const def = tool(fc, 'dap_peers');
+    const out = (await def.execute({})) as { agents: Record<string, unknown>[] };
     const wire = await hub.waitFor((f) => f.op === 'presence_query');
     assert.equal(wire.op, 'presence_query', 'asks the hub, not local cache');
     const byId = new Map(out.agents.map((a) => [String(a.agentId), a]));
-    assert.ok(byId.has(hub.pluginAgentId), 'lists itself');
-    assert.ok(byId.has(hub.peerId), 'lists the second fake-hub agent');
-    const self = byId.get(hub.pluginAgentId)!;
+    assert.ok(byId.has(selfId), 'lists itself');
+    assert.ok(byId.has(hub.peerId), 'lists the fake-hub peer');
+    assert.ok(!byId.has(clientOther.agentId), 'offline agent excluded by default');
+    assert.ok(out.agents.every((a) => a.online === true), 'default list is online-only');
+    const self = byId.get(selfId)!;
     assert.equal(self.name, 'dsh-test');
-    assert.equal(self.online, true);
     assert.ok(Number(self.lastSeen) > 0);
-    const peer = byId.get(hub.peerId)!;
-    assert.equal(peer.online, true);
+    const full = (await def.execute({ includeOffline: true })) as { agents: Record<string, unknown>[] };
+    const dropped = full.agents.find((a) => String(a.agentId) === clientOther.agentId);
+    assert.ok(dropped, 'includeOffline:true lists the dropped agent');
+    assert.equal(dropped!.online, false);
+    assert.equal(dropped!.name, 'dsh-other');
   } finally {
-    for (const cb of fc.disposeCbs.splice(0)) cb();
+    for (const f of [fc, other]) for (const cb of f.disposeCbs.splice(0)) cb();
     await hub.stop();
   }
 });

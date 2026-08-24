@@ -232,4 +232,21 @@ void main() {
 
     await client.disconnect();
   }, timeout: timeout);
+
+  test('peers: excludes offline agents unless includeOffline', () async {
+    final client = await connect(hub, await HubIdentity.generate());
+    final ghost = await connect(hub, await HubIdentity.generate());
+    await ghost.disconnect(); // registered but gone → offline in presence
+
+    final online = await client.peers();
+    expect(online.map((p) => p.agentId), isNot(contains(ghost.agentId)));
+    expect(online.map((p) => p.agentId), contains(client.agentId));
+
+    final all = await client.peers(includeOffline: true);
+    expect(all.map((p) => p.agentId), contains(ghost.agentId));
+    expect(
+        all.firstWhere((p) => p.agentId == ghost.agentId).online, isFalse);
+
+    await client.disconnect();
+  }, timeout: timeout);
 }
