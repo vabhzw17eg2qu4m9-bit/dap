@@ -8,7 +8,7 @@ import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/
 import { resolveDapSettings } from '../src/config.ts';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.ts';
 import type { DapClient, MsgFrame, Timers } from '../src/conn.ts';
-import type { ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.ts';
+import type { CommandCtx, ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.ts';
 import { FakeHub } from './fake-hub.ts';
 
 const KEYDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-test-'));
@@ -37,7 +37,7 @@ function nextEvent<T>(client: DapClient, event: string): Promise<T> {
 
 interface CapturedCommand {
   description: string;
-  handler: (args: string) => string;
+  handler: (args: string, cmdCtx?: CommandCtx) => string;
 }
 
 interface Captured {
@@ -552,7 +552,10 @@ test('/dap invite (no args) and bare /dap: print the paste-ready connect line (h
     const dap = command(cap, 'dap');
     const line = `send to other user:  /dap 127.0.0.1:${hub.port} <name>`; // ws://…/ws stripped to host:port
     assert.equal(dap.handler('invite'), line);
-    assert.equal(dap.handler(''), `current: ${hub.url} as sharer\n${line}`, 'bare /dap keeps current: and appends the share line');
+    // omp discards handler return values — the share line must arrive via cmdCtx.ui.notify.
+    const notified: string[] = [];
+    dap.handler('invite', { ui: { notify: (text: string) => void notified.push(text) }, hasUI: true });
+    assert.deepEqual(notified, [line]);
 
     fs.writeFileSync(cfgFile, JSON.stringify({ channels: ['ops'] }));
     assert.equal(dap.handler('invite'), line, 'line carries no room — config channels do not change it');

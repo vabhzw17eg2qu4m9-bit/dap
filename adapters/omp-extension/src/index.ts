@@ -14,7 +14,7 @@ import {
   newChannelKeypair,
   type ChannelKeys,
 } from './channels.ts';
-import type { AgentToolResult, ExtensionAPI, SessionCtx } from './types.ts';
+import type { AgentToolResult, CommandCtx, ExtensionAPI, SessionCtx } from './types.ts';
 
 export interface ExtensionOptions {
   /** Test/config overrides; otherwise env (DAP_HUB_URL / DAP_KEY_PATH /
@@ -451,15 +451,21 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     }
     return `inviting ${who} to #${channel}…`;
   };
+  const dispatchDap = (args: string): string => {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    if (parts[0] === 'invite') return inviteCommand(parts.slice(1));
+    const [host, name, channel] = parts;
+    if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}\n${shareLine()}`;
+    return JSON.stringify(connectTo(optStr(host), optStr(name), optStr(channel)));
+  };
   ctx.registerCommand?.('dap', {
     description:
       '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub; /dap invite — print the connect line to share with a new user; /dap invite <name|agentId> [channel] — DM them the channel keypair',
-    handler: (args: string) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      if (parts[0] === 'invite') return inviteCommand(parts.slice(1));
-      const [host, name, channel] = parts;
-      if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}\n${shareLine()}`;
-      return JSON.stringify(connectTo(optStr(host), optStr(name), optStr(channel)));
+    handler: (args: string, cmdCtx?: CommandCtx): string => {
+      const out = dispatchDap(args);
+      // omp discards handler return values — the line must go through the UI.
+      cmdCtx?.ui?.notify(out, 'info');
+      return out;
     },
   });
   const dispose = (): void => client.stop();

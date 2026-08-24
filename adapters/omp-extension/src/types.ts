@@ -17,6 +17,12 @@ export interface SessionCtx {
   clearTimer(handle: unknown): void;
 }
 
+/** Context omp passes to slash-command handlers (ui present in interactive mode). */
+export interface CommandCtx {
+  ui?: SessionCtx['ui'];
+  hasUI?: boolean;
+}
+
 export interface SendMessageOptions {
   /** steer injects into the live turn; triggerTurn starts a turn when idle. */
   deliverAs?: 'steer' | 'followUp' | 'nextTurn';
@@ -53,5 +59,5 @@ export interface ExtensionAPI {
   /** Extension label shown in the UI. */
   setLabel(label: string): void;
   /** Optional: harness slash-command registration (omp). */
-  registerCommand?(name: string, def: { description: string; handler: (args: string) => string }): void;
+  registerCommand?(name: string, def: { description: string; handler: (args: string, cmdCtx?: CommandCtx) => string }): void;
 }
