@@ -617,3 +617,39 @@ test('dap_peers: presence lists every agent including self', async () => {
     await hub.close();
   }
 });
+
+test('footer status line: persistent connection info visible without asking', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const status: string[] = [];
+  const fire = (ev: string) =>
+    cap.fire(ev, {
+      hasUI: true,
+      isIdle: () => false,
+      ui: { notify: () => {}, setStatus: (_k: string, text: string | undefined) => void status.push(text ?? 'CLEARED') },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+  const ext = dapExtension(cap.ctx, {
+    url: hub.url,
+    keyPath: nextKeyPath(),
+    name: 'footcheck',
+    channels: { general: 'A'.repeat(43) + '=' },
+  });
+  try {
+    fire('session_start'); // before welcome: connecting…
+    assert.match(status.at(-1)!, /connecting/);
+    await nextEvent(ext.client, 'welcome');
+    const connected = status.at(-1)!;
+    assert.match(connected, /connected/, 'footer shows connected');
+    assert.match(connected, /footcheck/, 'footer shows name');
+    assert.match(connected, /#general/, 'footer shows channels');
+    assert.match(connected, new RegExp(hub.url.replace(/^ws:\/\/([^/]+)\/ws$/, '$1')), 'footer shows host');
+    hub.drop(ext.client.agentId); // server drops us
+    await nextEvent(ext.client, 'close');
+    assert.match(status.at(-1)!, /reconnecting/);
+  } finally {
+    ext.dispose();
+    await hub.close();
+  }
+});

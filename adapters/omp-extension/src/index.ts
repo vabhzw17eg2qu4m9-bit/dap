@@ -14,7 +14,7 @@ import {
   newChannelKeypair,
   type ChannelKeys,
 } from './channels.ts';
-import type { AgentToolResult, ExtensionAPI } from './types.ts';
+import type { AgentToolResult, ExtensionAPI, SessionCtx } from './types.ts';
 
 export interface ExtensionOptions {
   /** Test/config overrides; otherwise env (DAP_HUB_URL / DAP_KEY_PATH /
@@ -101,12 +101,25 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   });
   const agentId = client.agentId; // available synchronously — no await needed
   ctx.setLabel('DAP — distributed agents');
-  // Visible load confirmation; runtime actions are only legal inside
-  // events/tools, and ui access is guarded by hasUI.
+  // Persistent connection line in the omp footer (visible without asking):
+  // DAP <name|id> · <host> · <state> · #chan1,#chan2. ui reference is
+  // captured at session_start; setStatus is a no-op in headless modes and
+  // a fire-and-forget request in RPC — safe to call from any event.
+  let ui: SessionCtx['ui'] | undefined;
+  const renderStatus = (state: string): void => {
+    const who = settings.name ?? agentId;
+    const host = settings.url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
+    const chans = Object.keys(cryptoCtx.channels)
+      .map((c) => '#' + c)
+      .join(',');
+    ui?.setStatus?.('dap', `DAP ${who} · ${host} · ${state}${chans ? ' · ' + chans : ''}`);
+  };
   ctx.on('session_start', (_event, sctx) => {
+    ui = sctx.ui;
     if (sctx.hasUI && sctx.ui) {
       sctx.ui.notify(`DAP connected as ${agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
     }
+    renderStatus(client.connected ? 'connected' : 'connecting…');
   });
   const inbox = new Inbox(100, (entry) => ctx.appendEntry('io.dap.message', entry));
   // Explicit channel maps (tests) opt out of the channels-file lifecycle;
@@ -178,7 +191,10 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   // first join ever creates the channel and registers its public key).
   client.on('welcome', () => {
     for (const [name, pub] of Object.entries(cryptoCtx.channels)) client.join(name, pub);
+    renderStatus('connected');
   });
+
+  client.on('close', () => renderStatus('reconnecting…'));
 
   // Hub rejections (unknown_agent, access_denied, replay, …) must never be
   // silent: the sending tool already returned ok (it only proves the frame

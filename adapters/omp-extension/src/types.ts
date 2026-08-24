@@ -5,7 +5,11 @@
 
 /** Per-session context handed to event handlers. */
 export interface SessionCtx {
-  ui?: { notify(text: string, level?: string): void };
+  ui?: {
+    notify(text: string, level?: string): void;
+    /** Footer/status-bar line; undefined clears. */
+    setStatus?(key: string, text: string | undefined): void;
+  };
   hasUI: boolean;
   isIdle(): boolean;
   /** Managed, error-isolated timers (unlike raw timers). */
