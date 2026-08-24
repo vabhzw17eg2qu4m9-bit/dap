@@ -292,7 +292,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_whois',
-    description: 'Look up another agent (pubkey, display name, online) by agentId.',
+    description: 'Look up another agent (pubkey, display name, online) by agentId. Ids are 16-hex — discover them via dap_peers, never names.',
     parameters: {
       type: 'object',
       properties: { agentId: { type: 'string' } },
@@ -302,6 +302,29 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       const info = await client.whois(str(params.agentId));
       return toolResult(info ?? { error: 'unknown_agent' });
     },
+  });
+
+  ctx.registerTool({
+    name: 'dap_status',
+    description: 'Own DAP connection status: are we connected to the hub, our agentId, name, hub url, known channels.',
+    parameters: { type: 'object', properties: {} },
+    execute: async () =>
+      toolResult({
+        connected: client.connected,
+        agentId,
+        name: settings.name,
+        url: settings.url,
+        channels: Object.keys(cryptoCtx.channels),
+        welcomes: client.welcomeCount,
+        hellos: client.helloCount,
+      }),
+  });
+
+  ctx.registerTool({
+    name: 'dap_peers',
+    description: 'All agents on the hub (id, name, online, lastSeen). Discover agentIds here — they are 16-hex ids, never names.',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => toolResult({ agents: await client.presence() }),
   });
 
   const dispose = (): void => client.stop();

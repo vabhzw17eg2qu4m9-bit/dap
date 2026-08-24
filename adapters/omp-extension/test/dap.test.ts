@@ -572,3 +572,48 @@ test('tools fail honestly while disconnected: ok:false instead of a silent drop'
     ext.dispose();
   }
 });
+
+test('dap_status: identity + connection state the agent can read about itself', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, {
+    url: hub.url,
+    keyPath: nextKeyPath(),
+    name: 'statuscheck',
+    channels: { general: 'A'.repeat(43) + '=' },
+  });
+  try {
+    // Before the welcome lands: connected=false, identity still known.
+    const cold = await run<{ connected: boolean; agentId: string; url: string }>(cap, "dap_status");
+    assert.equal(cold.connected, false);
+    assert.equal(cold.agentId, ext.client.agentId);
+    assert.equal(typeof cold.url, 'string');
+
+    await nextEvent(ext.client, 'welcome');
+    const warm = await run<{ connected: boolean; name: string; channels: string[]; welcomes: number; hellos: number }>(cap, 'dap_status');
+    assert.equal(warm.connected, true);
+    assert.equal(warm.name, 'statuscheck');
+    assert.deepEqual(warm.channels, ['general']);
+    assert.equal(warm.welcomes, 1);
+    assert.equal(warm.hellos, 1);
+  } finally {
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('dap_peers: presence lists every agent including self', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'peer-a' });
+  try {
+    await nextEvent(ext.client, 'welcome');
+    const r = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(cap, 'dap_peers');
+    const self = r.agents.find((a) => a.agentId === ext.client.agentId);
+    assert.ok(self, 'own agentId present in presence');
+    assert.equal(self.online, true);
+  } finally {
+    ext.dispose();
+    await hub.close();
+  }
+});

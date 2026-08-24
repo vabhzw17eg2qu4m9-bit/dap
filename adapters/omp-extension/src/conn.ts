@@ -26,6 +26,14 @@ export interface MsgFrame {
   ciphertext: string;
 }
 
+/** One agent in a presence snapshot (hub registry view). */
+export interface PresenceAgent {
+  agentId: string;
+  name?: string;
+  online: boolean;
+  lastSeen?: number;
+}
+
 export interface AgentInfo {
   agentId: string;
   pubkey: string;
@@ -134,6 +142,14 @@ export class DapClient {
    * registers chanPubkey; re-join is idempotent — safe on every reconnect. */
   join(channel: string, chanPubkeyB64: string): void {
     this.send({ op: 'join', channel, chanPubkey: chanPubkeyB64 });
+  }
+
+  /** Presence snapshot: every agent the hub knows (id, name, online, lastSeen). */
+  presence(): Promise<PresenceAgent[]> {
+    const prev = this.eventCount('presence');
+    this.send({ op: 'presence_query' });
+    return this.waitForAfter<{ agents: PresenceAgent[] }>('presence', prev, 5000)
+      .then((f) => f.agents);
   }
 
   /** Pubkey directory lookup (needed for DM key agreement). */
