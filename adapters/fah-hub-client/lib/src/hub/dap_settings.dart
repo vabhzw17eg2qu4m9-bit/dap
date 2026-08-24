@@ -31,6 +31,36 @@ class DapSettings {
   final String? name;
 }
 
+/// A pending by-name invite in the machine-shared `~/.dap/config.json`
+/// (`invites: [{name, channel}]`): armed by `dap_invite <name>` for a
+/// user not yet on the hub, removed once the chankey DM was delivered.
+class PendingInvite {
+  const PendingInvite({required this.name, required this.channel});
+
+  final String name;
+  final String channel;
+
+  /// `null` when the entry is not `{name: String, channel: String}`.
+  static PendingInvite? fromJson(Object? raw) => raw is Map &&
+          raw['name'] is String &&
+          raw['channel'] is String
+      ? PendingInvite(
+          name: raw['name'] as String, channel: raw['channel'] as String)
+      : null;
+
+  Map<String, String> toJson() => {'name': name, 'channel': channel};
+
+  @override
+  bool operator ==(Object other) =>
+      other is PendingInvite && other.name == name && other.channel == channel;
+
+  @override
+  int get hashCode => Object.hash(name, channel);
+
+  @override
+  String toString() => '#$channel:$name';
+}
+
 const String defaultDapUrl = 'ws://127.0.0.1:8787/ws';
 
 /// dap_connect host normalization: no scheme → `ws://`, no path → `/ws`
@@ -43,6 +73,12 @@ String normalizeDapHost(String host) {
   final path = (uri.path.isEmpty || uri.path == '/') ? '/ws' : uri.path;
   return uri.replace(path: path).toString();
 }
+
+/// The hub address for paste-ready connect lines: scheme and trailing
+/// `/ws` stripped (`ws://h:1/ws` → `h:1`).
+String dapHostOf(String url) => url
+    .replaceFirst(RegExp(r'^wss?://'), '')
+    .replaceFirst(RegExp(r'/ws$'), '');
 
 /// `~/.dap/config.json` path — the single authority every reader/writer
 /// of that file goes through ([readDapConfig], [persistDapConfig],
@@ -79,15 +115,29 @@ Map<String, dynamic> readDapConfig(String file) {
   }
 }
 
+/// The `invites` list from `~/.dap/config.json`; a missing or non-array
+/// key counts as empty (back-compat with files written before invites
+/// existed), malformed entries are skipped.
+List<PendingInvite> readPendingInvites(String file) {
+  final raw = readDapConfig(file)['invites'];
+  return [
+    for (final entry in (raw is List ? raw : const []))
+      if (PendingInvite.fromJson(entry) case final invite?) invite,
+  ];
+}
+
 /// Read-modify-write of `~/.dap/config.json` (dap_connect persistence):
 /// merges [url]/[name]/[channels]; the default-room list only grows (a
-/// union — rooms are never un-remembered). [file] is injectable for
-/// tests. Auto-join on later launches flows through the shared channels
-/// file (the store joins every channel it has keys for).
+/// union — rooms are never un-remembered). [invites] is the
+/// authoritative pending-invite list — an empty list removes them all
+/// (delivered entries are dropped by the caller). [file] is injectable
+/// for tests. Auto-join on later launches flows through the shared
+/// channels file (the store joins every channel it has keys for).
 Future<void> persistDapConfig({
   String? url,
   String? name,
   List<String>? channels,
+  List<PendingInvite>? invites,
   String? file,
 }) async {
   final path = file ?? defaultDapConfigFile();
@@ -100,6 +150,9 @@ Future<void> persistDapConfig({
       ...(cur['channels'] as List? ?? const []).cast<String>(),
       ...channels,
     }.toList();
+  }
+  if (invites != null) {
+    next['invites'] = [for (final invite in invites) invite.toJson()];
   }
   final target = File(path);
   if (!await target.parent.exists()) {

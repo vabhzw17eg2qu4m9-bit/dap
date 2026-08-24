@@ -70,12 +70,13 @@ export function buildServer(dap: DapClient): McpServer {
 
   server.registerTool('dap_invite', {
     title: 'DAP channel invite',
-    description: 'Invite an agent to a channel: DMs them the channel keypair inside a normal E2E DM (the plaintext happens to be JSON). Creates the channel (fresh keypair) on first use.',
+    description:
+      'Invite an agent to a channel: DMs them the channel keypair inside a normal E2E DM (the plaintext happens to be JSON). Creates the channel (fresh keypair) on first use. The recipient is an agentId (16-hex) — or a NAME: a name that is offline or unknown arms a pending invite, delivered automatically when that name comes online (the result then carries pending:true and a paste-ready connectLine for the invited user).',
     inputSchema: {
       channel: z.string().min(1).describe('channel name'),
-      agent: z.string().min(1).describe('recipient agentId (a_xxxx)'),
+      agent: z.string().min(1).describe('recipient agentId (16-hex) or display name (offline names arm a pending invite)'),
     },
-  }, ({ channel, agent }) => run(() => dap.invite(channel, agent)));
+  }, ({ channel, agent }) => run(() => dap.inviteByName(channel, agent)));
 
   server.registerTool('dap_inbox', {
     title: 'DAP inbox drain',
@@ -141,6 +142,7 @@ async function main(): Promise<void> {
     name: settings.name,
     channelsFile: settings.channelsFile,
     channels: parseChannels(env.DAP_CHANNELS),
+    invites: true, // long-lived bridge process: deliver pending by-name invites
     onHubError: (e) => console.error(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`),
   });
   dap.start(); // zero-config: defaults point at the local hub; backoff covers a down hub

@@ -7,6 +7,13 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
+/** A pending by-name invite: armed by `dap_invite` for a user not yet on
+ *  the hub; delivered automatically when that name comes online. */
+export interface PendingInvite {
+  name: string;
+  channel: string;
+}
+
 /** Optional persisted settings: ~/.dap/config.json (all fields optional). */
 export interface DapFileConfig {
   url?: string;
@@ -15,6 +22,8 @@ export interface DapFileConfig {
   channelsFile?: string;
   /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
   channels?: string[];
+  /** Armed invite-by-name entries; removed once delivered. */
+  invites?: PendingInvite[];
 }
 
 export interface DapSettings {
@@ -31,20 +40,25 @@ export const optStr = (v: unknown): string | undefined => (typeof v === 'string'
 /** Config file path: DAP_CONFIG_FILE env (tests pin a tmp path) > ~/.dap/config.json. */
 const defaultConfigFile = (): string => optStr(process.env.DAP_CONFIG_FILE) ?? path.join(os.homedir(), '.dap', 'config.json');
 
-/** Read the config file; a missing or invalid file counts as absent. */
+/** Read the config file; a missing or invalid file counts as absent.
+ *  `invites` is normalized to [] (files written before the key lack it). */
 export function readDapConfig(file = defaultConfigFile()): DapFileConfig {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as DapFileConfig;
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf8')) as DapFileConfig;
+    // `invites` is normalized to [] (files written before the key lack it).
+    return { ...cfg, invites: Array.isArray(cfg.invites) ? cfg.invites : [] };
   } catch {
-    return {};
+    return { invites: [] };
   }
 }
 
 /** Merge `update` into the config file (read-modify-write, mkdir on demand):
  *  dap_connect persists host/name/default-rooms so the next launch
- *  auto-connects with the same identity and auto-joins the same rooms. */
+ *  auto-connects with the same identity and auto-joins the same rooms.
+ *  `invites` is the authoritative list — delivered entries are removed by
+ *  the caller. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[] },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
   file = defaultConfigFile(),
 ): void {
   const cur = readDapConfig(file);
@@ -54,6 +68,7 @@ export function persistDapConfig(
   if (update.channels?.length) {
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
+  if (update.invites) next.invites = update.invites;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }

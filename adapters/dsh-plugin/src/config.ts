@@ -12,6 +12,15 @@ export interface DapFileConfig {
   channelsFile?: string;
   /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
   channels?: string[];
+  /** Armed invite-by-name entries; removed once delivered. */
+  invites?: PendingInvite[];
+}
+
+/** A pending by-name invite: armed by dap_invite for a user not yet on the
+ *  hub; delivered automatically when that name comes online. */
+export interface PendingInvite {
+  name: string;
+  channel: string;
 }
 
 export interface DapSettingsOverrides {
@@ -35,20 +44,23 @@ export const optStr = (v: unknown): string | undefined => (typeof v === 'string'
 /** Config file path: DAP_CONFIG_FILE (injectable for tests) > ~/.dap/config.json. */
 const configPath = (): string => optStr(process.env.DAP_CONFIG_FILE) ?? join(homedir(), '.dap', 'config.json');
 
-/** Read the DAP config file; a missing or invalid file counts as absent. */
+/** Read the DAP config file; a missing or invalid file counts as absent.
+ *  `invites` is normalized to [] (files written before the key lack it). */
 export function readDapConfig(file = configPath()): DapFileConfig {
   try {
-    return JSON.parse(readFileSync(file, 'utf8')) as DapFileConfig;
+    const cfg = JSON.parse(readFileSync(file, 'utf8')) as DapFileConfig;
+    return { ...cfg, invites: Array.isArray(cfg.invites) ? cfg.invites : [] };
   } catch {
-    return {};
+    return { invites: [] };
   }
 }
 
 /** Merge `update` into the DAP config file (read-modify-write, mkdir on
  *  demand): dap_connect persists host/name/default-rooms so the next
- *  launch auto-connects with the same identity. */
+ *  launch auto-connects with the same identity. `invites` is the
+ *  authoritative list — delivered entries are removed by the caller. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[] },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
   file = configPath(),
 ): void {
   const cur = readDapConfig(file);
@@ -58,6 +70,7 @@ export function persistDapConfig(
   if (update.channels?.length) {
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
+  if (update.invites) next.invites = update.invites;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }

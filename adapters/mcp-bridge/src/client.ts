@@ -15,6 +15,7 @@ import WebSocket from 'ws';
 import * as dap from './crypto.js';
 import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog } from './keepalive.js';
 import { loadChannelKeys, parseChankeyInvite, persistChannelKeys } from './channels.js';
+import { persistDapConfig, readDapConfig, type PendingInvite } from './config.js';
 
 /** A hub `error` frame observed on the wire (unknown_agent, access_denied, …). */
 export interface HubErrorEvent {
@@ -69,6 +70,16 @@ export interface StatusInfo {
   hellos: number;
 }
 
+export interface ArmedInvite {
+  ok: true;
+  /** True: the chankey DM is deferred until the name comes online. */
+  pending: true;
+  name: string;
+  channel: string;
+  /** Paste-ready connect line for the invited user (shared out-of-band). */
+  connectLine: string;
+}
+
 export interface SendResult {
   ok: true;
   id: string;
@@ -90,6 +101,13 @@ export interface ClientOpts {
    *  channels load from it; created/invited keypairs persist to it. */
   channelsFile?: string;
   backoff?: { initialMs?: number; maxMs?: number };
+  /** Pending by-name invites (dap_invite with a not-yet-online name): load
+   *  + arm entries in ~/.dap/config.json and deliver them from a presence
+   *  poller. Opt-in — the long-lived bridge process enables it; plain
+   *  library clients (tests, peer stubs) stay inert. */
+  invites?: boolean;
+  /** Tests pin a fast poll interval; production uses the 15s default. */
+  invitePollMs?: number;
   /** Fired for every hub `error` frame (surfacing hook — see drainErrors). */
   onHubError?: (e: HubErrorEvent) => void;
 }
@@ -109,6 +127,11 @@ const INBOX_CAP = 100;
 const ERRORS_CAP = 20;
 const WAIT_MS = 5000;
 const NOT_CONNECTED = 'not connected to the hub (reconnecting with backoff — retry in a moment)';
+const INVITE_POLL_MS = 15_000;
+
+/** Shareable host[:port] for connect lines: strip the ws(s):// scheme and
+ *  the trailing /ws path from a full hub URL. */
+const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
 
 export function loadIdentity(keyPath: string): Identity {
   if (existsSync(keyPath)) {
@@ -154,6 +177,12 @@ export class DapClient {
   private readonly listeners = new Set<(m: MsgEvent) => void>();
   private ws: WebSocket | null = null;
   private retryTimer: NodeJS.Timeout | undefined;
+  private inviteTimer: NodeJS.Timeout | undefined;
+  private readonly invitePollMs: number;
+  /** Armed by-name invites (config.json `invites`); delivered + removed by
+   *  the poller. */
+  private readonly pendingInvites: PendingInvite[] = [];
+  private deliveringInvites = false;
   private readonly initialMs: number;
   private readonly maxMs: number;
   private delay: number;
@@ -175,6 +204,10 @@ export class DapClient {
     this.maxMs = opts.backoff?.maxMs ?? 30_000;
     this.delay = this.initialMs;
     this.watchdog = new KeepAliveWatchdog(DEFAULT_KEEP_ALIVE);
+    this.invitePollMs = opts.invitePollMs ?? INVITE_POLL_MS;
+    // Restart redelivery: pendings armed before shutdown load here and the
+    // welcome-time check delivers them without waiting a tick.
+    if (opts.invites) this.pendingInvites.push(...(readDapConfig().invites ?? []));
   }
 
   /** True while the welcome handshake is done on an open socket. */
@@ -198,6 +231,8 @@ export class DapClient {
     this.watchdog.stop();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+    clearInterval(this.inviteTimer);
+    this.inviteTimer = undefined;
     this.ws?.close();
     this.ws = null;
   }
@@ -352,6 +387,103 @@ export class DapClient {
     return out;
   }
 
+  /** dap_invite target resolution (shared contract): a 16-hex id DMs the
+   *  chankey now; a name resolves case-insensitively via presence — exactly
+   *  one ONLINE match DMs now, several matches fail as ambiguous, and an
+   *  unknown or offline name arms a pending invite delivered when that name
+   *  comes online. */
+  async inviteByName(channel: string, who: string): Promise<SendResult | ArmedInvite> {
+    if (!this.connected) throw new Error(NOT_CONNECTED);
+    if (/^[0-9a-f]{16}$/.test(who)) return this.invite(channel, who);
+    const wanted = who.toLowerCase();
+    const matches = (await this.presence()).filter((a) => a.name?.toLowerCase() === wanted);
+    if (matches.length === 1 && matches[0].online) return this.invite(channel, matches[0].agentId);
+    if (matches.length > 1) {
+      throw new Error(`"${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}`);
+    }
+    return this.armInvite(who, channel);
+  }
+
+  /** Arm a pending by-name invite: create the channel under our key (the
+   *  zero-config path — keygen, persist, join now) and remember {name,
+   *  channel}, deduped case-insensitively on (name, channel). */
+  private async armInvite(name: string, channel: string): Promise<ArmedInvite> {
+    await this.ensureChannel(channel);
+    if (!this.pendingInvites.some((p) => p.name.toLowerCase() === name.toLowerCase() && p.channel === channel)) {
+      this.pendingInvites.push({ name, channel });
+      persistDapConfig({ invites: [...this.pendingInvites] });
+    }
+    this.pollPendingInvites(); // arm-time check: the name may be online already
+    return {
+      ok: true,
+      pending: true,
+      name,
+      channel,
+      connectLine: `send to ${name}:  /dap ${hostOf(this.opts.url)} ${name}`,
+    };
+  }
+
+  /** Start (once) the pending-invite poller and check immediately: pendings
+   *  armed before a restart deliver without waiting a tick. */
+  private startInvitePoller(): void {
+    if (this.inviteTimer === undefined) {
+      this.inviteTimer = setInterval(() => this.pollPendingInvites(), this.invitePollMs);
+    }
+    this.pollPendingInvites();
+  }
+
+  private pollPendingInvites(): void {
+    void this.deliverPendingInvites().catch((err: unknown) => this.surfaceInviteFailure(err));
+  }
+
+  /** One delivery pass (poller tick + arm/welcome-time check): a single
+   *  presence snapshot, every pending with exactly one online name-match
+   *  gets its chankey DM. Own agentId is excluded — the config file is
+   *  machine-shared, so our own name must never match. Per-invite failures
+   *  keep the entry for the next tick. */
+  private async deliverPendingInvites(): Promise<void> {
+    if (this.deliveringInvites || this.pendingInvites.length === 0 || !this.connected) return;
+    this.deliveringInvites = true;
+    try {
+      const agents = await this.presence();
+      for (let i = this.pendingInvites.length - 1; i >= 0; i--) {
+        const pending = this.pendingInvites[i]!;
+        const online = agents.filter(
+          (a) => a.online && a.agentId !== this.agentId && a.name?.toLowerCase() === pending.name.toLowerCase(),
+        );
+        if (online.length !== 1) continue; // still away (or ambiguous): keep waiting
+        try {
+          await this.invite(pending.channel, online[0].agentId);
+        } catch {
+          continue; // hub rejected the frame — retried on the next tick
+        }
+        this.pendingInvites.splice(i, 1);
+        persistDapConfig({ invites: [...this.pendingInvites] });
+        this.deliver({
+          dm: false,
+          channel: pending.channel,
+          invite: pending.channel,
+          from: this.agentId,
+          text: `[dap] invited ${pending.name} to #${pending.channel}`,
+          ts: Date.now(),
+        });
+      }
+    } finally {
+      this.deliveringInvites = false;
+    }
+  }
+
+  /** Check-level failures are never silent: error ring (drained by
+   *  dap_inbox) + the onHubError hook, like every other hub verdict. */
+  private surfaceInviteFailure(err: unknown): void {
+    const msg = `pending invite check failed: ${err instanceof Error ? err.message : String(err)}`;
+    this.lastError = msg;
+    const event: HubErrorEvent = { code: 'invite_failed', msg, ts: Date.now() };
+    this.errorRing.push(event);
+    if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
+    this.opts.onHubError?.(event);
+  }
+
   /** Pubkey directory lookup (needed for DM key agreement). */
   async whois(agentId: string): Promise<WhoisInfo> {
     const { xPub: _internal, ...out } = await this.agentInfo(agentId);
@@ -475,6 +607,7 @@ export class DapClient {
     // reconnect-safe — the hub's live membership dies with the connection).
     // Join failures surface via the error ring / onHubError, never silently.
     for (const [name, ch] of this.channels) void this.join(name, ch.pub).catch(() => {});
+    if (this.opts.invites) this.startInvitePoller(); // restart redelivery
   }
 
   private onJoined(channel: string): void {

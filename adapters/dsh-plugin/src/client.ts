@@ -181,7 +181,7 @@ export class DapClient {
    *  identity key file and display name, then connect fresh. A new name
    * means a new identity (name-derived key file) — a different agentId. */
   retarget(next: { url?: string; keyPath?: string; name?: string }): void {
-    clearTimeout(this.retryTimer); // no-op when nothing is pending
+    clearTimeout(this.retryTimer ?? undefined); // no-op when nothing is pending
     this.retryTimer = null;
     this.watchdog.stop();
     this.ws?.close(); // retiring socket: late events are ignored (see connect)

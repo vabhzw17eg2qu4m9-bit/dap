@@ -8,8 +8,9 @@ import { join, dirname } from 'node:path';
 import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import plugin, { type DapToolDef, type DshContext } from '../src/index.js';
+import type { DapClient } from '../src/client.js';
 import * as dap from '../src/crypto.js';
-import { resolveDapSettings, defaultKeyPath, DEFAULT_URL } from '../src/config.js';
+import { resolveDapSettings, defaultKeyPath, DEFAULT_URL, readDapConfig, persistDapConfig } from '../src/config.js';
 import { loadChannelKeys } from '../src/channels.js';
 import { KeepAliveWatchdog, type KeepAlivePeer, type KaTimers } from '../src/keepalive.js';
 import { FakeHub, until, channelConfig } from './fake-hub.js';
@@ -736,7 +737,7 @@ test('dap_connect: retargets to a second hub (bare host), new identity, default 
     assert.equal(hub2.hellos, 1, 'no stray duplicate connection to hub2');
     assert.equal(hub2.pluginAgentId, client.agentId, 'hub2 knows the new identity');
     await until(() => hub2.channelMembers.get('lobby')?.has(client.agentId) === true);
-    await until(() => !hub1.isOnline(oldId), 'old hub socket is gone');
+    await until(() => !hub1.isOnline(oldId), 5000);
 
     // Name-derived identity under the dsh key dir, auto-generated 0600.
     const keyFile = join(HOME, '.dap', 'keys', 'dsh', 'renamed.key');
@@ -758,6 +759,206 @@ test('dap_connect: retargets to a second hub (bare host), new identity, default 
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub1.stop();
     await hub2.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- pending by-name invites (arm + poller + restart redelivery) ----
+
+test('dap_invite <unknown name>: arms a pending invite (default channel, connect line), auto-creates + joins the channel, persists deduped', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-arm');
+  const cfgFile = join(dir, 'config.json');
+  const chFile = join(dir, 'a-channels.json');
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const fc = fakeCtx();
+  const client = plugin.apply(fc.ctx, {
+    url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: chFile, name: 'inviter',
+    invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 }, // the tick never fires here
+  });
+  try {
+    await hub.waitFor((f) => f.op === 'flush'); // welcomed
+    const host = hub.url.replace(/^ws:\/\//, '').replace(/\/ws$/, '');
+
+    const r = (await tool(fc, 'dap_invite').execute({ to: 'carol' })) as {
+      ok: boolean; pending: boolean; name: string; channel: string; connectLine: string;
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.pending, true);
+    assert.equal(r.name, 'carol');
+    assert.equal(r.channel, 'general', 'channel defaults to general');
+    assert.equal(r.connectLine, `send to carol:  /dap ${host} carol`, 'paste-ready connect line');
+
+    // Arm-time channel creation: keygen + join under the INVITER's key.
+    await hub.waitFor((f) => f.op === 'join' && f.channel === 'general');
+    assert.ok(hub.channelMembers.get('general')?.has(client.agentId), 'inviter joined at arm time');
+    assert.ok(loadChannelKeys(chFile).general?.priv, 'channel keypair persisted under the inviter key');
+    assert.deepEqual(readDapConfig(cfgFile).invites, [{ name: 'carol', channel: 'general' }], 'pending persisted');
+
+    // Same (name, channel) again, different case: deduped, still one entry.
+    await tool(fc, 'dap_invite').execute({ to: 'CAROL' });
+    assert.deepEqual(readDapConfig(cfgFile).invites, [{ name: 'carol', channel: 'general' }], 'deduped');
+
+    // A different channel arms a second entry and creates that channel too.
+    const r2 = (await tool(fc, 'dap_invite').execute({ to: 'carol', channel: 'team' })) as { channel: string };
+    assert.equal(r2.channel, 'team');
+    await hub.waitFor((f) => f.op === 'join' && f.channel === 'team');
+    assert.deepEqual(readDapConfig(cfgFile).invites, [
+      { name: 'carol', channel: 'general' },
+      { name: 'carol', channel: 'team' },
+    ], 'both pendings persisted');
+  } finally {
+    delete process.env.DAP_CONFIG_FILE;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending invite: invitee connects later under the armed name -> poller tick DMs the chankey, invitee joins, pending removed', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-poll');
+  const cfgFile = join(dir, 'config.json');
+  const fileA = join(dir, 'a-channels.json');
+  const fileB = join(dir, 'b-channels.json');
+  writeFileSync(fileB, '{}');
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const clientA = plugin.apply(a.ctx, {
+    url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'inviter',
+    invitePollMs: 25, backoff: { initialMs: 10, maxMs: 40 },
+  });
+  let clientB: DapClient | undefined;
+  try {
+    await hub.waitFor((f) => f.op === 'flush');
+    await tool(a, 'dap_invite').execute({ to: 'carol' }); // carol not on the hub yet: armed
+    assert.equal((readDapConfig(cfgFile).invites ?? []).length, 1);
+
+    // The invitee is a different user: she must not load the inviter's config.
+    delete process.env.DAP_CONFIG_FILE;
+    clientB = plugin.apply(b.ctx, {
+      url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'carol',
+      invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await until(() => clientB?.connected === true);
+
+    // Poller tick: presence now sees carol online -> automatic chankey DM.
+    const dmFrame = await hub.waitFor((f) => f.op === 'send' && f.to === clientB!.agentId);
+    assert.ok(!String(dmFrame.ciphertext).includes('chankey'), 'hub never sees the invite plaintext');
+    await until(() => hub.channelMembers.get('general')?.has(clientB!.agentId) === true);
+    await until(() => (readDapConfig(cfgFile).invites ?? []).length === 0, 5000);
+    await until(() => a.followups.some((t) => t.includes('[dap] invited carol to #general')));
+    assert.ok(b.followups.some((t) => t.includes(`invited to #general by ${clientA.agentId}`)), 'invitee noticed the invite');
+    assert.equal(loadChannelKeys(fileB).general?.pub, loadChannelKeys(fileA).general?.pub, 'same channel key delivered');
+  } finally {
+    delete process.env.DAP_CONFIG_FILE;
+    for (const fc of [a, b]) for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('dap_invite <online name>: immediate chankey DM, nothing armed in config', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-online');
+  const cfgFile = join(dir, 'config.json');
+  const fileA = join(dir, 'a-channels.json');
+  const fileB = join(dir, 'b-channels.json');
+  writeFileSync(fileB, '{}');
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const clientA = plugin.apply(a.ctx, {
+    url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'alice',
+    invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
+  });
+  const clientB = plugin.apply(b.ctx, {
+    url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'bob',
+    invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
+  });
+  try {
+    await until(() => clientA.connected && clientB.connected);
+    await tool(a, 'dap_invite').execute({ to: 'bob' }); // online name: straight to the chankey DM
+    const dmFrame = await hub.waitFor((f) => f.op === 'send' && f.to === clientB.agentId);
+    assert.ok(!String(dmFrame.ciphertext).includes('chankey'), 'hub never sees the invite plaintext');
+    await until(() => hub.channelMembers.get('general')?.has(clientB.agentId) === true);
+    assert.ok(b.followups.some((t) => t.includes(`invited to #general by ${clientA.agentId}`)), 'invitee noticed the invite');
+    assert.deepEqual(readDapConfig(cfgFile).invites, [], 'online name: nothing armed');
+  } finally {
+    delete process.env.DAP_CONFIG_FILE;
+    for (const fc of [a, b]) for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending invites survive a restart: welcome-time check delivers without waiting a tick', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-restart');
+  const cfgFile = join(dir, 'config.json');
+  const fileA = join(dir, 'a-channels.json');
+  const fileB = join(dir, 'b-channels.json');
+  writeFileSync(fileB, '{}');
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a1 = fakeCtx();
+  const a2 = fakeCtx();
+  const b = fakeCtx();
+  plugin.apply(a1.ctx, {
+    url: hub.url, keyPath: join(dir, 'a1.key'), channelsFile: fileA, name: 'inviter',
+    invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 }, // no tick: only welcome checks run
+  });
+  let clientA2: DapClient | undefined;
+  let clientB: DapClient | undefined;
+  try {
+    await hub.waitFor((f) => f.op === 'flush');
+    await tool(a1, 'dap_invite').execute({ to: 'carol' });
+    // The arm-time delivery check settles (its presence pass finds no carol).
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    for (const cb of a1.disposeCbs.splice(0)) cb(); // inviter goes away entirely
+
+    delete process.env.DAP_CONFIG_FILE; // the invitee never loads the inviter's pendings
+    clientB = plugin.apply(b.ctx, {
+      url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'carol',
+      invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await until(() => clientB?.connected === true);
+    process.env.DAP_CONFIG_FILE = cfgFile;
+
+    // Fresh inviter instance, same config + channels file: the welcome-time
+    // check delivers carol's invite without waiting for a poller tick.
+    clientA2 = plugin.apply(a2.ctx, {
+      url: hub.url, keyPath: join(dir, 'a2.key'), channelsFile: fileA, name: 'inviter2',
+      invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await until(() => hub.channelMembers.get('general')?.has(clientB!.agentId) === true);
+    assert.equal(loadChannelKeys(fileB).general?.pub, loadChannelKeys(fileA).general?.pub, 'same channel key delivered');
+    await until(() => (readDapConfig(cfgFile).invites ?? []).length === 0, 5000);
+    assert.ok(a2.followups.some((t) => t.includes('[dap] invited carol to #general')), 'inviter notified');
+  } finally {
+    delete process.env.DAP_CONFIG_FILE;
+    for (const fc of [a2, b]) for (const cb of fc.disposeCbs.splice(0)) cb(); // a1 already disposed
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('config invites back-compat: missing key defaults to [], non-array treated as absent, persist keeps other keys', () => {
+  const dir = tmpDir('dsh-cfginv');
+  const cfgFile = join(dir, 'config.json');
+  try {
+    writeFileSync(cfgFile, JSON.stringify({ url: 'ws://legacy:9/ws', name: 'legacy', channels: ['ops'] }));
+    const cfg = readDapConfig(cfgFile);
+    assert.deepEqual(cfg.invites, [], 'missing invites key defaults to []');
+    assert.equal(cfg.url, 'ws://legacy:9/ws');
+    persistDapConfig({ invites: [{ name: 'newbie', channel: 'general' }] }, cfgFile);
+    const after = readDapConfig(cfgFile);
+    assert.deepEqual(after.invites, [{ name: 'newbie', channel: 'general' }]);
+    assert.equal(after.url, 'ws://legacy:9/ws', 'existing keys survive');
+    assert.deepEqual(after.channels, ['ops']);
+    writeFileSync(cfgFile, JSON.stringify({ invites: 'corrupt' }));
+    assert.deepEqual(readDapConfig(cfgFile).invites, [], 'non-array invites treated as absent');
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

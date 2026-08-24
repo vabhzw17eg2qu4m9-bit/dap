@@ -1,7 +1,8 @@
 /// DAP/1 WebSocket hub client (docs/protocol.md): signed hello handshake,
 /// E2E-encrypted channel/DM sends, whois-before-first-DM, flush after
-/// welcome, and reconnect with exponential backoff (1 s → 30 s, reset after
-/// a successful welcome).
+/// welcome, reconnect with exponential backoff (1 s → 30 s, reset after
+/// a successful welcome), and pending by-name invites auto-delivered
+/// once the invitee comes online ([PendingInvites]).
 library;
 
 import 'dart:async';
@@ -107,6 +108,20 @@ typedef DapConnection = ({
   List<String> channels,
 });
 
+/// dap_invite result: `ok: false, error` is an honest failure (not
+/// connected, ambiguous name, DM failure); otherwise the chankey DM went
+/// out immediately (`pending: false`) or the invite was armed for a user
+/// not yet online (`pending: true` — delivered automatically when they
+/// connect; [connectLine] is the paste-ready line for the invited user).
+typedef InviteResult = ({
+  bool ok,
+  String channel,
+  String to,
+  bool pending,
+  String? connectLine,
+  String? error,
+});
+
 class HubClient {
   HubClient({
     required HubConfig config,
@@ -166,12 +181,17 @@ class HubClient {
 
   final _inbound = StreamController<InboundMessage>.broadcast();
   final _errors = StreamController<HubError>.broadcast();
+  final _welcomeEvents = StreamController<void>.broadcast();
   /// All inbound `msg` frames, oldest first.
   Stream<InboundMessage> get inbound => _inbound.stream;
 
   /// Every hub `error` frame received (unknown_agent, access_denied, …).
   /// Hub rejections must never be silent — listeners surface them.
   Stream<HubError> get errors => _errors.stream;
+
+  /// Fires after every accepted welcome (first connect and each
+  /// reconnect) — the restart-redelivery hook for pending invites.
+  Stream<void> get welcomeEvents => _welcomeEvents.stream;
 
   /// True while a welcome was received on a currently open socket and the
   /// client was not deliberately disconnected ([disconnect]). The
@@ -277,6 +297,7 @@ class HubClient {
       if (!_firstWelcome.isCompleted) _firstWelcome.complete(agentId);
       await _joinKnownChannels();
       await _flushAfterWelcome();
+      if (!_welcomeEvents.isClosed) _welcomeEvents.add(null);
     }
     await done.future;
     return ok;
@@ -302,6 +323,7 @@ class HubClient {
     }
     await _inbound.close();
     await _errors.close();
+    await _welcomeEvents.close();
   }
 
   /// Runtime retarget (dap_connect): stop the reconnect loop and the
@@ -459,15 +481,24 @@ class HubClient {
   /// distribution"). Trust model: possession of the channel private key IS
   /// v1 membership; the introducer is whoever DM'd you the key.
   Future<void> inviteTo(String channel, String toAgentId) async {
-    final store = channelStore;
-    final keys = store != null
-        ? await _channelKeysOrCreate(channel, store)
-        : await _keysFromConfig(channel);
+    final keys = await ensureChannelKeys(channel);
     await sendDm(
       toAgentId,
       jsonEncode(
           {'t': 'chankey', 'channel': channel, 'pub': keys.pub, 'priv': keys.priv}),
     );
+  }
+
+  /// Channel keys for invites and sends: the store auto-generates +
+  /// persists the keypair and joins when it was just created (zero-config
+  /// channel creation — also the arm-time path for pending invites);
+  /// explicit-config-only clients fall back to the configured secret
+  /// (honest error when absent).
+  Future<ChannelKeys> ensureChannelKeys(String channel) async {
+    final store = channelStore;
+    return store != null
+        ? await _channelKeysOrCreate(channel, store)
+        : await _keysFromConfig(channel);
   }
 
   /// Explicit-config fallback: priv is required (it is the invite payload),
@@ -787,4 +818,205 @@ class HubClient {
 
   static SimplePublicKey _dhPubkey(String b64) =>
       SimplePublicKey(base64Decode(b64), type: KeyPairType.x25519);
+}
+
+/// Pending by-name invites — `dap_invite <name>` against a user not yet
+/// on the hub: persisted in the machine-shared `~/.dap/config.json` under
+/// `invites: [{name, channel}]`, delivered automatically once the name
+/// appears online. One presence query per [interval] (~15 s) plus an
+/// immediate check at arm time and after every welcome (restart
+/// redelivery). Mirrors the omp-extension pending-invite behavior.
+class PendingInvites {
+  PendingInvites({
+    required this.client,
+    required this.configFile,
+    this.onNotice,
+    this.interval = const Duration(seconds: 15),
+  });
+
+  /// The inviter's connection: presence, chankey DMs, channel creation.
+  final HubClient client;
+
+  /// `~/.dap/config.json` — the authoritative pending list (injectable
+  /// test seam).
+  final String configFile;
+
+  /// Short user-facing notices ('invited X to #c', check failures) — the
+  /// host wires this to its terminal; failures are never silent.
+  final void Function(String notice)? onNotice;
+
+  /// Poll interval (injectable test seam — shrink for fast ticks).
+  final Duration interval;
+
+  static const String notConnected =
+      'not connected to the hub (reconnecting with backoff — retry in a moment)';
+
+  static final RegExp _idPattern = RegExp(r'^[0-9a-f]{16}$');
+
+  final _pending = <PendingInvite>[];
+  Timer? _timer;
+  StreamSubscription<void>? _welcomeSub;
+  bool _delivering = false;
+  bool _started = false;
+
+  /// Armed invites (loaded from [configFile] at [start]).
+  List<PendingInvite> get pending => List.unmodifiable(_pending);
+
+  /// Loads persisted invites, hooks welcomes, starts the poller.
+  void start() {
+    if (_started) return;
+    _started = true;
+    _pending.addAll(readPendingInvites(configFile));
+    _welcomeSub = client.welcomeEvents.listen((_) => check());
+    _timer = Timer.periodic(interval, (_) => check());
+  }
+
+  /// One delivery pass — poller tick, welcome, or arm time. Runs inside
+  /// timers, so errors surface via [onNotice] instead of throwing.
+  void check() {
+    unawaited(deliver().then(
+      (_) {},
+      onError: (Object e) =>
+          onNotice?.call('[hub] pending invite check failed: $e'),
+    ));
+  }
+
+  /// The shared delivery engine: one presence snapshot, every pending
+  /// whose name matches exactly one online agent (our own id excluded)
+  /// gets its chankey DM and leaves the list; a failed DM keeps the
+  /// entry for the next pass. Awaitable for deterministic tests.
+  Future<void> deliver() async {
+    if (_delivering || _pending.isEmpty || !client.connected) return;
+    _delivering = true;
+    try {
+      final agents = await client.presenceQuery();
+      for (var i = _pending.length - 1; i >= 0; i--) {
+        final invite = _pending[i];
+        final match = _soleOnlineMatch(agents, invite.name);
+        if (match == null) continue; // away or ambiguous: keep waiting
+        try {
+          await client.inviteTo(invite.channel, match.agentId);
+        } on Object {
+          continue; // retried on the next pass
+        }
+        _pending.removeAt(i);
+        await _persist();
+        onNotice?.call('invited ${invite.name} to #${invite.channel}');
+      }
+    } finally {
+      _delivering = false;
+    }
+  }
+
+  /// dap_invite: [nameOrId] is a 16-hex agent id (immediate chankey DM)
+  /// or a display name — a currently-online name is invited immediately;
+  /// an unknown or offline name arms a pending invite (auto-delivered
+  /// when they come online) and the result carries the paste-ready
+  /// connect line for the invited user. [channel] defaults to `general`
+  /// and is created zero-config under OUR key at arm time.
+  Future<InviteResult> invite(String nameOrId, {String? channel}) async {
+    final room = channel ?? 'general';
+    if (!client.connected) return _failed(room, nameOrId, notConnected);
+    if (_idPattern.hasMatch(nameOrId)) return _sendNow(room, nameOrId);
+    return _inviteByName(nameOrId, room);
+  }
+
+  Future<InviteResult> _inviteByName(String name, String room) async {
+    final List<AgentInfo> agents;
+    try {
+      agents = await client.presenceQuery();
+    } on Object catch (e) {
+      return _failed(room, name, 'invite failed: $e');
+    }
+    final matches = _namedMatches(agents, name);
+    if (matches.length == 1 && matches.single.online) {
+      return _sendNow(room, matches.single.agentId);
+    }
+    if (matches.length > 1) {
+      return _failed(
+          room,
+          name,
+          '"$name" is ambiguous — use an id: '
+          '${matches.map((m) => m.agentId).join(', ')}');
+    }
+    return _arm(name, room); // unknown or offline: invite on arrival
+  }
+
+  Future<InviteResult> _sendNow(String channel, String agentId) async {
+    try {
+      await client.inviteTo(channel, agentId);
+    } on Object catch (e) {
+      return _failed(channel, agentId, 'invite failed: $e');
+    }
+    onNotice?.call('invited $agentId to #$channel');
+    return (
+      ok: true,
+      channel: channel,
+      to: agentId,
+      pending: false,
+      connectLine: null,
+      error: null,
+    );
+  }
+
+  /// Arm a pending invite: create the channel under our key (the same
+  /// zero-config path as the DM), remember {name, channel} deduped on
+  /// (lowercased name, channel), hand back the paste-ready connect line.
+  Future<InviteResult> _arm(String name, String channel) async {
+    await client.ensureChannelKeys(channel);
+    final armed = _pending.any((p) =>
+        p.name.toLowerCase() == name.toLowerCase() && p.channel == channel);
+    if (!armed) {
+      _pending.add(PendingInvite(name: name, channel: channel));
+      await _persist();
+    }
+    check(); // arm-time check: the name may have connected just now
+    return (
+      ok: true,
+      channel: channel,
+      to: name,
+      pending: true,
+      connectLine:
+          'send to $name:  /dap ${dapHostOf(client.config.url ?? '')} $name',
+      error: null,
+    );
+  }
+
+  InviteResult _failed(String channel, String to, String error) => (
+        ok: false,
+        channel: channel,
+        to: to,
+        pending: false,
+        connectLine: null,
+        error: error,
+      );
+
+  /// The single online agent displaying [name] case-insensitively, our
+  /// own id excluded (shared-config self-invite hazard) — null while the
+  /// name is away or ambiguous.
+  AgentInfo? _soleOnlineMatch(List<AgentInfo> agents, String name) {
+    final wanted = name.toLowerCase();
+    final matches = agents
+        .where((a) =>
+            a.online &&
+            a.agentId != client.agentId &&
+            (a.name?.toLowerCase() ?? '') == wanted)
+        .toList();
+    return matches.length == 1 ? matches.single : null;
+  }
+
+  List<AgentInfo> _namedMatches(List<AgentInfo> agents, String name) {
+    final wanted = name.toLowerCase();
+    return agents
+        .where((a) => (a.name?.toLowerCase() ?? '') == wanted)
+        .toList();
+  }
+
+  Future<void> _persist() =>
+      persistDapConfig(invites: List.of(_pending), file: configFile);
+
+  Future<void> dispose() async {
+    _timer?.cancel();
+    await _welcomeSub?.cancel();
+  }
 }

@@ -37,6 +37,7 @@ class HubPlugin implements FahPlugin {
   PluginIO? _io;
   HubClient? _client;
   HubMessagingRepository? _repository;
+  PendingInvites? _invites;
   HubIdentity? _identity;
   StreamSubscription<HubError>? _errorSub;
 
@@ -79,6 +80,13 @@ class HubPlugin implements FahPlugin {
     );
     _repository = HubMessagingRepository(_client!);
     await _repository!.start();
+    final invites = PendingInvites(
+      client: _client!,
+      configFile: defaultDapConfigFile(home),
+      onNotice: (notice) => _io?.writeln('[hub] $notice'),
+    );
+    invites.start();
+    _invites = invites;
     _io?.writeln('[hub] connected as ${_client!.agentId}');
   }
 
@@ -98,16 +106,20 @@ class HubPlugin implements FahPlugin {
   /// The backing repository (exposed for hosts that prefer direct access).
   HubMessagingRepository? get repository => _repository;
 
-  /// Invites [agentId] to [channel] (see [HubClient.inviteTo]). The
-  /// mirrored [PluginContext] subset carries no tool registry, so hosts
-  /// register their `invite` tool around this one-liner; the upstream PR
-  /// would wire `registerTool` directly.
-  Future<void> inviteTo(String channel, String agentId) async {
-    final repository = _repository;
-    if (repository == null) {
+  /// dap_invite (see [PendingInvites.invite]): [nameOrId] is a 16-hex
+  /// agent id (immediate chankey DM) or a display name — a currently
+  /// online name is invited immediately, an unknown or offline name arms
+  /// a pending invite (auto-delivered when they come online) and the
+  /// result carries the paste-ready connect line for the invited user.
+  /// The mirrored [PluginContext] subset carries no tool registry, so
+  /// hosts register their `invite` tool around this one-liner; the
+  /// upstream PR would wire `registerTool` directly.
+  Future<InviteResult> inviteTo(String nameOrId, {String? channel}) async {
+    final invites = _invites;
+    if (invites == null) {
       throw StateError('plugin not started — call start() first');
     }
-    await repository.inviteTo(channel, agentId);
+    return invites.invite(nameOrId, channel: channel);
   }
 
   /// dap_connect — a manual invitation to any DAP hub, at runtime (the
@@ -172,6 +184,8 @@ class HubPlugin implements FahPlugin {
 
   Future<void> dispose() async {
     await _errorSub?.cancel();
+    await _invites?.dispose();
+    _invites = null;
     await _repository?.dispose();
     _repository = null;
     _client = null;

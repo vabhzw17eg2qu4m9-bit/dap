@@ -58,11 +58,6 @@ class HubMessagingRepository implements MessagingRepository {
     }
   }
 
-  /// Invites [agentId] to [channel] (see [HubClient.inviteTo]): the channel
-  /// keypair travels inside a normal E2E DM; the recipient auto-persists,
-  /// joins, and gets a notice on the steering source.
-  Future<void> inviteTo(String channel, String agentId) =>
-      client.inviteTo(channel, agentId);
 
   /// `dap_status` passthrough (see [HubClient.status]): connection state,
   /// identity, known channels, and hello/welcome counters.
