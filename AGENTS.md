@@ -22,9 +22,11 @@ CRAP ≤ 12 per function (`../bin/crap4go --run-tests --threshold 12 .` — pre-
 
 ## Quality gates
 
-- hub: crap4go (built in `bin/`, see bootstrap below)
-- fah adapter: `dart pub global activate crap4dart && crap4dart analyze --run-tests --threshold 12` (IstiN/crap4dart, Dart sibling of crap4go) — run on change, fix over-threshold methods
-- TS adapters: `tsc --noEmit` clean + suite green
+- **Master**: `./scripts/score.sh` — 18 criteria, must stay 18/18; run after any change, commit only non-regressing.
+- hub: `go vet ./...` clean; CRAP ≤ 12 per function (`../bin/crap4go --run-tests --threshold 12 .`) — pre-commit hook enforced, never `--no-verify`.
+- fah adapter: `dart analyze` clean; `crap4dart analyze --run-tests --threshold 12` (IstiN/crap4dart) — run on change, fix over-threshold methods.
+- TS adapters (mcp-bridge, omp-extension, dsh-plugin): `tsc --noEmit` clean + full suite green (`npm test`).
+- Every adapter suite green is itself a gate: omp/mcp/dsh `npm test`, fah `dart test`, hub `go test ./...`.
 
 ## Environment
 
