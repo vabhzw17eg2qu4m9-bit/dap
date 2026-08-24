@@ -47,6 +47,10 @@ const toolResult = (result: unknown): AgentToolResult => ({
   details: result,
 });
 
+/** Shareable host[:port] for connect lines: strip the ws(s):// scheme and
+ *  the trailing /ws path from a full hub URL. */
+const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
+
 /** Injection text: enough context for the steered turn to answer in-channel. */
 function formatEntry(entry: InboxEntry, peerName: string): string {
   const where = entry.channel ? '#' + entry.channel : 'DM';
@@ -108,7 +112,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   let ui: SessionCtx['ui'] | undefined;
   const renderStatus = (state: string): void => {
     const who = settings.name ?? agentId;
-    const host = settings.url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
+    const host = hostOf(settings.url);
     const chans = Object.keys(cryptoCtx.channels)
       .map((c) => '#' + c)
       .join(',');
@@ -213,6 +217,28 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
    * sends while disconnected are dropped silently by the socket layer. */
   const requireConnected = (): { ok: false; error: string } | undefined =>
     client.connected ? undefined : { ok: false, error: 'not connected to the hub (reconnecting with backoff — retry in a moment)' };
+  /** Outcome of the shared invite path (tool result or footer verdict). */
+  interface InviteOutcome {
+    ok: boolean;
+    channel?: string;
+    to?: string;
+    id?: string;
+    ts?: number;
+    error?: string;
+  }
+  /** One invite path (dap_invite tool + /dap invite command): DM the
+   *  channel keypair to another agent — channelKeysFor auto-creates the
+   *  channel zero-config when we don't hold the private key yet. */
+  const sendInvite = async (channel: string, to: string): Promise<InviteOutcome> => {
+    const down = requireConnected();
+    if (down) return down;
+    const keys = channelKeysFor(channel);
+    const frameId = crypto.randomUUID();
+    const payload = JSON.stringify({ t: 'chankey', channel, pub: keys.pub, priv: keys.priv });
+    const ciphertext = await encryptForDM(payload, to, frameId, cryptoCtx);
+    const ts = client.signedSend({ to, id: frameId, ciphertext });
+    return { ok: true, channel, to, id: frameId, ts };
+  };
 
   ctx.registerTool({
     name: 'dap_send',
@@ -272,18 +298,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       },
       required: ['channel', 'to'],
     },
-    execute: async (_toolCallId, params) => {
-      const down = requireConnected();
-      if (down) return toolResult(down);
-      const channel = str(params.channel);
-      const to = str(params.to);
-      const keys = channelKeysFor(channel);
-      const frameId = crypto.randomUUID();
-      const payload = JSON.stringify({ t: 'chankey', channel, pub: keys.pub, priv: keys.priv });
-      const ciphertext = await encryptForDM(payload, to, frameId, cryptoCtx);
-      const ts = client.signedSend({ to, id: frameId, ciphertext });
-      return toolResult({ ok: true, channel, to, id: frameId, ts });
-    },
+    execute: async (_toolCallId, params) => toolResult(await sendInvite(str(params.channel), str(params.to))),
   });
 
   ctx.registerTool({
@@ -394,11 +409,56 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       return toolResult(connectTo(host, name, channel));
     },
   });
+  /** The paste-ready connect line for a brand-new user (sent out-of-band). */
+  const shareLine = (): string => `send to other user:  /dap ${hostOf(settings.url)} <name>`;
+  /** /dap invite <name|agentId> [channel]: names resolve via presence
+   *  (case-insensitive; 16-hex ids pass straight through). Sync handler
+   *  → the async verdict lands in the footer status and (on failure) a
+   *  steer — never swallowed, even headless. */
+  const inviteCommand = (args: string[]): string => {
+    const [who, channelArg] = args;
+    if (!who) return shareLine();
+    const down = requireConnected();
+    if (down) return down.error;
+    const channel = channelArg ?? 'general';
+    const surface = (msg: string): void => {
+      renderStatus(msg);
+      ctx.appendEntry('io.dap.error', { code: 'invite_failed', msg });
+      ctx.sendMessage(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
+    };
+    const report = (r: InviteOutcome): void => {
+      if (r.ok) renderStatus(`invited ${r.to} to #${r.channel}`);
+      else surface(`invite failed: ${r.error}`);
+    };
+    if (/^[0-9a-f]{16}$/.test(who)) {
+      void sendInvite(channel, who).then(report, (err: unknown) => surface(`invite failed: ${String(err)}`));
+    } else {
+      const wanted = who.toLowerCase();
+      void client
+        .presence()
+        .then((agents) => {
+          const matches = agents.filter((a) => a.name?.toLowerCase() === wanted);
+          if (matches.length === 1 && matches[0].online) return sendInvite(channel, matches[0].agentId).then(report);
+          surface(
+            matches.length === 0
+              ? `invite failed: no agent named "${who}"`
+              : matches.length > 1
+                ? `invite failed: "${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}`
+                : `invite failed: "${who}" is offline — invite by 16-hex agentId instead`,
+          );
+        })
+        .catch((err: unknown) => surface(`invite failed: ${String(err)}`));
+    }
+    return `inviting ${who} to #${channel}…`;
+  };
   ctx.registerCommand?.('dap', {
-    description: '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub',
+    description:
+      '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub; /dap invite — print the connect line to share with a new user; /dap invite <name|agentId> [channel] — DM them the channel keypair',
     handler: (args: string) => {
-      const [host, name, channel] = args.trim().split(/\s+/).filter(Boolean);
-      if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}`;
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts[0] === 'invite') return inviteCommand(parts.slice(1));
+      const [host, name, channel] = parts;
+      if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}\n${shareLine()}`;
       return JSON.stringify(connectTo(optStr(host), optStr(name), optStr(channel)));
     },
   });

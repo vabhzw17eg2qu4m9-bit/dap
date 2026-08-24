@@ -35,9 +35,15 @@ function nextEvent<T>(client: DapClient, event: string): Promise<T> {
   return client.waitForAfter<T>(event, client.eventCount(event));
 }
 
+interface CapturedCommand {
+  description: string;
+  handler: (args: string) => string;
+}
+
 interface Captured {
   ctx: ExtensionAPI;
   tools: Map<string, ToolDefinition>;
+  commands: Map<string, CapturedCommand>;
   sent: { msg: string; opts: SendMessageOptions | undefined }[];
   entries: { type: string; data: unknown }[];
   labels: string[];
@@ -51,12 +57,14 @@ function fakeCtx(): Captured {
   const entries: Captured['entries'] = [];
   const labels: string[] = [];
   const handlers = new Map<string, (event: unknown, ctx: SessionCtx) => void | Promise<void>>();
+  const commands = new Map<string, CapturedCommand>();
   const ctx: ExtensionAPI = {
     registerTool: (tool) => void tools.set(tool.name, tool),
     sendMessage: (msg, opts) => void sent.push({ msg, opts }),
     appendEntry: (type, data) => void entries.push({ type, data }),
     setLabel: (label) => void labels.push(label),
     on: (event, handler) => void handlers.set(event, handler),
+    registerCommand: (name, def) => void commands.set(name, def),
   };
   return {
     ctx,
@@ -64,6 +72,7 @@ function fakeCtx(): Captured {
     sent,
     entries,
     labels,
+    commands,
     fire: (event, sctx) => void handlers.get(event)?.(event, sctx),
   };
 }
@@ -89,6 +98,12 @@ const tool = (c: Captured, name: string): ToolDefinition => {
   const t = c.tools.get(name);
   assert.ok(t, 'tool not registered: ' + name);
   return t;
+};
+
+const command = (c: Captured, name: string): CapturedCommand => {
+  const cmd = c.commands.get(name);
+  assert.ok(cmd, 'command not registered: ' + name);
+  return cmd;
 };
 
 /** Invoke a registered tool the way omp does: execute(toolCallId, params);
@@ -481,6 +496,70 @@ test('invite: A auto-creates #general, dap_invite DMs the chankey to B; B joins 
   } finally {
     extA.dispose();
     extB.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap invite: name (case-insensitive) and agentId forms share the tool path; B gets the chankey DM, joins, persists', async () => {
+  const hub = await new FakeHub().listen();
+  const fileA = path.join(KEYDIR, 'cmd-invite-a-' + ++keySeq + '.json');
+  const fileB = path.join(KEYDIR, 'cmd-invite-b-' + ++keySeq + '.json');
+  fs.writeFileSync(fileB, '{}'); // B starts with an empty channels file
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileB, name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    const dap = command(a, 'dap');
+
+    // Display-name form, wrong case on purpose: presence resolves it, channel defaults to general.
+    const joinedA = nextEvent<{ channel: string }>(extA.client, 'joined');
+    assert.match(dap.handler('invite BoB'), /inviting BoB to #general…/);
+    assert.equal((await joinedA).channel, 'general', 'A zero-config created + joined #general');
+    await nextEvent(extB.client, 'inbound'); // chankey DM fully processed (deterministic)
+    await nextEvent(extB.client, 'joined');
+    assert.equal(loadChannelKeys(fileB).general?.pub, loadChannelKeys(fileA).general?.pub, 'B persisted the invited keypair');
+    assert.ok(hub.channelMembers.get('general')?.has(extB.client.agentId), 'B auto-joined after the invite');
+    assert.ok(b.sent.some((s) => s.msg.includes('[dap] invited to #general by ' + extA.client.agentId)), 'invite notice steered');
+    const dmSend = hub.verifiedSends.find((f) => f.to === extB.client.agentId);
+    assert.ok(dmSend && !dmSend.ciphertext.includes('chankey'), 'ciphertext only on the wire');
+
+    // agentId form, explicit channel: same shared invite path.
+    const joinedTeam = nextEvent<{ channel: string }>(extA.client, 'joined');
+    assert.match(dap.handler(`invite ${extB.client.agentId} team`), /inviting/);
+    assert.equal((await joinedTeam).channel, 'team');
+    await nextEvent(extB.client, 'inbound');
+    await nextEvent(extB.client, 'joined');
+    assert.ok(hub.channelMembers.get('team')?.has(extB.client.agentId), 'B joined #team via agentId invite');
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap invite (no args) and bare /dap: print the paste-ready connect line (host from ws URL, <name> placeholder)', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const cfgFile = path.join(KEYDIR, 'cfg-share-' + ++keySeq + '.json');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'sharer' });
+  try {
+    await nextEvent(ext.client, 'welcome');
+    const dap = command(cap, 'dap');
+    const line = `send to other user:  /dap 127.0.0.1:${hub.port} <name>`; // ws://…/ws stripped to host:port
+    assert.equal(dap.handler('invite'), line);
+    assert.equal(dap.handler(''), `current: ${hub.url} as sharer\n${line}`, 'bare /dap keeps current: and appends the share line');
+
+    fs.writeFileSync(cfgFile, JSON.stringify({ channels: ['ops'] }));
+    assert.equal(dap.handler('invite'), line, 'line carries no room — config channels do not change it');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    ext.dispose();
     await hub.close();
   }
 });
