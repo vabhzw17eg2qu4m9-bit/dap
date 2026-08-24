@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import dapExtension from '../src/index.ts';
+import dapExtension, { type DapExtension } from '../src/index.ts';
 import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.ts';
-import { resolveDapSettings } from '../src/config.ts';
+import { persistDapConfig, readDapConfig, resolveDapSettings } from '../src/config.ts';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.ts';
 import type { DapClient, MsgFrame, Timers } from '../src/conn.ts';
 import type { CommandCtx, ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.ts';
@@ -33,6 +33,21 @@ test.after(() => {
 /** Wait for the next emission of `event` after this call — race-free. */
 function nextEvent<T>(client: DapClient, event: string): Promise<T> {
   return client.waitForAfter<T>(event, client.eventCount(event));
+}
+
+/** Wait until `event` has fired at least `n` times. Wire frames can batch
+ *  into one macrotask, so a nextEvent registered after a prior await can
+ *  miss emissions that already landed. */
+async function eventCountAtLeast(client: DapClient, event: string, n: number): Promise<void> {
+  while (client.eventCount(event) < n) await client.waitForAfter(event, client.eventCount(event));
+}
+
+/** Macrotask-boundary drain: every pending microtask continuation (e.g. an
+ *  in-flight delivery pass) settles before the next test step. */
+async function microtasksSettled(): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setImmediate(resolve);
+  await promise;
 }
 
 interface CapturedCommand {
@@ -564,6 +579,233 @@ test('/dap invite (no args) and bare /dap: print the paste-ready connect line (h
     else process.env.DAP_CONFIG_FILE = prevCfgEnv;
     ext.dispose();
     await hub.close();
+  }
+});
+
+test('/dap invite <unknown name>: arms a pending invite, prints the connect line, persists to config (deduped)', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const cfgFile = path.join(KEYDIR, 'cfg-pending-' + ++keySeq + '.json');
+  const chFile = path.join(KEYDIR, 'ch-pending-' + keySeq + '.json');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: chFile, name: 'inviter' });
+  try {
+    await nextEvent(ext.client, 'welcome');
+    const dap = command(cap, 'dap');
+    const notices: string[] = [];
+    const cmdCtx = { ui: { notify: (t: string) => void notices.push(t) }, hasUI: true };
+    // The arm settles via its side effects: the join (channel auto-created)
+    // and the arm-time delivery check's presence round-trip.
+    const joined = nextEvent<{ channel: string }>(ext.client, 'joined');
+    const presenceBefore = ext.client.eventCount('presence');
+    assert.match(dap.handler('invite carol', cmdCtx), /inviting carol to #general…/);
+    assert.equal((await joined).channel, 'general', 'channel auto-created + inviter joined at arm time');
+    await eventCountAtLeast(ext.client, 'presence', presenceBefore + 2); // lookup + arm-time check
+    assert.ok(
+      notices.includes(`send to carol:  /dap 127.0.0.1:${hub.port} carol`),
+      'paste-ready line notified: ' + JSON.stringify(notices),
+    );
+    assert.deepEqual(
+      readDapConfig(cfgFile).invites,
+      [{ name: 'carol', channel: 'general' }],
+      'pending invite persisted',
+    );
+
+    // Same (name, channel) again, different case: deduped, still one entry.
+    const before2 = ext.client.eventCount('presence');
+    dap.handler('invite CAROL general', cmdCtx);
+    await eventCountAtLeast(ext.client, 'presence', before2 + 2);
+    assert.deepEqual(readDapConfig(cfgFile).invites, [{ name: 'carol', channel: 'general' }], 'deduped');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('pending invite: invitee connects later under the armed name -> poller tick DMs the chankey, invitee joins, pending removed', async () => {
+  const hub = await new FakeHub().listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-auto-' + ++keySeq + '.json');
+  const fileA = path.join(KEYDIR, 'auto-inv-a-' + keySeq + '.json');
+  const fileB = path.join(KEYDIR, 'auto-inv-b-' + ++keySeq + '.json');
+  fs.writeFileSync(fileB, '{}');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice' });
+  let extB: DapExtension | undefined;
+  try {
+    await nextEvent(extA.client, 'welcome');
+    // Managed-timer session context: the poller registers into pollTasks,
+    // the test fires it manually — no real waits.
+    const pollTasks = new Map<number, () => void>();
+    let pollSeq = 0;
+    const notices: string[] = [];
+    a.fire('session_start', {
+      hasUI: true,
+      isIdle: () => true,
+      ui: { notify: (text: string) => void notices.push(text) },
+      setInterval: (fn: () => void) => {
+        const id = ++pollSeq;
+        pollTasks.set(id, fn);
+        return id;
+      },
+      clearTimer: (h: unknown) => void pollTasks.delete(h as number),
+    });
+    assert.equal(pollTasks.size, 1, 'poller armed on its managed timer');
+
+    const cmdNotices: string[] = [];
+    const cmdCtx = { ui: { notify: (t: string) => void cmdNotices.push(t) }, hasUI: true };
+    const joined = nextEvent<{ channel: string }>(extA.client, 'joined');
+    const presenceBefore = extA.client.eventCount('presence');
+    assert.match(command(a, 'dap').handler('invite carol', cmdCtx), /inviting carol to #general…/);
+    await joined; // arm() completed: channel created, pending persisted
+    await eventCountAtLeast(extA.client, 'presence', presenceBefore + 2); // arm-time check settled
+    // The invitee is a different user: it must not load the inviter's
+    // pending config (DAP_CONFIG_FILE is read at factory time).
+    delete process.env.DAP_CONFIG_FILE;
+    extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileB, name: 'carol' });
+    process.env.DAP_CONFIG_FILE = cfgFile;
+    await nextEvent(extB.client, 'welcome');
+    const carolId = extB.client.agentId;
+
+    // Poller tick: presence now sees carol online -> automatic chankey DM.
+    const tickPresence = nextEvent(extA.client, 'presence');
+    await microtasksSettled(); // the arm-time pass finishes before the tick fires
+    for (const fn of [...pollTasks.values()]) fn();
+    await tickPresence;
+    await nextEvent(extB.client, 'inbound'); // chankey DM fully processed (deterministic)
+    await nextEvent(extB.client, 'joined');
+
+    const dmSend = hub.verifiedSends.find((f) => f.to === carolId);
+    assert.ok(dmSend && !dmSend.ciphertext.includes('chankey'), 'ciphertext only on the wire');
+    assert.equal(loadChannelKeys(fileB).general?.pub, loadChannelKeys(fileA).general?.pub, 'invitee persisted the keypair');
+    assert.ok(hub.channelMembers.get('general')?.has(carolId), 'invitee joined #general');
+    assert.ok(notices.includes('invited carol to #general'), 'inviter notified: ' + JSON.stringify(notices));
+    assert.deepEqual(readDapConfig(cfgFile).invites, [], 'pending removed after delivery');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    extB?.dispose();
+    extA.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap invite <online name>: immediate chankey DM, nothing armed in config', async () => {
+  const hub = await new FakeHub().listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-online-' + ++keySeq + '.json');
+  const fileA = path.join(KEYDIR, 'online-inv-a-' + keySeq + '.json');
+  const fileB = path.join(KEYDIR, 'online-inv-b-' + ++keySeq + '.json');
+  fs.writeFileSync(fileB, '{}');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileB, name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    const joined = nextEvent<{ channel: string }>(extA.client, 'joined');
+    assert.match(command(a, 'dap').handler('invite bob'), /inviting bob to #general…/);
+    await nextEvent(extB.client, 'inbound');
+    await nextEvent(extB.client, 'joined');
+    assert.equal((await joined).channel, 'general');
+    assert.ok(hub.verifiedSends.some((f) => f.to === extB.client.agentId), 'immediate DM, no pending involved');
+    assert.ok(!fs.existsSync(cfgFile), 'nothing armed or persisted for an online name');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('config back-compat: file without invites key loads (invites defaults to []), persist keeps other keys', () => {
+  const cfgFile = path.join(KEYDIR, 'cfg-legacy-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ url: 'ws://legacy:9/ws', name: 'legacy', channels: ['ops'] }));
+  const cfg = readDapConfig(cfgFile);
+  assert.deepEqual(cfg.invites, [], 'missing invites key defaults to []');
+  assert.equal(cfg.url, 'ws://legacy:9/ws');
+  persistDapConfig({ invites: [{ name: 'newbie', channel: 'general' }] }, cfgFile);
+  const after = readDapConfig(cfgFile);
+  assert.deepEqual(after.invites, [{ name: 'newbie', channel: 'general' }]);
+  assert.equal(after.url, 'ws://legacy:9/ws', 'existing keys survive');
+  assert.deepEqual(after.channels, ['ops']);
+  fs.writeFileSync(cfgFile, JSON.stringify({ invites: 'corrupt' }));
+  assert.deepEqual(readDapConfig(cfgFile).invites, [], 'non-array invites treated as absent');
+});
+
+test('pending invites survive a restart: welcome-time check delivers without waiting a tick', async () => {
+  const hub = await new FakeHub().listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-restart-' + ++keySeq + '.json');
+  const fileA = path.join(KEYDIR, 'restart-a-' + keySeq + '.json');
+  const fileB = path.join(KEYDIR, 'restart-b-' + ++keySeq + '.json');
+  fs.writeFileSync(fileB, '{}');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice' });
+  let extB: DapExtension | undefined;
+  let extA2: DapExtension | undefined;
+  try {
+    await nextEvent(extA.client, 'welcome');
+    const joined = nextEvent<{ channel: string }>(extA.client, 'joined');
+    const presenceBefore = extA.client.eventCount('presence');
+    command(a, 'dap').handler('invite carol', { ui: { notify: () => {} }, hasUI: true });
+    await joined; // arm() completed
+    await eventCountAtLeast(extA.client, 'presence', presenceBefore + 2);
+    extA.dispose(); // inviter goes away entirely
+    delete process.env.DAP_CONFIG_FILE; // the invitee never loads the inviter's pendings
+    extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileB, name: 'carol' });
+    process.env.DAP_CONFIG_FILE = cfgFile;
+    await nextEvent(extB.client, 'welcome');
+
+    // Fresh inviter instance, same config: welcome-time check delivers.
+    extA2 = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelsFile: fileA, name: 'alice2' });
+    await nextEvent(extA2.client, 'welcome');
+    await nextEvent(extB.client, 'inbound');
+    await nextEvent(extB.client, 'joined');
+    assert.equal(loadChannelKeys(fileB).general?.pub, loadChannelKeys(fileA).general?.pub, 'same channel key delivered');
+    assert.ok(hub.channelMembers.get('general')?.has(extB.client.agentId), 'carol joined');
+    assert.deepEqual(readDapConfig(cfgFile).invites, [], 'pending consumed after restart delivery');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    extA2?.dispose();
+    extB?.dispose();
+    extA.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap <bare host>: normalizes to …/ws; explicit path kept', async () => {
+  const cfgFile = path.join(KEYDIR, 'cfg-hostnorm-' + ++keySeq + '.json');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, {
+    url: 'ws://127.0.0.1:9/ws', // dead endpoint; we only read the normalized url
+    keyPath: nextKeyPath(),
+    backoff: { initial: 60_000, max: 60_000 }, // no reconnect storm
+  });
+  try {
+    const dap = command(cap, 'dap');
+    const bare = JSON.parse(dap.handler('127.0.0.1:8787 me')) as { url: string };
+    assert.equal(bare.url, 'ws://127.0.0.1:8787/ws', 'bare host gains the /ws path');
+    const explicit = JSON.parse(dap.handler('ws://127.0.0.1:8787/custom me')) as { url: string };
+    assert.equal(explicit.url, 'ws://127.0.0.1:8787/custom', 'explicit path kept');
+    assert.equal(readDapConfig(cfgFile).url, 'ws://127.0.0.1:8787/custom', 'normalized url persisted');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    ext.dispose();
   }
 });
 

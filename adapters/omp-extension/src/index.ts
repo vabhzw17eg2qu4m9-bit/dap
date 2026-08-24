@@ -7,7 +7,14 @@ import {
   decryptInbound,
   type PayloadCryptoContext,
 } from './codec.ts';
-import { resolveDapSettings, optStr, defaultKeyPath, persistDapConfig } from './config.ts';
+import {
+  resolveDapSettings,
+  optStr,
+  defaultKeyPath,
+  persistDapConfig,
+  readDapConfig,
+  type PendingInvite,
+} from './config.ts';
 import {
   loadChannelKeys,
   persistChannelKeys,
@@ -120,6 +127,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   };
   ctx.on('session_start', (_event, sctx) => {
     ui = sctx.ui;
+    pollerCtx = sctx; // managed timers for the pending-invite poller
+    startPoller();
     if (sctx.hasUI && sctx.ui) {
       sctx.ui.notify(`DAP connected as ${agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
     }
@@ -195,6 +204,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   // first join ever creates the channel and registers its public key).
   client.on('welcome', () => {
     for (const [name, pub] of Object.entries(cryptoCtx.channels)) client.join(name, pub);
+    startPoller(); // the session context may exist before the socket does
+    pollPending(); // restart with pendings armed: deliver without waiting a tick
     renderStatus('connected');
   });
 
@@ -238,6 +249,56 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     const ciphertext = await encryptForDM(payload, to, frameId, cryptoCtx);
     const ts = client.signedSend({ to, id: frameId, ciphertext });
     return { ok: true, channel, to, id: frameId, ts };
+  };
+
+  /** Never-silent failure path shared by the invite flows: footer + durable
+   *  entry + steer — the verdict must reach the user even headless. */
+  const surface = (msg: string): void => {
+    renderStatus(msg);
+    ctx.appendEntry('io.dap.error', { code: 'invite_failed', msg });
+    ctx.sendMessage(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
+  };
+  /** Pending by-name invites: `/dap invite <name>` against a user not yet on
+   *  the hub. The chankey DM fires automatically once the name appears
+   *  online; entries survive restarts in ~/.dap/config.json. */
+  const configFile = optStr(process.env.DAP_CONFIG_FILE);
+  const pendingInvites: PendingInvite[] = readDapConfig(configFile).invites ?? [];
+  const persistInvites = (): void => persistDapConfig({ invites: [...pendingInvites] }, configFile);
+  /** Shared delivery engine (poller tick + arm-time check): one presence
+   *  snapshot, every matching pending gets its chankey DM. Never throws —
+   *  it runs inside managed timers. */
+  let delivering = false;
+  const deliverPending = async (): Promise<void> => {
+    if (delivering || pendingInvites.length === 0 || !client.connected) return;
+    delivering = true;
+    try {
+      const agents = await client.presence();
+      for (let i = pendingInvites.length - 1; i >= 0; i--) {
+        const pending = pendingInvites[i];
+        const online = agents.filter((a) => a.online && a.agentId !== client.agentId && a.name?.toLowerCase() === pending.name.toLowerCase());
+        if (online.length !== 1) continue; // still away (or ambiguous): keep waiting
+        const outcome = await sendInvite(pending.channel, online[0].agentId);
+        if (!outcome.ok) continue; // retried on the next tick
+        pendingInvites.splice(i, 1);
+        persistInvites();
+        renderStatus(`invited ${pending.name} to #${pending.channel}`);
+        ui?.notify(`invited ${pending.name} to #${pending.channel}`, 'info');
+      }
+    } finally {
+      delivering = false;
+    }
+  };
+  const pollPending = (): void => {
+    void deliverPending().catch((err: unknown) => surface(`pending invite check failed: ${String(err)}`));
+  };
+  /** Managed ctx.setInterval poller (~15s): starts once the session context
+   *  (timers) and the first welcome both exist; dispose clears it. */
+  const INVITE_POLL_MS = 15000;
+  let pollerCtx: SessionCtx | undefined;
+  let pollerHandle: unknown;
+  const startPoller = (): void => {
+    if (pollerHandle !== undefined || !pollerCtx) return;
+    pollerHandle = pollerCtx.setInterval(pollPending, INVITE_POLL_MS);
   };
 
   ctx.registerTool({
@@ -368,10 +429,9 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   /** dap_connect: manual invitation to any DAP server — host, optional
    *  name (a new name = a new identity: name-derived key file), optional
    *  default room (persisted; auto-joined on every later launch). */
-  const configFile = optStr(process.env.DAP_CONFIG_FILE);
   const normalizeHost = (h: string): string => {
-    const withScheme = /^wss?:\/\//.test(h) ? h : 'ws://' + h;
-    const u = new URL(withScheme);
+    const u = new URL(/^wss?:\/\//.test(h) ? h : 'ws://' + h);
+    if (u.pathname === '/' || u.pathname === '') u.pathname = '/ws';
     return u.toString().replace(/\/$/, '');
   };
   const connectTo = (host?: string, name?: string, channel?: string) => {
@@ -412,23 +472,33 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   /** The paste-ready connect line for a brand-new user (sent out-of-band). */
   const shareLine = (): string => `send to other user:  /dap ${hostOf(settings.url)} <name>`;
   /** /dap invite <name|agentId> [channel]: names resolve via presence
-   *  (case-insensitive; 16-hex ids pass straight through). Sync handler
-   *  → the async verdict lands in the footer status and (on failure) a
-   *  steer — never swallowed, even headless. */
-  const inviteCommand = (args: string[]): string => {
+   *  (case-insensitive; 16-hex ids pass straight through). A name that is
+   *  unknown or offline arms a pending invite — the chankey DM fires
+   *  automatically when that name comes online. Sync handler → the async
+   *  verdict lands in the footer status and (on failure) a steer — never
+   *  swallowed, even headless. */
+  const inviteCommand = (args: string[], cmdCtx?: CommandCtx): string => {
     const [who, channelArg] = args;
     if (!who) return shareLine();
     const down = requireConnected();
     if (down) return down.error;
     const channel = channelArg ?? 'general';
-    const surface = (msg: string): void => {
-      renderStatus(msg);
-      ctx.appendEntry('io.dap.error', { code: 'invite_failed', msg });
-      ctx.sendMessage(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
-    };
     const report = (r: InviteOutcome): void => {
       if (r.ok) renderStatus(`invited ${r.to} to #${r.channel}`);
       else surface(`invite failed: ${r.error}`);
+    };
+    /** Arm a pending invite: create the channel under our key (same
+     *  zero-config path as sendInvite), remember {name, channel}, hand
+     *  back the paste-ready connect line for the invitee. */
+    const arm = (): void => {
+      channelKeysFor(channel);
+      if (!pendingInvites.some((p) => p.name.toLowerCase() === who.toLowerCase() && p.channel === channel)) {
+        pendingInvites.push({ name: who, channel });
+        persistInvites();
+      }
+      const line = `send to ${who}:  /dap ${hostOf(settings.url)} ${who}`;
+      cmdCtx?.ui?.notify(line, 'info');
+      pollPending(); // arm-time check: the name may have connected just now
     };
     if (/^[0-9a-f]{16}$/.test(who)) {
       void sendInvite(channel, who).then(report, (err: unknown) => surface(`invite failed: ${String(err)}`));
@@ -438,37 +508,37 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
         .presence()
         .then((agents) => {
           const matches = agents.filter((a) => a.name?.toLowerCase() === wanted);
-          if (matches.length === 1 && matches[0].online) return sendInvite(channel, matches[0].agentId).then(report);
-          surface(
-            matches.length === 0
-              ? `invite failed: no agent named "${who}"`
-              : matches.length > 1
-                ? `invite failed: "${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}`
-                : `invite failed: "${who}" is offline — invite by 16-hex agentId instead`,
-          );
+          if (matches.length === 1 && matches[0].online) return void sendInvite(channel, matches[0].agentId).then(report);
+          if (matches.length > 1)
+            return surface(`invite failed: "${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}`);
+          arm(); // unknown or offline: not an error — invite on arrival
         })
         .catch((err: unknown) => surface(`invite failed: ${String(err)}`));
     }
     return `inviting ${who} to #${channel}…`;
   };
-  const dispatchDap = (args: string): string => {
+  const dispatchDap = (args: string, cmdCtx?: CommandCtx): string => {
     const parts = args.trim().split(/\s+/).filter(Boolean);
-    if (parts[0] === 'invite') return inviteCommand(parts.slice(1));
+    if (parts[0] === 'invite') return inviteCommand(parts.slice(1), cmdCtx);
     const [host, name, channel] = parts;
     if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}\n${shareLine()}`;
     return JSON.stringify(connectTo(optStr(host), optStr(name), optStr(channel)));
   };
   ctx.registerCommand?.('dap', {
     description:
-      '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub; /dap invite — print the connect line to share with a new user; /dap invite <name|agentId> [channel] — DM them the channel keypair',
+      '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub; /dap invite — print the connect line to share with a new user; /dap invite <name|agentId> [channel] — DM them the channel keypair (a name not yet online is invited automatically when they connect)',
     handler: (args: string, cmdCtx?: CommandCtx): string => {
-      const out = dispatchDap(args);
+      const out = dispatchDap(args, cmdCtx);
       // omp discards handler return values — the line must go through the UI.
       cmdCtx?.ui?.notify(out, 'info');
       return out;
     },
   });
-  const dispose = (): void => client.stop();
+  const dispose = (): void => {
+    if (pollerHandle !== undefined) pollerCtx?.clearTimer(pollerHandle);
+    pollerHandle = undefined;
+    client.stop();
+  };
   // Clean exit: closing the socket lets the hub deregister immediately
   // (identity + mailbox survive for offline DMs).
   ctx.on('session_shutdown', dispose);
