@@ -65,7 +65,10 @@ type Listener = (value: unknown) => void;
  * backoff (1s doubling, 30s cap, reset on welcome).
  */
 export class DapClient {
-  readonly agentId: string;
+  /** Identity follows the keypair: agentId = hex(sha256(pub))[:16]. */
+  get agentId(): string {
+    return agentIdFor(this.opts.keys.pub);
+  }
   connected = false;
   helloCount = 0;
   welcomeCount = 0;
@@ -86,7 +89,7 @@ export class DapClient {
   private readonly whoisWaiters = new Map<string, Array<(info: AgentInfo | undefined) => void>>();
 
   constructor(private readonly opts: DapOptions) {
-    this.agentId = agentIdFor(opts.keys.pub);
+    // agentId is a getter over opts.keys — no field to set.
     this.backoff = { ...DEFAULT_BACKOFF, ...opts.backoff };
     this.delay = this.backoff.initial;
     this.timers =
@@ -109,6 +112,27 @@ export class DapClient {
     });
     ws.on('message', (data) => this.handleFrame(data.toString()));
     ws.on('close', () => this.onClose());
+  }
+
+  /** Runtime retarget (dap_connect): stop everything, swap url and/or
+   *  identity keys and display name, then connect fresh. A new name means
+   *  a new identity (name-derived key file) — a different agentId. */
+  retarget(next: { url?: string; keys?: KeyPair; name?: string }): void {
+    if (this.timer !== undefined) this.timers.clearInterval(this.timer);
+    this.timer = undefined;
+    this.watchdog.stop();
+    this.ws?.close();
+    this.ws = undefined;
+    this.connected = false;
+    this.stopped = false; // connect() again after the implicit stop
+    if (next.url) this.opts.url = next.url;
+    if (next.keys) {
+      this.opts.keys = next.keys;
+      this.whoisCache.clear();
+    }
+    if (next.name !== undefined) this.opts.name = next.name;
+    this.delay = this.backoff.initial;
+    this.connect();
   }
 
   stop(): void {

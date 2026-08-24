@@ -249,4 +249,60 @@ void main() {
 
     await client.disconnect();
   }, timeout: timeout);
+
+  test('retarget/connectTo: bare host + name + room → second welcome, '
+      'new agentId, lobby joined, retired loop stays retired', () async {
+    final hub2 = FakeHub();
+    await hub2.start();
+    addTearDown(() => hub2.stop());
+    final home = await Directory.systemTemp.createTemp('fah-dap-conn-');
+    addTearDown(() => home.delete(recursive: true));
+
+    final client = HubClient(
+      config: HubConfig(url: hub.url.toString()),
+      identity: await HubIdentity.generate(),
+      channelStore: await ChannelStore.fromFile('${home.path}/channels.json'),
+      // long enough that retarget lands while the loop parks in backoff
+      backoff: (int _) => const Duration(milliseconds: 400),
+    );
+    await client.connect();
+    final firstId = client.agentId!;
+    expect(hub.hellosSeen, 1);
+
+    // network drop → the reconnect loop parks in its 400 ms backoff
+    await hub.closeAgent(firstId);
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+
+    // subscribe early — the lobby join fires during connectTo itself
+    final lobbyJoin = hub2.joins
+        .firstWhere((j) => j.channel == 'lobby')
+        .timeout(const Duration(seconds: 5));
+
+    // bare host: no scheme, no path — normalized to ws://<host>/ws
+    final result = await client.connectTo('127.0.0.1:${hub2.url.port}',
+        name: 'bee', channel: 'lobby', home: home.path);
+    expect(result.ok, isTrue);
+    expect(result.url, hub2.url.toString());
+    expect(result.name, 'bee');
+    expect(result.agentId, isNot(firstId)); // new name = new identity
+    expect(result.agentId, client.agentId); // recomputed from the new keys
+    expect(result.channels, contains('lobby'));
+    expect(client.status().welcomes, 2); // the second welcome
+    expect(client.status().url, hub2.url.toString());
+
+    final join = await lobbyJoin;
+    expect(join.agentId, result.agentId); // lobby joined under the new id
+
+    // name-derived key file, 0600, reloads to the same identity
+    final keyFile = File('${home.path}/.dap/keys/fah/bee.key');
+    expect((await keyFile.stat()).modeString(), 'rw-------');
+    expect((await HubIdentity.load(keyFile.path)).agentId, result.agentId);
+
+    // the retired loop (asleep when retargeted) must never re-hello:
+    // a live rogue loop would reconnect and bump the count within ms
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    expect(hub2.hellosSeen, 1);
+
+    await client.disconnect();
+  }, timeout: timeout);
 }

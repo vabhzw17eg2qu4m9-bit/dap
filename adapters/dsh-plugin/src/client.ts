@@ -112,8 +112,12 @@ interface AgentInfo {
 }
 
 export class DapClient {
-  readonly agentId: string;
-  private readonly id: Identity;
+  /** Identity follows the key file: agentId is derived from the Ed25519
+   *  pubkey, so retargeting onto a new key file yields a new agentId. */
+  get agentId(): string {
+    return dap.agentIdOf(this.id.edPub);
+  }
+  private id: Identity;
   private readonly opts: ClientOpts;
   private readonly watchdog: KeepAliveWatchdog;
   private readonly errorRing: HubErrorEvent[] = [];
@@ -140,7 +144,6 @@ export class DapClient {
   constructor(opts: ClientOpts) {
     this.opts = opts;
     this.id = loadIdentity(opts.keyPath);
-    this.agentId = dap.agentIdOf(this.id.edPub);
     for (const ch of opts.channels ?? []) this.channels.set(ch.name, ch);
     // Zero-config mode: pick the shared channels file up on startup — every
     // key there is auto-joined after each welcome (reconnect-safe).
@@ -172,6 +175,27 @@ export class DapClient {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.ws?.close();
     this.ws = null;
+  }
+
+  /** Runtime retarget (dap_connect): stop everything, swap url and/or
+   *  identity key file and display name, then connect fresh. A new name
+   * means a new identity (name-derived key file) — a different agentId. */
+  retarget(next: { url?: string; keyPath?: string; name?: string }): void {
+    clearTimeout(this.retryTimer); // no-op when nothing is pending
+    this.retryTimer = null;
+    this.watchdog.stop();
+    this.ws?.close(); // retiring socket: late events are ignored (see connect)
+    this.ws = null;
+    this.welcomed = false;
+    this.stopped = false; // connect() again after the implicit stop
+    if (next.url) this.opts.url = next.url;
+    if (next.keyPath) {
+      this.id = loadIdentity(next.keyPath);
+      this.known.clear();
+    }
+    if (next.name !== undefined) this.opts.name = next.name;
+    this.delay = this.initialMs;
+    this.connect();
   }
 
   /** Hub `error` frames observed since the last drain. */
@@ -279,6 +303,12 @@ export class DapClient {
     this.ws?.send(JSON.stringify({ op: 'join', channel, chanPubkey: chanPubkeyB64 }));
   }
 
+  /** dap_connect default room: make sure the channel is known — zero-config
+   *  keygen + persist when it is not; joins land after the next welcome. */
+  ensureChannel(channel: string): ChannelKey {
+    return this.channels.get(channel) ?? this.createChannel(channel);
+  }
+
   /** Zero-config channel creation: the first user generates the keypair,
    *  persists it (keeping the other channels) and joins — creating it. */
   private createChannel(channel: string): ChannelKey {
@@ -306,14 +336,22 @@ export class DapClient {
 
   private connect(): void {
     if (this.stopped) return;
-    this.ws = new WebSocket(this.opts.url);
-    this.ws.on('open', () => {
-      this.watchdog.start(this.ws!); // refresh while idle; terminate a dead conn
+    const ws = new WebSocket(this.opts.url);
+    this.ws = ws;
+    // Socket-identity guards: a socket retired by stop()/retarget() must not
+    // act on late events — a stray close would arm a phantom reconnect.
+    ws.on('open', () => {
+      if (this.ws !== ws) return;
+      this.watchdog.start(ws); // refresh while idle; terminate a dead conn
       this.sendHello();
     });
-    this.ws.on('message', (data) => this.handleRaw(String(data)));
-    this.ws.on('close', () => this.onDisconnect());
-    this.ws.on('error', (err) => {
+    ws.on('message', (data) => {
+      if (this.ws === ws) this.handleRaw(String(data));
+    });
+    ws.on('close', () => {
+      if (this.ws === ws) this.onDisconnect();
+    });
+    ws.on('error', (err) => {
       this.lastError = String(err);
     }); // close always follows
   }

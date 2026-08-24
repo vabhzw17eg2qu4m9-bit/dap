@@ -4,7 +4,7 @@
 // Zero-config: settings resolve as config arg > DAP_* env > ~/.dap/config.json
 // > defaults (see config.ts); channel keys live in the shared channels file.
 import { DapClient, type ChannelKey, type MsgEvent } from './client.js';
-import { resolveDapSettings } from './config.js';
+import { resolveDapSettings, optStr, defaultKeyPath, persistDapConfig } from './config.js';
 
 export interface DapToolDef {
   name: string;
@@ -152,6 +152,50 @@ export default {
         return { agents: a.includeOffline === true ? all : all.filter((p) => p.online) };
       },
     });
+
+  /** dap_connect: manual invitation to any DAP server — host, optional
+   *  name (a new name = a new identity: name-derived key file), optional
+   *  default room (persisted; auto-joined on every later launch). */
+  const normalizeHost = (h: string): string => {
+    const withScheme = /^wss?:\/\//.test(h) ? h : 'ws://' + h;
+    const u = new URL(withScheme);
+    if (u.pathname === '/') u.pathname = '/ws'; // bare host: default hub path
+    return u.toString().replace(/\/$/, '');
+  };
+  const connectTo = (host?: string, name?: string, channel?: string) => {
+    const url = host ? normalizeHost(host) : settings.url;
+    if (name) settings.name = name;
+    if (host) settings.url = url;
+    persistDapConfig({ url: host ? url : undefined, name, channels: channel ? [channel] : undefined });
+    if (channel) client.ensureChannel(channel);
+    client.retarget({ url: host ? url : undefined, keyPath: name ? defaultKeyPath(name) : undefined, name });
+    return {
+      ok: true,
+      url: settings.url,
+      name: settings.name ?? client.agentId,
+      agentId: client.agentId,
+      channels: client.status().channels,
+    };
+  };
+  ctx.tools.register({
+    name: 'dap_connect',
+    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        host: { type: 'string', description: 'hub host[:port] or ws(s):// URL' },
+        name: { type: 'string', description: 'agent name (new identity)' },
+        channel: { type: 'string', description: 'default room to join after connect' },
+      },
+    },
+    execute: async (a) => {
+      const host = optStr(a.host);
+      const name = optStr(a.name);
+      const channel = optStr(a.channel);
+      if (!host && !name) return { ok: false, error: 'host or name required' };
+      return connectTo(host, name, channel);
+    },
+  });
 
     ctx.on?.('dispose', () => client.stop());
     return client;

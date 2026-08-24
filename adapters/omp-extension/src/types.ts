@@ -52,4 +52,6 @@ export interface ExtensionAPI {
   registerTool(def: ToolDefinition): void;
   /** Extension label shown in the UI. */
   setLabel(label: string): void;
+  /** Optional: harness slash-command registration (omp). */
+  registerCommand?(name: string, def: { description: string; handler: (args: string) => string }): void;
 }

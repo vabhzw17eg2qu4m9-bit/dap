@@ -177,4 +177,50 @@ void main() {
 
     await plugin.dispose();
   }, timeout: timeout);
+
+  test('HubPlugin.connectTo: bare host + name + channel → new identity on '
+      'hub 2, lobby joined, url/name/channels persisted', () async {
+    final hub2 = FakeHub();
+    await hub2.start();
+    addTearDown(() => hub2.stop());
+    final tmp = await Directory.systemTemp.createTemp('fah-hub-conn-');
+    addTearDown(() => tmp.delete(recursive: true));
+    // a pre-existing default room must survive the config merge
+    await persistDapConfig(
+        channels: ['general'], file: '${tmp.path}/.dap/config.json');
+
+    final plugin = HubPlugin(environment: {}, home: tmp.path);
+    plugin.register(PluginContext(config: {
+      'hub': {'url': hub.url.toString()},
+    }));
+    await plugin.start();
+    final firstId = plugin.agentId!;
+
+    // subscribe before connectTo — the join fires during the call
+    final lobbyJoin = hub2.joins
+        .firstWhere((j) => j.channel == 'lobby')
+        .timeout(const Duration(seconds: 5));
+
+    final result = await plugin.connectTo('127.0.0.1:${hub2.url.port}',
+        name: 'bee', channel: 'lobby');
+    expect(result.ok, isTrue);
+    expect(result.url, hub2.url.toString()); // bare host normalized
+    expect(result.agentId, isNot(firstId)); // name → new identity
+    expect(plugin.agentId, result.agentId);
+
+    final join = await lobbyJoin;
+    expect(join.agentId, result.agentId); // lobby joined under the new id
+    // url/name/channels persisted (merge: general kept, lobby added)
+    final cfg = readDapConfig('${tmp.path}/.dap/config.json');
+    expect(cfg['url'], hub2.url.toString());
+    expect(cfg['name'], 'bee');
+    expect((cfg['channels'] as List).cast<String>(), ['general', 'lobby']);
+
+    // room keys persisted to the machine-shared channels file (auto-join
+    // on every later launch flows through it)
+    expect(await loadChannelKeys('${tmp.path}/.dap/channels.json'),
+        contains('lobby'));
+
+    await plugin.dispose();
+  }, timeout: timeout);
 }

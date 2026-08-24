@@ -13,6 +13,8 @@ export interface DapFileConfig {
   name?: string;
   keyPath?: string;
   channelsFile?: string;
+  /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
+  channels?: string[];
 }
 
 export interface DapSettings {
@@ -26,13 +28,34 @@ export const DEFAULT_URL = 'ws://127.0.0.1:8787/ws';
 
 export const optStr = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
 
-/** Read ~/.dap/config.json; a missing or invalid file counts as absent. */
-export function readDapConfig(file = path.join(os.homedir(), '.dap', 'config.json')): DapFileConfig {
+/** Config file path: DAP_CONFIG_FILE env (tests pin a tmp path) > ~/.dap/config.json. */
+const defaultConfigFile = (): string => optStr(process.env.DAP_CONFIG_FILE) ?? path.join(os.homedir(), '.dap', 'config.json');
+
+/** Read the config file; a missing or invalid file counts as absent. */
+export function readDapConfig(file = defaultConfigFile()): DapFileConfig {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8')) as DapFileConfig;
   } catch {
     return {};
   }
+}
+
+/** Merge `update` into the config file (read-modify-write, mkdir on demand):
+ *  dap_connect persists host/name/default-rooms so the next launch
+ *  auto-connects with the same identity and auto-joins the same rooms. */
+export function persistDapConfig(
+  update: { url?: string; name?: string; channels?: string[] },
+  file = defaultConfigFile(),
+): void {
+  const cur = readDapConfig(file);
+  const next: DapFileConfig = { ...cur };
+  if (update.url) next.url = update.url;
+  if (update.name) next.name = update.name;
+  if (update.channels?.length) {
+    next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }
 
 /** Default identity file: ~/.dap/keys/mcp/<name|hostname>.key — the

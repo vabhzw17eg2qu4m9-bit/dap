@@ -18,7 +18,7 @@ import { FakeHub, until, channelConfig } from './fake-hub.js';
 // DAP_* env leaked in from the machine running the tests.
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-dap-home-'));
 process.env.HOME = HOME;
-const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE'];
+const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CONFIG_FILE'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
 
@@ -84,7 +84,7 @@ test('apply() registers dap tools on the Cordis context', async () => {
     applyTo(hub, tmpKeyPath(), fc);
     assert.deepEqual(
       fc.tools.map((t) => t.name).sort(),
-      ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois'],
+      ['dap_connect', 'dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois'],
     );
     for (const t of fc.tools) {
       const schema: Record<string, unknown> = t.inputSchema;
@@ -696,5 +696,68 @@ test('error surfacing: hub error frame -> followup notice + dap_inbox errors', a
   } finally {
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
+  }
+});
+
+test('dap_connect: retargets to a second hub (bare host), new identity, default room, persisted config', async () => {
+  const hub1 = await new FakeHub().start();
+  const hub2 = await new FakeHub().start();
+  const dir = tmpDir('dsh-connect');
+  const cfgFile = join(dir, 'config.json');
+  const fc = fakeCtx();
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const client = plugin.apply(fc.ctx, {
+    url: hub1.url,
+    keyPath: join(dir, 'a.key'),
+    channelsFile: join(dir, 'channels.json'),
+    backoff: { initialMs: 10, maxMs: 40 },
+  });
+  try {
+    await hub1.waitFor((f) => f.op === 'flush'); // welcomed on hub1
+    const oldId = client.agentId;
+    assert.equal(hub1.pluginAgentId, oldId);
+
+    // Bare host form: scheme and hub path implied by normalization.
+    const r = (await tool(fc, 'dap_connect').execute({
+      host: hub2.url.replace(/^ws:\/\//, ''),
+      name: 'renamed',
+      channel: 'lobby',
+    })) as { ok: boolean; url: string; name: string; agentId: string; channels: string[] };
+    assert.equal(r.ok, true);
+    assert.equal(r.url, hub2.url, 'bare host normalized to the full ws URL');
+    assert.equal(r.name, 'renamed');
+    assert.notEqual(r.agentId, oldId, 'new name => new identity');
+    assert.ok(r.channels.includes('lobby'), 'default room ensured');
+
+    // The second welcome lands on hub2 — exactly one connection attempt there
+    // (the retired hub1 socket must not arm a phantom reconnect).
+    await hub2.waitFor((f) => f.op === 'flush');
+    assert.equal(client.welcomes, 2, 'welcome count 2 across the retarget');
+    assert.equal(hub2.hellos, 1, 'no stray duplicate connection to hub2');
+    assert.equal(hub2.pluginAgentId, client.agentId, 'hub2 knows the new identity');
+    await until(() => hub2.channelMembers.get('lobby')?.has(client.agentId) === true);
+    await until(() => !hub1.isOnline(oldId), 'old hub socket is gone');
+
+    // Name-derived identity under the dsh key dir, auto-generated 0600.
+    const keyFile = join(HOME, '.dap', 'keys', 'dsh', 'renamed.key');
+    assert.ok(existsSync(keyFile), 'identity created under ~/.dap/keys/dsh/');
+    assert.equal(statSync(keyFile).mode & 0o777, 0o600);
+
+    // Config merged into the injected path (url/name/default room).
+    const cfg = JSON.parse(readFileSync(cfgFile, 'utf8')) as Record<string, unknown>;
+    assert.equal(cfg.url, hub2.url);
+    assert.equal(cfg.name, 'renamed');
+    assert.deepEqual(cfg.channels, ['lobby']);
+
+    // The blind-join caveat must ride in the tool description.
+    const desc = tool(fc, 'dap_connect').description;
+    assert.match(desc, /dap_invite you/);
+    assert.match(desc, /members cannot read you/);
+  } finally {
+    delete process.env.DAP_CONFIG_FILE;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub1.stop();
+    await hub2.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

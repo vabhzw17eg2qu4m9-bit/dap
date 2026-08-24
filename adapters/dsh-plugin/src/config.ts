@@ -1,15 +1,17 @@
 // Zero-config settings resolution (identical contract in every DAP adapter):
 // explicit config arg > DAP_* env > ~/.dap/config.json > defaults. All fields
 // optional; a missing or invalid config file counts as absent.
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export interface DapFileConfig {
   url?: string;
   name?: string;
   keyPath?: string;
   channelsFile?: string;
+  /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
+  channels?: string[];
 }
 
 export interface DapSettingsOverrides {
@@ -30,13 +32,34 @@ export const DEFAULT_URL = 'ws://127.0.0.1:8787/ws';
 
 export const optStr = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
 
-/** Read ~/.dap/config.json; a missing or invalid file counts as absent. */
-export function readDapConfig(file = join(homedir(), '.dap', 'config.json')): DapFileConfig {
+/** Config file path: DAP_CONFIG_FILE (injectable for tests) > ~/.dap/config.json. */
+const configPath = (): string => optStr(process.env.DAP_CONFIG_FILE) ?? join(homedir(), '.dap', 'config.json');
+
+/** Read the DAP config file; a missing or invalid file counts as absent. */
+export function readDapConfig(file = configPath()): DapFileConfig {
   try {
     return JSON.parse(readFileSync(file, 'utf8')) as DapFileConfig;
   } catch {
     return {};
   }
+}
+
+/** Merge `update` into the DAP config file (read-modify-write, mkdir on
+ *  demand): dap_connect persists host/name/default-rooms so the next
+ *  launch auto-connects with the same identity. */
+export function persistDapConfig(
+  update: { url?: string; name?: string; channels?: string[] },
+  file = configPath(),
+): void {
+  const cur = readDapConfig(file);
+  const next: DapFileConfig = { ...cur };
+  if (update.url) next.url = update.url;
+  if (update.name) next.name = update.name;
+  if (update.channels?.length) {
+    next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }
 
 /** Default identity file is derived from the agent name (or hostname):

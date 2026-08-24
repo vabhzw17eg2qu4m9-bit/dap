@@ -8,6 +8,8 @@ export interface DapFileConfig {
   name?: string;
   keyPath?: string;
   channelsFile?: string;
+  /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
+  channels?: string[];
 }
 
 export const DEFAULT_URL = 'ws://127.0.0.1:8787/ws';
@@ -21,6 +23,24 @@ export function readDapConfig(file = path.join(os.homedir(), '.dap', 'config.jso
   } catch {
     return {};
   }
+}
+
+/** Merge `update` into ~/.dap/config.json (read-modify-write, mkdir on
+ *  demand): dap_connect persists host/name/default-rooms so the next
+ *  launch auto-connects with the same identity. */
+export function persistDapConfig(
+  update: { url?: string; name?: string; channels?: string[] },
+  file = path.join(os.homedir(), '.dap', 'config.json'),
+): void {
+  const cur = readDapConfig(file);
+  const next: DapFileConfig = { ...cur };
+  if (update.url) next.url = update.url;
+  if (update.name) next.name = update.name;
+  if (update.channels?.length) {
+    next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }
 
 export interface SettingsOverrides {

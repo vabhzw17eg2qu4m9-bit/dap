@@ -1,6 +1,6 @@
 // MCP conformance: drive the BUILT server artifact (`node dist/server.js`)
 // over real stdio with the SDK client against the LIVE hub binary.
-// initialize handshake → tools/list (the seven dap tools) → tools/call
+// initialize handshake → tools/list (the eight dap tools) → tools/call
 // dap_send round-trip → dap_dm / dap_whois / dap_status / dap_peers / dap_inbox.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -44,10 +44,10 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
   const client = new Client({ name: 'dap-conformance-check', version: '0.1.0' });
   await client.connect(transport); // performs the MCP initialize handshake
 
-  // tools/list: exactly the seven dap tools
+  // tools/list: exactly the eight dap tools
   const listed = await client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema);
   const names = listed.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois']);
+  assert.deepEqual(names, ['dap_connect', 'dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois']);
 
   // tools/call dap_send: creates the channel, E2E round-trips through the live hub
   const sent = textOf(await client.callTool({ name: 'dap_send', arguments: { channel: 'conformance', text: 'round-trip through the live hub' } }));

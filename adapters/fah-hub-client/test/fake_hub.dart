@@ -27,6 +27,10 @@ class FakeHub {
   final _helloEvents = StreamController<String>.broadcast();
 
   int _hellosSeen = 0;
+
+  /// Accepted hellos so far (reconnect/retarget double-loop detection).
+  int get hellosSeen => _hellosSeen;
+
   int rejectedHellos = 0;
   final List<Map<String, dynamic>> relayed = [];
   final List<String> whoisQueries = [];

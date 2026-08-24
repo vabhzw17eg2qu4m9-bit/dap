@@ -110,6 +110,40 @@ class HubPlugin implements FahPlugin {
     await repository.inviteTo(channel, agentId);
   }
 
+  /// dap_connect — a manual invitation to any DAP hub, at runtime (the
+  /// upstream-PR tool wraps this one method): [host] is a bare host,
+  /// host:port, or ws(s):// URL; optional [name] is the display name
+  /// AND identity (name-derived key file `~/.dap/keys/fah/<name>.key`,
+  /// auto-created 0600 — same name = same agent everywhere, new name =
+  /// new agentId); optional [channel] is the default room, joined
+  /// after connect and on every later launch. Persists url/name/
+  /// channels to `~/.dap/config.json` and retargets the live client.
+  ///
+  /// NOTE: if the room already exists on the target hub under another
+  /// member's key, ask a member for a dap_invite — a blind join lets
+  /// you post, but the members cannot read you.
+  Future<DapConnection> connectTo(String host,
+      {String? name, String? channel}) async {
+    final repository = _repository;
+    if (repository == null) {
+      throw StateError('plugin not started — call start() first');
+    }
+    final result = await repository.connectTo(
+      host,
+      name: name,
+      channel: channel,
+      home: home,
+    );
+    await persistDapConfig(
+      url: result.url,
+      name: name,
+      channels: channel != null ? [channel] : null,
+      file: defaultDapConfigFile(home),
+    );
+    _io?.writeln('[hub] connected to ${result.url} as ${result.agentId}');
+    return result;
+  }
+
   /// Connection snapshot for the `dap_status` tool (see
   /// [HubClient.status]). The mirrored [PluginContext] subset carries no
   /// tool registry, so hosts register their `status` tool around this

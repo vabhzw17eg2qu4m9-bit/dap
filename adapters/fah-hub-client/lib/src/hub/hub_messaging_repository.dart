@@ -73,6 +73,13 @@ class HubMessagingRepository implements MessagingRepository {
   Future<List<AgentInfo>> peers({bool includeOffline = false}) =>
       client.peers(includeOffline: includeOffline);
 
+  /// dap_connect passthrough (see [HubClient.connectTo]): runtime move
+  /// of the live connection to another hub, optionally under a new
+  /// name-derived identity, with an optional default room.
+  Future<DapConnection> connectTo(String host,
+          {String? name, String? channel, String? home}) =>
+      client.connectTo(host, name: name, channel: channel, home: home);
+
   @override
   Future<void> register(String agentId) => start();
 

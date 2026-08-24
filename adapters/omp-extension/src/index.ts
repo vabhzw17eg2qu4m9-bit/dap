@@ -7,7 +7,7 @@ import {
   decryptInbound,
   type PayloadCryptoContext,
 } from './codec.ts';
-import { resolveDapSettings, optStr } from './config.ts';
+import { resolveDapSettings, optStr, defaultKeyPath, persistDapConfig } from './config.ts';
 import {
   loadChannelKeys,
   persistChannelKeys,
@@ -90,7 +90,7 @@ function parseChankeyInvite(text: string): { channel: string; pub: string; priv:
  */
 export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOptions = {}): DapExtension {
   const settings = resolveDapSettings(overrides);
-  const keys: KeyPair = loadOrCreateKeys(settings.keyPath);
+  let keys: KeyPair = loadOrCreateKeys(settings.keyPath);
 
   const client = new DapClient({
     url: settings.url,
@@ -350,6 +350,58 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
 
+  /** dap_connect: manual invitation to any DAP server — host, optional
+   *  name (a new name = a new identity: name-derived key file), optional
+   *  default room (persisted; auto-joined on every later launch). */
+  const configFile = optStr(process.env.DAP_CONFIG_FILE);
+  const normalizeHost = (h: string): string => {
+    const withScheme = /^wss?:\/\//.test(h) ? h : 'ws://' + h;
+    const u = new URL(withScheme);
+    return u.toString().replace(/\/$/, '');
+  };
+  const connectTo = (host?: string, name?: string, channel?: string) => {
+    const url = host ? normalizeHost(host) : settings.url;
+    let nextKeys: KeyPair | undefined;
+    if (name) {
+      settings.name = name;
+      nextKeys = loadOrCreateKeys(defaultKeyPath(name));
+      keys = nextKeys;
+      cryptoCtx.keys = nextKeys;
+    }
+    if (host) settings.url = url;
+    persistDapConfig({ url: host ? url : undefined, name, channels: channel ? [channel] : undefined }, configFile);
+    if (channel && !cryptoCtx.channels[channel]) cryptoCtx.channels[channel] = createChannel(channel).pub;
+    client.retarget({ url: host ? url : undefined, keys: nextKeys, name });
+    renderStatus('connecting…');
+    return { ok: true, url: settings.url, name: settings.name ?? client.agentId, agentId: client.agentId, channels: Object.keys(cryptoCtx.channels) };
+  };
+  ctx.registerTool({
+    name: 'dap_connect',
+    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
+    parameters: {
+      type: 'object',
+      properties: {
+        host: { type: 'string', description: 'hub host[:port] or ws(s):// URL' },
+        name: { type: 'string', description: 'agent name (new identity)' },
+        channel: { type: 'string', description: 'default room to join after connect' },
+      },
+    },
+    execute: async (_toolCallId, params) => {
+      const host = optStr(params.host);
+      const name = optStr(params.name);
+      const channel = optStr(params.channel);
+      if (!host && !name) return toolResult({ ok: false, error: 'host or name required' });
+      return toolResult(connectTo(host, name, channel));
+    },
+  });
+  ctx.registerCommand?.('dap', {
+    description: '/dap <host[:port]|ws(s)://…> [name] [channel] — connect to a DAP hub',
+    handler: (args: string) => {
+      const [host, name, channel] = args.trim().split(/\s+/).filter(Boolean);
+      if (!host) return `current: ${settings.url}${settings.name ? ' as ' + settings.name : ''}`;
+      return JSON.stringify(connectTo(optStr(host), optStr(name), optStr(channel)));
+    },
+  });
   const dispose = (): void => client.stop();
   // Clean exit: closing the socket lets the hub deregister immediately
   // (identity + mailbox survive for offline DMs).

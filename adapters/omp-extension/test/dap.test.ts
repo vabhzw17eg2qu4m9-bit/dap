@@ -682,3 +682,40 @@ test('dap_peers: online-only by default, includeOffline lists everyone', async (
     await hub.close();
   }
 });
+
+test('dap_connect: retargets to another hub, renames identity, persists config + default room', async () => {
+  const hub1 = await new FakeHub().listen();
+  const hub2 = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const cfgFile = path.join(KEYDIR, 'cfg-' + ++keySeq + '.json');
+  const chFile = path.join(KEYDIR, 'ch-' + ++keySeq + '.json');
+  const prevCfgEnv = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const ext = dapExtension(cap.ctx, { url: hub1.url, keyPath: nextKeyPath(), channelsFile: chFile });
+  try {
+    await nextEvent(ext.client, 'welcome');
+    const oldId = ext.client.agentId;
+    const r = await run<{ ok: boolean; url: string; name: string; agentId: string; channels: string[] }>(
+      cap, 'dap_connect', { host: hub2.url.replace(/^ws:\/\//, ''), name: 'renamed', channel: 'lobby' },
+    );
+    assert.equal(r.ok, true);
+    assert.equal(r.url, hub2.url, 'host normalized to full ws URL');
+    assert.equal(r.name, 'renamed');
+    assert.notEqual(r.agentId, oldId, 'new name => new identity');
+    assert.ok(r.channels.includes('lobby'), 'default room ensured');
+    const saved = JSON.parse(fs.readFileSync(cfgFile, 'utf8')) as { url?: string; name?: string; channels?: string[] };
+    assert.equal(saved.url, hub2.url, 'config persisted to DAP_CONFIG_FILE path, not ~/.dap');
+    assert.equal(saved.name, 'renamed');
+    assert.ok(saved.channels?.includes('lobby'), 'default room persisted');
+    const w2 = nextEvent(ext.client, 'welcome');
+    await w2; // connected to the SECOND hub
+    assert.equal(ext.client.welcomeCount, 2);
+    assert.ok(ext.client.eventCount('joined') >= 1, 'lobby joined after connect');
+  } finally {
+    if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfgEnv;
+    ext.dispose();
+    await hub1.close();
+    await hub2.close();
+  }
+});

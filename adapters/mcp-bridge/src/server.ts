@@ -1,5 +1,5 @@
 // Universal MCP stdio bridge for DAP/1: ONE outbound WebSocket to the hub,
-// seven tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush, Amp,
+// eight tools on every MCP client (Claude Code, Gemini CLI, Goose, Crush,
 // Cline, Roo Code, kimi-code — same entry in each MCP config).
 //
 //   stdin/stdout ← MCP (initialize handled by the SDK)   WSS → DAP hub
@@ -16,8 +16,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { DapClient, type ChannelKey, type MsgEvent } from './client.js';
-import { resolveDapSettings } from './config.js';
+import { DapClient, loadIdentity, type ChannelKey, type MsgEvent } from './client.js';
+import { defaultKeyPath, persistDapConfig, resolveDapSettings } from './config.js';
 
 interface TextResult extends CallToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -37,6 +37,13 @@ async function run(body: () => Promise<unknown>): Promise<TextResult> {
     return failure(err);
   }
 }
+
+/** host → ws url: no scheme means ws://, no path means /ws (the hub endpoint). */
+const normalizeHost = (h: string): string => {
+  const u = new URL(/^wss?:\/\//.test(h) ? h : 'ws://' + h);
+  if (u.pathname === '/' || u.pathname === '') u.pathname = '/ws';
+  return u.toString().replace(/\/$/, '');
+};
 
 function parseChannels(spec: string | undefined): ChannelKey[] {
   if (!spec) return [];
@@ -98,6 +105,28 @@ export function buildServer(dap: DapClient): McpServer {
   }, ({ includeOffline }) => run(() => dap.presence().then((all) => ({
     agents: includeOffline === true ? all : all.filter((a) => a.online === true),
   }))));
+
+  // dap_connect: manual invitation to any DAP server — host, optional name
+  // (a new name = a new identity: name-derived key file under ~/.dap/keys/mcp/),
+  // optional default room (keygen when unknown, joined after connect and on
+  // every later launch; all of it persisted to the adapter config file).
+  server.registerTool('dap_connect', {
+    title: 'DAP connect',
+    description: 'Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://… — ws:// and /ws are assumed when omitted), optional name (display name AND identity: a new name means a name-derived key file and a new agentId; same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to the config file). NOTE: if that room already exists on the target hub under another member\'s key, ask a member to dap_invite you — a blind join lets you post but members cannot read you.',
+    inputSchema: {
+      host: z.string().min(1).optional().describe('hub host[:port] or ws(s):// URL'),
+      name: z.string().min(1).optional().describe('agent name (display name AND identity)'),
+      channel: z.string().min(1).optional().describe('default room to join after connect'),
+    },
+  }, ({ host, name, channel }) => run(async () => {
+    if (!host && !name) throw new Error('host or name required');
+    const url = host ? normalizeHost(host) : undefined;
+    const keys = name ? loadIdentity(defaultKeyPath(name)) : undefined;
+    if (channel) dap.ensureChannelKeys(channel); // joined automatically on the next welcome
+    persistDapConfig({ url, name, channels: channel ? [channel] : undefined });
+    dap.retarget({ url, keys, name });
+    return { ok: true, ...dap.status() };
+  }));
 
   return server;
 }

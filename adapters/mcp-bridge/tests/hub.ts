@@ -83,10 +83,12 @@ async function boot(): Promise<HubProc> {
   return { url: `${httpUrl}/ws`, httpUrl, adminToken, stop };
 }
 
-let cached: Promise<HubProc> | undefined;
+const hubs = new Map<string, Promise<HubProc>>();
 
-/** Start (or reuse) the live hub for this test process. */
-export function startHub(): Promise<HubProc> {
-  cached ??= boot();
-  return cached;
+/** Start (or reuse) a named live hub for this test process — tests that need
+ *  TWO independent hubs pass distinct names. */
+export function startHub(name = 'main'): Promise<HubProc> {
+  let hub = hubs.get(name);
+  if (!hub) hubs.set(name, (hub = boot()));
+  return hub;
 }

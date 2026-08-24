@@ -12,6 +12,7 @@ import 'package:cryptography/cryptography.dart';
 
 import 'canonical.dart';
 import 'channels.dart';
+import 'dap_settings.dart';
 import 'hub_config.dart';
 import 'identity.dart';
 import 'payload_crypto.dart';
@@ -96,22 +97,41 @@ class InboundMessage {
   final String? plaintext;
 }
 
+/// dap_connect result: the connection now in force (the new welcome's
+/// agentId, the normalized url, the display name, every joinable room).
+typedef DapConnection = ({
+  bool ok,
+  String url,
+  String? name,
+  String agentId,
+  List<String> channels,
+});
+
 class HubClient {
   HubClient({
-    required this.config,
-    required this.identity,
+    required HubConfig config,
+    required HubIdentity identity,
     this.channelStore,
     Duration Function(int attempt)? backoff,
     this.pingInterval = const Duration(seconds: 20),
-  }) : backoff = backoff ?? HubClient.defaultBackoff;
+  })  : _config = config,
+        _identity = identity,
+        backoff = backoff ?? HubClient.defaultBackoff;
 
-  final HubConfig config;
-  final HubIdentity identity;
+  HubConfig _config;
+  HubIdentity _identity;
+
+  /// Where to connect (swapped by [retarget]).
+  HubConfig get config => _config;
+
+  /// Who we are (swapped by [retarget]; a new identity = new agentId).
+  HubIdentity get identity => _identity;
 
   /// Zero-config channel-key lifecycle (auto-keygen on first send, invite
   /// accept, auto-join). Null keeps the explicit-config-only behavior:
   /// unknown channels fail honestly with [ArgumentError].
   final ChannelStore? channelStore;
+
   final Duration Function(int attempt) backoff;
 
   /// Client keepalive interval. Native mechanism: dart:io WebSocket
@@ -124,6 +144,11 @@ class HubClient {
   WebSocket? _ws;
   StreamSubscription? _subscription;
   bool _closing = false;
+
+  /// Reconnect-loop generation: bumping it ([retarget]) retires any loop
+  /// still parked in backoff so it cannot double-connect alongside the
+  /// fresh one.
+  int _epoch = 0;
   int _reconnectAttempt = 0;
 
   /// Handshake counters (see [status]): one hello per connection attempt,
@@ -131,7 +156,7 @@ class HubClient {
   int _hellos = 0;
   int _welcomes = 0;
 
-  final _firstWelcome = Completer<String>();
+  Completer<String> _firstWelcome = Completer<String>();
   Completer<bool>? _welcomeCompleter;
   Completer<int>? _flushCompleter;
   Completer<void>? _presenceCompleter;
@@ -141,7 +166,6 @@ class HubClient {
 
   final _inbound = StreamController<InboundMessage>.broadcast();
   final _errors = StreamController<HubError>.broadcast();
-
   /// All inbound `msg` frames, oldest first.
   Stream<InboundMessage> get inbound => _inbound.stream;
 
@@ -187,13 +211,13 @@ class HubClient {
     if (!_loopStarted) {
       _loopStarted = true;
       _closing = false;
-      unawaited(_connectLoop());
+      unawaited(_connectLoop(++_epoch));
     }
     return _firstWelcome.future;
   }
 
-  Future<void> _connectLoop() async {
-    while (!_closing) {
+  Future<void> _connectLoop(int epoch) async {
+    while (!_closing && epoch == _epoch) {
       var welcomed = false;
       try {
         welcomed = await _cycle();
@@ -204,7 +228,7 @@ class HubClient {
       } on Object {
         // unexpected cycle failure — treat as unwelcomed cycle
       }
-      if (_closing) return;
+      if (_closing || epoch != _epoch) return;
       if (welcomed) _reconnectAttempt = 0;
       _reconnectAttempt++;
       await Future<void>.delayed(backoff(_reconnectAttempt));
@@ -278,6 +302,81 @@ class HubClient {
     }
     await _inbound.close();
     await _errors.close();
+  }
+
+  /// Runtime retarget (dap_connect): stop the reconnect loop and the
+  /// socket (its native ping watchdog dies with it) cleanly, swap url
+  /// and/or identity keys and display name, then reconnect fresh — no
+  /// process restart. A new identity means a new agentId ([agentId] is
+  /// recomputed from the new keys). The inbound/errors streams stay
+  /// live; completes with the new agent id at the next welcome.
+  Future<String> retarget({String? url, HubIdentity? keys, String? name}) async {
+    _epoch++; // retire any loop parked in backoff (no double-connect)
+    _closing = true;
+    await _subscription?.cancel();
+    await _ws?.close();
+    _failPending('retargeting');
+    _ws = null;
+    if (keys != null) {
+      _identity = keys;
+      _whoisCache.clear(); // peer keys resolved under the old identity
+      _welcomedAgentId = null;
+      agentId = keys.agentId;
+    }
+    if (url != null || name != null) {
+      _config = HubConfig(
+        url: url ?? _config.url,
+        keyPath: _config.keyPath,
+        name: name ?? _config.name,
+        channels: _config.channels,
+        channelSecrets: _config.channelSecrets,
+      );
+    }
+    if (!_firstWelcome.isCompleted) {
+      _firstWelcome.completeError(StateError('retargeted'));
+    }
+    _firstWelcome = Completer<String>();
+    _loopStarted = false;
+    _closing = false;
+    return connect();
+  }
+
+  /// dap_connect on the live client (see [HubPlugin.connectTo] for the
+  /// full flow with config persistence): normalize [host] (no scheme →
+  /// `ws://`, no path → `/ws`), optional [name] = display name AND
+  /// identity (name-derived key file `~/.dap/keys/fah/<name>.key`,
+  /// auto-created 0600 — a new name is a new agentId), optional
+  /// [channel] = default room (keypair ensured in the store when
+  /// unknown; joined after the new welcome and on every later launch
+  /// via the shared channels file). Completes at the new hub's welcome
+  /// and returns the connection now in force.
+  ///
+  /// NOTE: if the room already exists on the target hub under another
+  /// member's key, ask a member for a dap_invite — a blind join lets
+  /// you post, but the members cannot read you.
+  Future<DapConnection> connectTo(String host,
+      {String? name, String? channel, String? home}) async {
+    final url = normalizeDapHost(host);
+    HubIdentity? keys;
+    if (name != null) {
+      keys = await HubIdentity.load(
+          defaultDapKeyPath(name, home ?? defaultHome(Platform.environment)));
+    }
+    if (channel != null) {
+      final store = channelStore;
+      if (store == null) {
+        throw StateError('default room "$channel" needs a channel store');
+      }
+      await store.keysFor(channel); // keygen + persist when unknown
+    }
+    final id = await retarget(url: url, keys: keys, name: name);
+    return (
+      ok: true,
+      url: url,
+      name: config.name,
+      agentId: id,
+      channels: knownChannels,
+    );
   }
 
   // ---- outbound ----

@@ -98,7 +98,7 @@ interface PeerInfo extends WhoisInfo {
   xPub: Uint8Array;
 }
 
-interface Identity {
+export interface Identity {
   priv: Uint8Array;
   pub: Uint8Array;
   xpriv: Uint8Array;
@@ -110,7 +110,7 @@ const ERRORS_CAP = 20;
 const WAIT_MS = 5000;
 const NOT_CONNECTED = 'not connected to the hub (reconnecting with backoff — retry in a moment)';
 
-function loadIdentity(keyPath: string): Identity {
+export function loadIdentity(keyPath: string): Identity {
   if (existsSync(keyPath)) {
     const f = JSON.parse(readFileSync(keyPath, 'utf8')) as Record<string, string>;
     const id = { priv: dap.b64d(f.priv), pub: dap.b64d(f.pub), xpriv: dap.b64d(f.xpriv), xpub: dap.b64d(f.xpub) };
@@ -127,12 +127,17 @@ function loadIdentity(keyPath: string): Identity {
 }
 
 export class DapClient {
-  readonly agentId: string;
+  /** Agent id = sha256(ed25519 pub)[:16], derived from the CURRENT keys —
+   *  retargeting with new keys IS a new agent. */
+  get agentId(): string {
+    return dap.agentIdOf(this.id.pub);
+  }
+
   /** Hub `whois` requests issued — lets tests prove whois-before-DM. */
   whoisCalls = 0;
   lastError = '';
-  private readonly id: Identity;
-  private readonly opts: ClientOpts;
+  private id: Identity;
+  private opts: ClientOpts;
   private readonly watchdog: KeepAliveWatchdog;
   private readonly errorRing: HubErrorEvent[] = [];
   private readonly channels = new Map<string, ChannelKey>();
@@ -148,7 +153,7 @@ export class DapClient {
   private readonly readyWaiters: Array<() => void> = [];
   private readonly listeners = new Set<(m: MsgEvent) => void>();
   private ws: WebSocket | null = null;
-  private retryTimer: NodeJS.Timeout | null = null;
+  private retryTimer: NodeJS.Timeout | undefined;
   private readonly initialMs: number;
   private readonly maxMs: number;
   private delay: number;
@@ -158,7 +163,6 @@ export class DapClient {
   constructor(opts: ClientOpts) {
     this.opts = opts;
     this.id = loadIdentity(opts.keyPath);
-    this.agentId = dap.agentIdOf(this.id.pub);
     // File first, then explicit DAP_CHANNELS entries — explicit wins per the
     // settings precedence (config.ts).
     if (opts.channelsFile) {
@@ -193,9 +197,33 @@ export class DapClient {
     this.stopped = true;
     this.watchdog.stop();
     if (this.retryTimer) clearTimeout(this.retryTimer);
-    this.retryTimer = null;
+    this.retryTimer = undefined;
     this.ws?.close();
     this.ws = null;
+  }
+
+  /** Runtime retarget (dap_connect): stop timers/watchdog, close the socket,
+   *  swap url and/or identity keys and display name, then connect fresh. A
+   *  new name means a new identity (name-derived key file) — a new agentId. */
+  retarget(next: { url?: string; keys?: Identity; name?: string }): void {
+    clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.watchdog.stop();
+    if (this.ws) {
+      this.ws.removeAllListeners(); // the dying socket must not trigger reconnect
+      this.ws.on('error', () => {}); // 'close' always follows; swallow errors
+      this.ws.close();
+      this.ws = null;
+    }
+    this.welcomed = false;
+    this.stopped = false; // connect() again after the implicit stop
+    if (next.url) this.opts.url = next.url;
+    if (next.keys) this.id = next.keys;
+    if (next.name !== undefined) this.opts.name = next.name;
+    this.known.clear(); // other hub and/or other identity: registry cache is stale
+    this.joined.clear(); // hub membership dies with the connection
+    this.delay = this.initialMs;
+    this.connect();
   }
 
   /** Resolve once `welcome` arrived (bounded — rejects on timeout). */
@@ -256,13 +284,23 @@ export class DapClient {
       await this.join(name, known.pub);
       return { ...known, created: false };
     }
+    const ch = this.ensureChannelKeys(name);
+    await this.join(name, ch.pub); // first join registers the channel pubkey
+    return { ...ch, created: true };
+  }
+
+  /** Register a channel zero-config: keygen when unknown, persist to the
+   *  channels file (read-modify-write), keep in memory — joined on the next
+   *  welcome (every known channel auto-joins after each handshake). */
+  ensureChannelKeys(name: string): ChannelKey {
+    const known = this.channels.get(name);
+    if (known) return known;
     const kp = dap.newX25519Keypair();
     const keys = { pub: dap.b64e(kp.pub), priv: dap.b64e(kp.priv) };
     const ch: ChannelKey = { name, ...keys };
-    await this.join(name, ch.pub); // first join registers the channel pubkey
     this.channels.set(name, ch);
     if (this.opts.channelsFile) persistChannelKeys(this.opts.channelsFile, name, keys);
-    return { ...ch, created: true };
+    return ch;
   }
 
   /** Send an E2E-encrypted message to a channel (creates it on first use). */
