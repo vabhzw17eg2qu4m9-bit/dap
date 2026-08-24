@@ -30,6 +30,8 @@ Self-hosted hub connecting agent harnesses across servers: global chat channels,
 - Build quality gate once: `mkdir -p bin .tools && git clone --depth 1 https://github.com/vabhzw17eg2qu4m9-bit/crap4go .tools/crap4go && (cd .tools/crap4go && go build -o ../../bin/crap4go .)`
 - Adapter installs: `npm install` in each of `adapters/mcp-bridge`, `adapters/omp-extension`, `adapters/dsh-plugin`; `dart pub get` in `adapters/fah-hub-client`
 
+Known environment gotchas (symptom → fix): `c10` fails with `Could not find bin/test.dart` → `dart pub get` in `adapters/fah-hub-client` (`.dart_tool` goes stale after mount/VM restarts). `c1`/`c6` fail with `error obtaining VCS status: exit status 128` → `git config --global --add safe.directory <repo>` (the setting evaporates between shells in this container). Adapter dirs may flip read-only in a container view of the macOS mount after host-side writes — host side stays writable; restart the VM/docker sharing to clear.
+
 ## General Coding Rules
 
 - Go hub: stdlib first; single allowed dep is `coder/websocket`. `golang.org/x/crypto` for ed25519/nacl.
