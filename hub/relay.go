@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,12 +19,33 @@ import (
 )
 
 const (
-	maxFrameBytes    = 1 << 20
-	sendBuffer       = 512
-	maxQueuedBytes   = 4 << 20 // per-client queued-bytes cap; overflow drops the conn
-	writeTimeout     = 10 * time.Second
-	pingEvery        = 30 * time.Second
+	maxFrameBytes  = 1 << 20
+	sendBuffer     = 512
+	maxQueuedBytes = 4 << 20 // per-client queued-bytes cap; overflow drops the conn
+	writeTimeout   = 10 * time.Second
+	pingEvery      = 30 * time.Second
 )
+
+// close reasons: why a WebSocket died, for the ws_close trace line.
+const (
+	closeUnknown int32 = iota
+	closeEOF
+	closeError
+	closeEvicted
+	closeWriteFail
+	closePingTimeout
+	closeBackpressure
+)
+
+var closeNames = map[int32]string{
+	closeUnknown:      "error",
+	closeEOF:          "eof",
+	closeError:        "error",
+	closeEvicted:      "evicted",
+	closeWriteFail:    "write_fail",
+	closePingTimeout:  "ping_timeout",
+	closeBackpressure: "backpressure",
+}
 
 // agentEntry is the durable identity record (survives disconnects).
 type agentEntry struct {
@@ -42,11 +65,57 @@ type client struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	queued    atomic.Int64
+	reason    atomic.Int32 // first close cause wins (ws_close trace)
 	authed    bool
 	agentID   string
 	pubkey    string
 	x25519    string
 	name      string
+	// errCode is the error code sent for the op currently being
+	// dispatched; touched only by this client's read-loop goroutine.
+	errCode string
+	// helloID is the agentId derived from an unverified hello pubkey so
+	// pre-auth trace lines can name the agent; read-loop goroutine only.
+	helloID string
+}
+
+// closedAs records the first cause of connection death.
+func (c *client) closedAs(reason int32) { c.reason.CompareAndSwap(closeUnknown, reason) }
+
+// closeBecauseRead classifies a terminal read error for the trace.
+func (c *client) closeBecauseRead(err error) {
+	if errors.Is(err, io.EOF) {
+		c.closedAs(closeEOF)
+		return
+	}
+	c.closedAs(closeError)
+}
+
+// logAgent names the agent on trace lines: authenticated id, else the id
+// derived from the hello pubkey, else "-".
+func (c *client) logAgent() string {
+	if c.agentID != "" {
+		return c.agentID
+	}
+	return dash(c.helloID)
+}
+
+// dash keeps key=value lines rectangular: empty values print as "-".
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// logf writes one trace line: "<event> key=val ...". Metadata only —
+// ciphertext, keys and payloads must never be passed in.
+func (h *hub) logf(event string, kv ...any) {
+	line := event
+	for i := 0; i+1 < len(kv); i += 2 {
+		line += fmt.Sprintf(" %v=%v", kv[i], kv[i+1])
+	}
+	h.log.Print(line)
 }
 
 // handlerFunc handles one authenticated client op (hello included).
@@ -104,9 +173,11 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	c.SetReadLimit(2 * maxFrameBytes) // hard DoS cap; protocol check below
 	cl := &client{h: h, conn: c, send: make(chan []byte, sendBuffer), rejectCh: make(chan []byte, 1), closed: make(chan struct{})}
+	h.logf("ws_open", "remote", r.RemoteAddr)
 	go h.writePump(cl)
 	h.readLoop(cl, r.Context())
 	h.deregister(cl)
+	h.logf("ws_close", "agent", cl.logAgent(), "reason", closeNames[cl.reason.Load()])
 }
 
 // readLoop reads, parses and dispatches frames until the connection dies.
@@ -118,6 +189,7 @@ func (h *hub) readLoop(cl *client, ctx context.Context) {
 		}
 		data, err := io.ReadAll(rd) // full message, bounded by read limit
 		if err != nil {
+			cl.closeBecauseRead(err)
 			return
 		}
 		if typ != websocket.MessageText {
@@ -134,20 +206,34 @@ func (h *hub) readLoop(cl *client, ctx context.Context) {
 
 // dispatch routes one raw frame to its handler.
 func (h *hub) dispatch(cl *client, data []byte) {
+	cl.errCode = ""
 	f, raw, err := parseFrame(data)
 	if err != nil {
 		h.sendErr(cl, codeBadFrame, err.Error())
+		h.logOp(cl, "", "", codeBadFrame)
 		return
 	}
 	if !cl.authed && f.Op != "hello" {
 		h.sendErr(cl, codeNotAuth, "send hello first")
+		h.logOp(cl, f.Op, f.ID, codeNotAuth)
 		return
 	}
 	if fn, ok := h.handlers[f.Op]; ok {
 		fn(cl, f, raw)
+		h.logOp(cl, f.Op, f.ID, cl.errCode)
 		return
 	}
 	h.sendErr(cl, codeBadFrame, "unknown op "+f.Op)
+	h.logOp(cl, f.Op, f.ID, codeBadFrame)
+}
+
+// logOp traces one dispatched op frame and how routing ended.
+func (h *hub) logOp(cl *client, op, id, code string) {
+	outcome := "ok"
+	if code != "" {
+		outcome = "err"
+	}
+	h.logf("op", "agent", cl.logAgent(), "op", dash(op), "id", dash(id), "outcome", outcome, "code", dash(code))
 }
 
 // writePump serializes writes and pings the peer every pingEvery.
@@ -159,6 +245,8 @@ func (h *hub) writePump(c *client) {
 		select {
 		case b := <-c.send:
 			if !c.write(b) {
+				c.closedAs(closeWriteFail)
+				h.logf("write_fail", "agent", c.logAgent(), "queued", c.queued.Load())
 				return
 			}
 			c.queued.Add(int64(-len(b)))
@@ -167,6 +255,8 @@ func (h *hub) writePump(c *client) {
 			c.drop()   // reject is always fatal
 		case <-ticker.C:
 			if !c.ping() {
+				c.closedAs(closePingTimeout)
+				h.logf("ping_timeout", "agent", c.logAgent())
 				return
 			}
 		case <-c.closed:
@@ -204,6 +294,8 @@ func (c *client) sendFrame(f frame) bool {
 		return false
 	}
 	if c.queued.Load()+int64(len(b)) > maxQueuedBytes {
+		c.h.logf("backpressure", "agent", c.logAgent(), "queued", c.queued.Load())
+		c.closedAs(closeBackpressure)
 		c.drop() // slow consumer: shed it rather than buffer unbounded
 		return false
 	}
@@ -219,7 +311,8 @@ func (c *client) sendFrame(f frame) bool {
 
 // sendErr emits a spec error frame (codes from frames.go).
 func (h *hub) sendErr(cl *client, code, msg string) {
-	h.log.Printf("conn=%s code=%s msg=%s", cl.agentID, code, msg)
+	cl.errCode = code
+	h.logf("err", "agent", cl.logAgent(), "code", code, "msg", msg)
 	cl.sendFrame(frame{Op: "error", Code: code, Msg: msg})
 }
 
@@ -228,7 +321,9 @@ func (h *hub) sendErr(cl *client, code, msg string) {
 func (h *hub) register(cl *client) {
 	h.mu.Lock()
 	if old, ok := h.clients[cl.agentID]; ok && old != cl {
+		old.closedAs(closeEvicted)
 		old.drop()
+		h.logf("evict", "agent", cl.agentID)
 	}
 	h.clients[cl.agentID] = cl
 	e := h.upsertAgentLocked(cl)

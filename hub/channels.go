@@ -3,7 +3,6 @@ package main
 // channels.go — channel registry, pubkey ACLs, message routing.
 // The hub stores and forwards ciphertext only.
 
-
 // channel is a chat channel. Pubkey is the channel public key (b64)
 // registered by the creator; members' clients hold the private key
 // out-of-band. Allowed is the ACL (empty = any authenticated agent).
@@ -44,19 +43,30 @@ func (h *hub) handleJoin(cl *client, f frame, _ map[string]any) {
 // joinChannel creates or fetches the channel and adds the agent as a
 // member, enforcing the ACL.
 func (h *hub) joinChannel(cl *client, name, chanPub string) *protoError {
+	created, rejoin := false, false
 	h.mu.Lock()
 	ch := h.channels[name]
 	if ch == nil {
 		ch = h.newChannelLocked(name, chanPub)
+		created = true
 	}
 	if !ch.allows(cl.pubkey) {
 		h.mu.Unlock()
+		h.logf("join", "agent", cl.logAgent(), "channel", dash(name), "result", "denied")
 		return &protoError{codeDenied, "pubkey not on channel ACL"}
 	}
+	_, rejoin = ch.Members[cl.agentID]
 	ch.Members[cl.agentID] = true
 	peers := h.presencePeersLocked(cl.agentID)
 	h.mu.Unlock()
 	h.sendPresence(peers, cl.agentID, cl.name, cl.x25519, cl.pubkey, true)
+	result := "joined"
+	if created {
+		result = "created"
+	} else if rejoin {
+		result = "rejoin"
+	}
+	h.logf("join", "agent", cl.logAgent(), "channel", name, "result", result)
 	return nil
 }
 
@@ -108,6 +118,7 @@ func (h *hub) handleSend(cl *client, f frame, raw map[string]any) {
 func (h *hub) deliverChannel(cl *client, f frame) bool {
 	msg, online, offline, perr := h.channelTargets(cl, f)
 	if perr != nil {
+		h.logf("chan", "agent", cl.logAgent(), "channel", dash(f.Channel), "result", "denied", "code", perr.code)
 		h.sendErr(cl, perr.code, perr.msg)
 		return false
 	}
@@ -117,6 +128,8 @@ func (h *hub) deliverChannel(cl *client, f frame) bool {
 	for _, agentID := range offline {
 		h.enqueue(agentID, msg)
 	}
+	h.logf("chan", "agent", cl.logAgent(), "channel", f.Channel, "result", "ok",
+		"fanout", len(online)+len(offline), "online", len(online), "offline", len(offline))
 	return true
 }
 
@@ -152,6 +165,7 @@ func (h *hub) channelTargets(cl *client, f frame) (frame, []*client, []string, *
 func (h *hub) deliverDM(cl *client, f frame) bool {
 	msg := frame{Op: "msg", To: f.To, From: cl.agentID, ID: f.ID, TS: f.TS, Ciphertext: f.Ciphertext}
 	if h.lookupAgent(f.To) == nil {
+		h.logf("dm", "agent", cl.logAgent(), "to", dash(f.To), "result", "unknown")
 		h.sendErr(cl, codeUnknownAgent, "no such agent: "+f.To)
 		return false
 	}
@@ -159,9 +173,14 @@ func (h *hub) deliverDM(cl *client, f frame) bool {
 	rec := h.clients[f.To]
 	h.mu.RUnlock()
 	if rec == nil {
-		h.enqueue(f.To, msg)
+		size := h.enqueue(f.To, msg)
+		h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "mailbox", "size", size)
 		return true
 	}
-	rec.sendFrame(msg)
+	if !rec.sendFrame(msg) {
+		h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "dropped")
+		return true
+	}
+	h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "online")
 	return true
 }

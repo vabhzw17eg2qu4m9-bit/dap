@@ -13,6 +13,7 @@ import (
 func (h *hub) adminOK(w http.ResponseWriter, r *http.Request) bool {
 	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if got == "" || h.adminToken == "" || !constEq(got, h.adminToken) {
+		h.logf("admin", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "result", "denied")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -43,6 +44,7 @@ func (h *hub) adminChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.RUnlock()
 	writeJSON(w, rows)
+	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "channels", len(rows))
 }
 
 // adminSetACL replaces a channel's ACL (upserting the channel).
@@ -54,11 +56,13 @@ func (h *hub) adminSetACL(w http.ResponseWriter, r *http.Request) {
 		Allowed []string `json:"allowed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "bad_request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	h.setACL(r.PathValue("name"), body.Allowed)
 	w.WriteHeader(http.StatusNoContent)
+	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "channel", r.PathValue("name"), "acl", len(body.Allowed))
 }
 
 // setACL upserts the channel and persists the registry.
@@ -79,5 +83,7 @@ func (h *hub) adminAgents(w http.ResponseWriter, r *http.Request) {
 	if !h.adminOK(w, r) {
 		return
 	}
-	writeJSON(w, h.presenceList())
+	agents := h.presenceList()
+	writeJSON(w, agents)
+	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "agents", len(agents))
 }

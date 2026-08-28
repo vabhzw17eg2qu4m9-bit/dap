@@ -6,7 +6,7 @@ const mailboxCap = 100
 
 // enqueue buffers a message for an offline agent. On overflow the oldest
 // entry is dropped and the mailbox_full flag latches until the next flush.
-func (h *hub) enqueue(agentID string, f frame) {
+func (h *hub) enqueue(agentID string, f frame) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	q := append(h.mailbox[agentID], f)
@@ -15,6 +15,7 @@ func (h *hub) enqueue(agentID string, f frame) {
 		h.mailboxDropped[agentID] = true
 	}
 	h.mailbox[agentID] = q
+	return len(q)
 }
 
 // drain empties the mailbox, reporting whether overflow happened.
@@ -39,4 +40,5 @@ func (h *hub) handleFlush(cl *client, _ frame, _ map[string]any) {
 		h.sendErr(cl, codeMailboxFull, "mailbox overflowed; oldest messages dropped")
 	}
 	cl.sendFrame(frame{Op: "flushed", Count: len(msgs)})
+	h.logf("flush", "agent", cl.agentID, "count", len(msgs), "overflowed", dropped)
 }

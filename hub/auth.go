@@ -164,9 +164,9 @@ func (n *nonceCache) sweepLocked(now time.Time) {
 const sendIDCap = 4096
 
 type sendIDCache struct {
-	mu    sync.Mutex
-	ids   map[string][]string // pubkey → ring buffer of recent ids
-	next  map[string]int      // pubkey → next overwrite index (once full)
+	mu   sync.Mutex
+	ids  map[string][]string // pubkey → ring buffer of recent ids
+	next map[string]int      // pubkey → next overwrite index (once full)
 }
 
 func newSendIDCache() *sendIDCache {
@@ -200,6 +200,12 @@ func (s *sendIDCache) add(pub, id string) {
 
 // handleHello authenticates the first frame on a connection.
 func (h *hub) handleHello(cl *client, f frame, raw map[string]any) {
+	// Derive the id from the (still unverified) hello pubkey so trace
+	// lines can name the agent even when authentication fails.
+	if pub, err := base64.StdEncoding.DecodeString(f.Pubkey); err == nil {
+		cl.helloID = agentIDFor(pub)
+	}
+	h.logf("hello", "agent", cl.logAgent(), "name", f.Name)
 	if cl.authed {
 		h.sendErr(cl, codeBadFrame, "already authenticated")
 		return
@@ -219,7 +225,9 @@ func (h *hub) reject(cl *client, code, msg string) {
 		cl.drop()
 		return
 	}
-	h.log.Printf("conn=%s code=%s msg=%s", cl.agentID, code, msg)
+	cl.errCode = code
+	// traced before the error frame is queued for the pump
+	h.logf("auth_fail", "agent", cl.logAgent(), "code", code, "msg", msg)
 	select {
 	case cl.rejectCh <- b:
 		// wait for the pump to write the frame and drop the conn, so
