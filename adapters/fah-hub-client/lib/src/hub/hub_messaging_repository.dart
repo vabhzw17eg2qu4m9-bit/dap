@@ -31,8 +31,11 @@ class HubMessagingRepository implements MessagingRepository {
   }
 
   void _deliver(InboundMessage message) {
-    final text = message.plaintext;
-    if (text == null) return;
+    // Undecryptable payloads (key mismatch across a retarget, tampered
+    // frame) still surface — never silent.
+    final text = message.plaintext ??
+        '[hub] undecryptable message from '
+        '${message.from.isEmpty ? 'unknown' : message.from}';
     final toId = _inboxIdFor(message);
     _inboxes.putIfAbsent(toId, () => []).add(AgentMessage(
           id: message.id,

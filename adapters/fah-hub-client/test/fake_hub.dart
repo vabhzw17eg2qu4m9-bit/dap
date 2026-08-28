@@ -60,6 +60,13 @@ class FakeHub {
     if (ws != null) _reply(ws, {'op': 'error', 'code': code, 'msg': msg});
   }
 
+  /// Pushes a raw hub `msg` frame to an agent's live connection
+  /// (undecryptable-payload delivery tests).
+  void pushMsg(String agentId, Map<String, dynamic> msg) {
+    final ws = _conns[agentId];
+    if (ws != null) _reply(ws, {'op': 'msg', ...msg});
+  }
+
   Stream<String> get hellos => _helloEvents.stream;
 
   Future<void> start() async {

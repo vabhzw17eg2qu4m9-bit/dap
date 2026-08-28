@@ -240,7 +240,7 @@ class HubClient {
     while (!_closing && epoch == _epoch) {
       var welcomed = false;
       try {
-        welcomed = await _cycle();
+        welcomed = await _cycle(epoch);
       } on HubError catch (error) {
         // pre-welcome rejection (bad signature, …) — fatal, stop retrying
         if (!_firstWelcome.isCompleted) _firstWelcome.completeError(error);
@@ -258,7 +258,7 @@ class HubClient {
   /// One connect → hello → welcome → flush → hold-until-close cycle.
   /// Returns whether the hub welcomed us; only pre-welcome hub rejections
   /// throw ([HubError]) — transport failures just return `false`.
-  Future<bool> _cycle() async {
+  Future<bool> _cycle(int epoch) async {
     final WebSocket ws;
     try {
       ws = await WebSocket.connect(config.url!);
@@ -266,17 +266,30 @@ class HubClient {
       _failPending('connect failed');
       return false;
     }
+    // Stale-socket guard: a retarget while we were parked inside
+    // WebSocket.connect retired this generation — the socket is dead on
+    // arrival. Close it and touch nothing shared (no _ws/_subscription
+    // clobber, no hello, no reconnect war).
+    if (_closing || epoch != _epoch) {
+      await ws.close();
+      return false;
+    }
     _ws = ws;
     ws.pingInterval = pingInterval; // native liveness watchdog (see field doc)
     final welcomed = Completer<bool>();
     final done = Completer<void>();
     _welcomeCompleter = welcomed;
-    _subscription = ws.listen(
-      (dynamic data) => _onFrame(data as String),
+    late final StreamSubscription sub;
+    sub = ws.listen(
+      (dynamic data) {
+        // Superseded sockets must not touch the live generation's state.
+        if (epoch == _epoch) _onFrame(data as String);
+      },
       onDone: () => _abandon(welcomed, done),
       onError: (Object _) => _abandon(welcomed, done),
       cancelOnError: true,
     );
+    _subscription = sub;
     _hellos++;
     ws.add(jsonEncode(await _helloFrame()));
     final bool ok;
@@ -288,11 +301,11 @@ class HubClient {
       return false;
     } on HubError {
       // hub rejected the hello — close our side, propagate
-      await _subscription?.cancel();
+      await sub.cancel();
       await ws.close();
       rethrow;
     }
-    if (ok) {
+    if (ok && epoch == _epoch) {
       agentId = _welcomedAgentId;
       if (!_firstWelcome.isCompleted) _firstWelcome.complete(agentId);
       await _joinKnownChannels();
@@ -326,19 +339,20 @@ class HubClient {
     await _welcomeEvents.close();
   }
 
-  /// Runtime retarget (dap_connect): stop the reconnect loop and the
-  /// socket (its native ping watchdog dies with it) cleanly, swap url
-  /// and/or identity keys and display name, then reconnect fresh — no
-  /// process restart. A new identity means a new agentId ([agentId] is
-  /// recomputed from the new keys). The inbound/errors streams stay
-  /// live; completes with the new agent id at the next welcome.
   Future<String> retarget({String? url, HubIdentity? keys, String? name}) async {
     _epoch++; // retire any loop parked in backoff (no double-connect)
     _closing = true;
-    await _subscription?.cancel();
-    await _ws?.close();
-    _failPending('retargeting');
+    // Paired teardown with no await gap between reading and clearing the
+    // fields: a cycle completing mid-retarget could reassign _ws in that
+    // gap, splitting cancel(socket A)/close(socket B) and stranding a
+    // hub-registered, subscription-less zombie socket.
+    final ws = _ws;
+    final sub = _subscription;
     _ws = null;
+    _subscription = null;
+    _failPending('retargeting');
+    await sub?.cancel();
+    await ws?.close();
     if (keys != null) {
       _identity = keys;
       _whoisCache.clear(); // peer keys resolved under the old identity
