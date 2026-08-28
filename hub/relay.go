@@ -287,7 +287,10 @@ func (c *client) drop() {
 	})
 }
 
-// sendFrame queues a frame for the write pump; false if dropped.
+// sendFrame queues a frame for the write pump; false if dropped. A closed
+// connection must never accept a frame — checking c.closed BEFORE the
+// select removes the race where both cases are ready and the frame is
+// queued into a write pump that is already gone (logged online, lost).
 func (c *client) sendFrame(f frame) bool {
 	b, err := json.Marshal(f)
 	if err != nil {
@@ -300,6 +303,12 @@ func (c *client) sendFrame(f frame) bool {
 		return false
 	}
 	c.queued.Add(int64(len(b)))
+	select {
+	case <-c.closed:
+		c.queued.Add(int64(-len(b)))
+		return false
+	default:
+	}
 	select {
 	case c.send <- b:
 		return true

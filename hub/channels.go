@@ -178,7 +178,11 @@ func (h *hub) deliverDM(cl *client, f frame) bool {
 		return true
 	}
 	if !rec.sendFrame(msg) {
-		h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "dropped")
+		// Recipient connection died or was shed between lookup and push —
+		// queue to the mailbox instead of silently dropping the frame; the
+		// flush on their next welcome delivers it.
+		size := h.enqueue(f.To, msg)
+		h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "mailbox_after_drop", "size", size)
 		return true
 	}
 	h.logf("dm", "agent", cl.logAgent(), "to", f.To, "result", "online")
