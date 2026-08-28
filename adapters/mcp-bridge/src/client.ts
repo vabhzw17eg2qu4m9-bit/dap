@@ -17,11 +17,15 @@ import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog } from './keepalive.js';
 import { loadChannelKeys, parseChankeyInvite, persistChannelKeys } from './channels.js';
 import { persistDapConfig, readDapConfig, type PendingInvite } from './config.js';
 
-/** A hub `error` frame observed on the wire (unknown_agent, access_denied, …). */
+/** A hub `error` frame observed on the wire (unknown_agent, access_denied, …)
+ *  — plus locally-detected inbound failures (`undecryptable`), which carry
+ *  the sender frame's `from`/`id` when the frame had them. */
 export interface HubErrorEvent {
   code: string;
   msg: string;
   ts: number;
+  from?: string;
+  id?: string;
 }
 
 export interface ChannelKey {
@@ -167,13 +171,12 @@ export class DapClient {
   private readonly joined = new Set<string>();
   private readonly inboxMsgs: MsgEvent[] = [];
   private readonly known = new Map<string, PeerInfo>();
-  /** Connection attempts (hellos sent); `welcomes` counts the ones that authenticated. */
+  private readonly whoisWaiters = new Map<string, Array<(err?: Error, info?: PeerInfo) => void>>();
   hellos = 0;
   welcomes = 0;
-  private readonly whoisWaiters = new Map<string, Array<(info?: PeerInfo) => void>>();
+  private readonly readyWaiters: Array<(err?: Error) => void> = [];
   private readonly presenceWaiters: Array<(err?: Error, agents?: PresenceAgent[]) => void> = [];
   private readonly joinWaiters = new Map<string, Array<(err?: Error) => void>>();
-  private readonly readyWaiters: Array<() => void> = [];
   private readonly listeners = new Set<(m: MsgEvent) => void>();
   private ws: WebSocket | null = null;
   private retryTimer: NodeJS.Timeout | undefined;
@@ -250,6 +253,7 @@ export class DapClient {
       this.ws.close();
       this.ws = null;
     }
+    this.failWaiters(new Error('retargeted — in-flight hub call dropped, retry on the new connection'));
     this.welcomed = false;
     this.stopped = false; // connect() again after the implicit stop
     if (next.url) this.opts.url = next.url;
@@ -261,11 +265,20 @@ export class DapClient {
     this.connect();
   }
 
+  /** Fail every waiter parked on a deliberately-killed connection (retarget,
+   *  terminal stop): fail-fast beats a 5s timeout drift for calls in flight. */
+  private failWaiters(err: Error): void {
+    for (const resolves of this.whoisWaiters.values()) for (const done of resolves) done(err);
+    this.whoisWaiters.clear();
+    for (const done of this.presenceWaiters.splice(0)) done(err);
+    for (const wake of this.readyWaiters.splice(0)) wake(err);
+  }
+
   /** Resolve once `welcome` arrived (bounded — rejects on timeout). */
   ready(timeoutMs = WAIT_MS): Promise<void> {
     if (this.welcomed && this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const wake = () => { clearTimeout(timer); resolve(); };
+    const wake = (err?: Error) => { clearTimeout(timer); if (err) reject(err); else resolve(); };
     const timer = setTimeout(() => {
       const i = this.readyWaiters.indexOf(wake);
       if (i >= 0) this.readyWaiters.splice(i, 1);
@@ -478,10 +491,7 @@ export class DapClient {
   private surfaceInviteFailure(err: unknown): void {
     const msg = `pending invite check failed: ${err instanceof Error ? err.message : String(err)}`;
     this.lastError = msg;
-    const event: HubErrorEvent = { code: 'invite_failed', msg, ts: Date.now() };
-    this.errorRing.push(event);
-    if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
-    this.opts.onHubError?.(event);
+    this.ringError({ code: 'invite_failed', msg, ts: Date.now() });
   }
 
   /** Pubkey directory lookup (needed for DM key agreement). */
@@ -632,20 +642,26 @@ export class DapClient {
     for (const done of this.presenceWaiters.splice(0)) done(undefined, agents);
   }
 
-  private onError(frame: dap.Frame): void {
-    this.lastError = `hub error ${frame.code}: ${frame.msg}`;
-    // Never silent: keep a bounded ring (drained by dap_inbox) and fire the hook.
-    const event: HubErrorEvent = { code: String(frame.code), msg: String(frame.msg), ts: Date.now() };
+  /** Hub verdicts are never silent: bounded ring (drained by dap_inbox) +
+   *  the onHubError hook — one path for every observed failure. */
+  private ringError(event: HubErrorEvent): void {
     this.errorRing.push(event);
     if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
     this.opts.onHubError?.(event);
+  }
+
+  private onError(frame: dap.Frame): void {
+    this.lastError = `hub error ${frame.code}: ${frame.msg}`;
+    this.ringError({ code: String(frame.code), msg: String(frame.msg), ts: Date.now() });
     if (frame.code === 'unknown_channel' || frame.code === 'access_denied') {
       const err = new Error(this.lastError);
       for (const done of this.joinWaiters.get(String(frame.channel)) ?? []) done(err);
       this.joinWaiters.delete(String(frame.channel));
     }
     if (frame.code === 'unknown_agent') {
-      for (const resolves of this.whoisWaiters.values()) for (const r of resolves) r(undefined);
+      for (const [agentId, resolves] of this.whoisWaiters) for (const done of resolves) {
+        done(new Error(`unknown_agent: ${agentId}`));
+      }
       this.whoisWaiters.clear();
     }
   }
@@ -653,7 +669,13 @@ export class DapClient {
   private onDisconnect(): void {
     this.watchdog.stop();
     this.welcomed = false;
-    if (this.stopped) return;
+    if (this.stopped) {
+      // Terminal stop: nothing will reconnect — fail parked waiters now.
+      this.failWaiters(new Error('connection closed — client stopped'));
+      return;
+    }
+    // Transient drop: waiters ride the reconnect (bounded by their own
+    // timeouts) and the welcome resolves them — the reconnect contract.
     const wait = this.delay;
     this.delay = Math.min(this.delay * 2, this.maxMs);
     this.retryTimer = setTimeout(() => this.connect(), wait);
@@ -671,25 +693,26 @@ export class DapClient {
       xPub: x25519 ? dap.b64d(x25519) : new Uint8Array(0),
     };
     this.known.set(agentId, info);
-    for (const resolve of this.whoisWaiters.get(agentId) ?? []) resolve(info);
+    for (const done of this.whoisWaiters.get(agentId) ?? []) done(undefined, info);
     this.whoisWaiters.delete(agentId);
   }
 
   private agentInfo(agentId: string): Promise<PeerInfo> {
     const cached = this.known.get(agentId);
     if (cached) return Promise.resolve(cached);
-    const { promise, resolve, reject } = Promise.withResolvers<PeerInfo | undefined>();
+    const { promise, resolve, reject } = Promise.withResolvers<PeerInfo>();
     const timer = setTimeout(() => reject(new Error(`timeout whois ${agentId}`)), WAIT_MS);
-    const done = (info?: PeerInfo) => { clearTimeout(timer); resolve(info); };
+    const done = (err?: Error, info?: PeerInfo) => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else if (info) resolve(info);
+    };
     const list = this.whoisWaiters.get(agentId) ?? [];
     list.push(done);
     this.whoisWaiters.set(agentId, list);
     this.whoisCalls++;
     this.ws?.send(JSON.stringify({ op: 'whois', agentId }));
-    return promise.then((info) => {
-      if (!info) throw new Error(`unknown_agent: ${agentId}`);
-      return info;
-    });
+    return promise;
   }
 
   private async onMsg(frame: dap.Frame): Promise<void> {
@@ -712,7 +735,13 @@ export class DapClient {
       }
       this.deliver(ev);
     } catch (err) {
-      this.lastError = `undecryptable msg: ${String(err)}`;
+      const msg = `undecryptable msg: ${err instanceof Error ? err.message : String(err)}`;
+      this.lastError = msg;
+      // Never silent — same surfacing as hub verdicts (drained by dap_inbox).
+      const event: HubErrorEvent = { code: 'undecryptable', msg, ts: Date.now() };
+      if (frame.from !== undefined) event.from = String(frame.from);
+      if (frame.id !== undefined) event.id = String(frame.id);
+      this.ringError(event);
     }
   }
 
