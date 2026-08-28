@@ -201,7 +201,10 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { deliverAs: 'steer', triggerTurn: true });
   };
 
-  client.onMessage = (frame) =>    decryptInbound(frame, cryptoCtx)
+  // Subscribe (not assign): every session of a shared client receives each
+  // frame — a later session must never steal delivery from an earlier one.
+  const offMessage = client.onFrame((frame) =>
+    decryptInbound(frame, cryptoCtx)
       .then((payload) => {
         const invite = payload.dm ? parseChankeyInvite(payload.text) : undefined;
         if (invite) {
@@ -222,7 +225,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       })
       .catch((err: unknown) =>
         ctx.appendEntry('io.dap.undecryptable', { type: 'dap_undecryptable', id: frame.id, error: String(err) }),
-      );
+      ));
 
   // Membership: join every configured channel after each welcome (idempotent;
   // first join ever creates the channel and registers its public key).
@@ -595,6 +598,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
   const dispose = (): void => {
+    offMessage(); // dead sessions must not keep receiving (or steering) frames
     if (pollerHandle !== undefined) pollerCtx?.clearTimer(pollerHandle);
     pollerHandle = undefined;
     if (shared === undefined) {

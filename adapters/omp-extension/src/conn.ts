@@ -19,6 +19,8 @@ export const DEFAULT_BACKOFF: Backoff = { initial: 1000, max: 30000 };
 
 export interface MsgFrame {
   op: 'msg';
+  /** Set on DM deliveries — hub deliverDM echoes the recipient id. */
+  to?: string;
   channel?: string;
   from: string;
   id: string;
@@ -74,7 +76,6 @@ export class DapClient {
   welcomeCount = 0;
   /** Delays handed to setInterval for each reconnect — spec-visible backoff. */
   readonly backoffSchedule: number[] = [];
-  onMessage: ((frame: MsgFrame) => void | Promise<void>) | undefined;
 
   private readonly backoff: Backoff;
   private readonly timers: Timers;
@@ -85,8 +86,17 @@ export class DapClient {
   private stopped = false;
   private readonly listeners = new Map<string, Set<Listener>>();
   private readonly emitCounts = new Map<string, number>();
+  private readonly frameListeners = new Set<(frame: MsgFrame) => void | Promise<void>>();
+
   private readonly whoisCache = new Map<string, AgentInfo>();
   private readonly whoisWaiters = new Map<string, Array<(info: AgentInfo | undefined) => void>>();
+  /** Subscribe to inbound msg frames. Every subscriber receives each frame
+   *  (one client is shared by every omp session in the process — delivery
+   *  must fan out, not go to the last subscriber). Returns an unsubscriber. */
+  onFrame(fn: (frame: MsgFrame) => void | Promise<void>): () => void {
+    this.frameListeners.add(fn);
+    return () => this.frameListeners.delete(fn);
+  }
 
   constructor(private readonly opts: DapOptions) {
     // agentId is a getter over opts.keys — no field to set.
@@ -263,11 +273,11 @@ export class DapClient {
         break;
       case 'msg': {
         const msgFrame = frame as unknown as MsgFrame;
-        // 'inbound' fires only after the handler's async chain (decrypt,
+        // 'inbound' fires only after EVERY subscriber's async chain (decrypt,
         // inbox, steer) settled — tests can rely on it deterministically.
-        void Promise.resolve(this.onMessage?.(msgFrame))
-          .catch(() => {})
-          .then(() => this.emit('inbound', msgFrame));
+        void Promise.all(
+          [...this.frameListeners].map((fn) => Promise.resolve(fn(msgFrame)).catch(() => {})),
+        ).then(() => this.emit('inbound', msgFrame));
         break;
       }
       case 'agent_info': {

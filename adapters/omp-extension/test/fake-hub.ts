@@ -230,6 +230,9 @@ export class FakeHub {
       ts: frame.ts,
       ciphertext: frame.ciphertext,
     };
+    // Real-hub shape (hub/relay.go deliverDM): DM frames carry `to`,
+    // channel frames carry `channel` (omitempty).
+    if (frame.to) msg.to = frame.to;
     if (frame.channel) msg.channel = frame.channel;
     for (const target of targets) {
       const targetWs = this.agents.get(target)?.ws;

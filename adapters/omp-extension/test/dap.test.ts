@@ -1152,3 +1152,48 @@ test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers n
     await hub.close();
   }
 });
+
+test('live DM: a second session claiming the shared client must not steal delivery — dap_inbox still lists it', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const r = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'sender' });
+  const extR = dapExtension(r.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'receiver' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extR.client, 'welcome');
+
+    // Production condition: a second omp session (subagent) shares R's client
+    // and subscribes its own delivery handler (per-session inbox + steer).
+    // Delivery must fan out — the second session must not starve the first.
+    const stolen: string[] = [];
+    extR.client.onFrame((frame) => {
+      stolen.push(frame.id);
+      return Promise.resolve();
+    });
+
+    const inboundR = nextEvent<MsgFrame>(extR.client, 'inbound');
+    await run(a, 'dap_dm', { to: extR.client.agentId, text: 'live ping' });
+    const frame = await inboundR;
+    assert.equal(frame.to, extR.client.agentId, 'hub DM frame carries `to` (deliverDM shape)');
+
+    // The acceptance contract: the DM is in R's own durable inbox, readable
+    // via dap_inbox with decrypted sender, text and ts — like flushed mail.
+    const inbox = await run<{ count: number; entries: { id: string; from: string; text: string; ts: number; dm: boolean }[] }>(
+      r,
+      'dap_inbox',
+      { limit: 10 },
+    );
+    assert.equal(inbox.count, 1, `live DM must land in the first session's inbox despite the second subscriber`);
+    assert.equal(inbox.entries[0].id, frame.id);
+    assert.equal(inbox.entries[0].from, extA.client.agentId, 'decrypted sender');
+    assert.equal(inbox.entries[0].text, 'live ping');
+    assert.equal(inbox.entries[0].ts, frame.ts, 'entry ts is the hub frame ts');
+    assert.equal(inbox.entries[0].dm, true);
+    assert.ok(stolen.includes(frame.id), 'the second session still receives the frame (fan-out, not exclusivity)');
+  } finally {
+    extA.dispose();
+    extR.dispose();
+    await hub.close();
+  }
+});
