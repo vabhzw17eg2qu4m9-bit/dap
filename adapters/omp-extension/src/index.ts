@@ -134,7 +134,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     shared.refs++;
   }
   const created = existing === undefined; // this call constructed the client
-  const agentId = client.agentId; // available synchronously — no await needed
+  // client.agentId is read LIVE everywhere below — a captured value went
+  // stale after a /dap re-key (status kept the pre-retarget id).
   ctx.setLabel('DAP — distributed agents');
   // Persistent connection line in the omp footer (visible without asking):
   // DAP <name|id> · <host> · <state> · #chan1,#chan2. ui reference is
@@ -142,7 +143,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   // a fire-and-forget request in RPC — safe to call from any event.
   let ui: SessionCtx['ui'] | undefined;
   const renderStatus = (state: string): void => {
-    const who = settings.name ?? agentId;
+    const who = settings.name ?? client.agentId;
     const host = hostOf(settings.url);
     const chans = Object.keys(cryptoCtx.channels)
       .map((c) => '#' + c)
@@ -154,7 +155,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     pollerCtx = sctx; // managed timers for the pending-invite poller
     startPoller();
     if (sctx.hasUI && sctx.ui) {
-      sctx.ui.notify(`DAP connected as ${agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
+      sctx.ui.notify(`DAP connected as ${client.agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
     }
     renderStatus(client.connected ? 'connected' : 'connecting…');
   });
@@ -164,8 +165,18 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   const useChannelFile = !(overrides.channels || overrides.channelPrivs);
   const fromFile = useChannelFile ? channelsFromFile(settings.channelsFile) : null;
   const cryptoCtx: PayloadCryptoContext = {
-    keys,
-    selfAgentId: client.agentId,
+    // Live getters, not captured values: connectTo swaps `keys` and the
+    // client's identity at runtime (/dap re-key). A captured selfAgentId
+    // left the DM AAD on the PRE-retarget id — every inbound DM after a
+    // re-key failed AEAD verification and died in io.dap.undecryptable
+    // (durable but never steered): the agent went deaf while its own
+    // outbound kept working.
+    get keys(): KeyPair {
+      return keys;
+    },
+    get selfAgentId(): string {
+      return client.agentId;
+    },
     channels: overrides.channels ?? fromFile?.channels ?? {},
     channelPrivs: overrides.channelPrivs ?? fromFile?.channelPrivs ?? {},
     peerXPub: async (agentId) => (await client.whois(agentId))?.x25519,
@@ -426,7 +437,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   /** One payload for the dap_status tool and the /dap_status command (DRY). */
   const statusPayload = () => ({
     connected: client.connected,
-    agentId,
+    agentId: client.agentId,
     name: settings.name,
     url: settings.url,
     channels: Object.keys(cryptoCtx.channels),
@@ -464,8 +475,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     if (name) {
       settings.name = name;
       nextKeys = loadOrCreateKeys(defaultKeyPath(name));
-      keys = nextKeys;
-      cryptoCtx.keys = nextKeys;
+      keys = nextKeys; // cryptoCtx.keys is a live getter over this binding
     }
     if (host) settings.url = url;
     persistDapConfig({ url: host ? url : undefined, name, channels: channel ? [channel] : undefined }, configFile);

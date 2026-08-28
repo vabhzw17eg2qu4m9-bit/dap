@@ -1023,6 +1023,61 @@ test('dap_whois is fresh: an offline transition is not masked by the cache', asy
   }
 });
 
+test('/dap re-key stays live: status id, inbound AAD, outbound keys all follow the NEW identity', async () => {
+  const hub = await new FakeHub().listen();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-rekey-'));
+  const prevHome = process.env.HOME;
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  process.env.HOME = home; // defaultKeyPath(name) resolves under this home
+  process.env.DAP_CONFIG_FILE = path.join(home, 'config.json');
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath() });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath() });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    const oldId = extA.client.agentId;
+
+    // The user's exact action: /dap <host> <new name> — runtime identity swap.
+    const conn = await run<{ ok: boolean; agentId: string }>(a, 'dap_connect', {
+      host: `127.0.0.1:${hub.port}`,
+      name: 'swapped',
+    });
+    assert.equal(conn.ok, true);
+    assert.notEqual(conn.agentId, oldId, 'a name-derived key is a new identity');
+    await eventCountAtLeast(extA.client, 'welcome', 2);
+
+    // dap_status must report the LIVE identity (a captured id kept the
+    // pre-retarget agentId forever after a re-key).
+    const st = await run<{ agentId: string; connected: boolean }>(a, 'dap_status');
+    assert.equal(st.agentId, conn.agentId, 'status follows the retargeted identity');
+    assert.equal(st.connected, true);
+    // Inbound to the NEW id must decrypt (DM AAD = current id) and steer in.
+    const aInboundBefore = extA.client.eventCount('inbound');
+    await run(b, 'dap_dm', { to: conn.agentId, text: 'post-rekey inbound' });
+    await extA.client.waitForAfter('inbound', aInboundBefore);
+    assert.ok(a.sent.some((s) => /post-rekey inbound/.test(s.msg)), 'inbound DM steered in after re-key');
+    const inbox = await run<{ entries: { text: string }[] }>(a, 'dap_inbox', { limit: 10 });
+    assert.ok(inbox.entries.some((e) => /post-rekey inbound/.test(e.text)), 'durable inbox holds it');
+
+    // Outbound post-re-key must decrypt at the peer (live key material).
+    const bInboundBefore = extB.client.eventCount('inbound');
+    await run(a, 'dap_dm', { to: extB.client.agentId, text: 'post-rekey outbound' });
+    await extB.client.waitForAfter('inbound', bInboundBefore);
+
+    assert.ok(b.sent.some((s) => /post-rekey outbound/.test(s.msg)), 'outbound DM decrypts at the peer after re-key');
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
 test('footer status line: persistent connection info visible without asking', async () => {
   const hub = await new FakeHub().listen();
   const cap = fakeCtx();
