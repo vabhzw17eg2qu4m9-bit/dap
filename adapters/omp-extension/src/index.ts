@@ -418,7 +418,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       required: ['agentId'],
     },
     execute: async (_toolCallId, params) => {
-      const info = await client.whois(str(params.agentId));
+      const info = await client.whois(str(params.agentId), { fresh: true });
       return toolResult(info ?? { error: 'unknown_agent' });
     },
   });

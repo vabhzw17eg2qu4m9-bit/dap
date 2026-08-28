@@ -998,6 +998,31 @@ test('dap_peers: lists only other online agents — self and offline excluded', 
   }
 });
 
+test('dap_whois is fresh: an offline transition is not masked by the cache', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'asker' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'vanishing' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+
+    const first = await run<{ online: boolean }>(a, 'dap_whois', { agentId: extB.client.agentId });
+    assert.equal(first.online, true);
+
+    hub.drop(extB.client.agentId);
+    await hub.waitOffline(extB.client.agentId);
+
+    const second = await run<{ online: boolean }>(a, 'dap_whois', { agentId: extB.client.agentId });
+    assert.equal(second.online, false, 'a cached online verdict must not survive the disconnect');
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
 test('footer status line: persistent connection info visible without asking', async () => {
   const hub = await new FakeHub().listen();
   const cap = fakeCtx();

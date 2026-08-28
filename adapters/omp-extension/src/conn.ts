@@ -204,10 +204,17 @@ export class DapClient {
       .then((f) => f.agents);
   }
 
-  /** Pubkey directory lookup (needed for DM key agreement). */
-  whois(agentId: string): Promise<AgentInfo | undefined> {
-    const cached = this.whoisCache.get(agentId);
-    if (cached) return Promise.resolve(cached);
+  /** Pubkey directory lookup (needed for DM key agreement). The cache is
+   * fine for key material (a pubkey never changes under an agentId) but
+   * `online`/`lastSeen` are volatile — callers surfacing presence (the
+   * dap_whois tool) must pass `{ fresh: true }` or they may serve a
+   * stale online verdict forever (the cache only clears on our own
+   * re-key). */
+  whois(agentId: string, opts?: { fresh?: boolean }): Promise<AgentInfo | undefined> {
+    if (!opts?.fresh) {
+      const cached = this.whoisCache.get(agentId);
+      if (cached) return Promise.resolve(cached);
+    }
     const { promise, resolve } = Promise.withResolvers<AgentInfo | undefined>();
     const waiters = this.whoisWaiters.get(agentId) ?? [];
     waiters.push(resolve);
