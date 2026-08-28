@@ -91,3 +91,18 @@ test('stopped watchdog clears pending deadlines and never terminates', () => {
   mt.elapseDeadlines();
   assert.equal(peer.killed, false);
 });
+
+test('watchdog re-arms on a fresh peer after terminating a dead one', () => {
+  const dead = stubPeer(false);
+  const mt = new ManualKaTimers();
+  const wd = new KeepAliveWatchdog({ every: 20, pongDeadline: 50 }, mt.timers);
+  wd.start(dead);
+  mt.elapseDeadlines();
+  assert.equal(dead.killed, true);
+  // Reconnect: same watchdog instance, new socket — must watch again.
+  const fresh = stubPeer(false);
+  wd.start(fresh);
+  assert.equal(fresh.pings, 1, 'fresh peer is pinged immediately');
+  mt.elapseDeadlines();
+  assert.equal(fresh.killed, true, 'fresh silent peer also gets terminated');
+});

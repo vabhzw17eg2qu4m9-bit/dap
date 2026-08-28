@@ -58,6 +58,10 @@ export class KeepAliveWatchdog {
 
   start(peer: KeepAlivePeer): void {
     this.stop();
+    // A previous incarnation may have terminated its peer; the fresh socket
+    // deserves a fresh verdict (without this, connections after one
+    // watchdog-terminated reconnect would never be watched again).
+    this.terminated = false;
     peer.on('pong', () => {
       this.awaitingPong = false;
       if (this.deadline !== undefined) this.timers.clearTimeout(this.deadline);

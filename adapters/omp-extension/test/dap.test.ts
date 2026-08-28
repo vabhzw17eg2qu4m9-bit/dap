@@ -1043,3 +1043,83 @@ test('dap_connect: retargets to another hub, renames identity, persists config +
     await hub2.close();
   }
 });
+
+test('per-process singleton: second session reuses the client (no eviction war)', async () => {
+  const hub = await new FakeHub().listen();
+  const prevUrl = process.env.DAP_HUB_URL;
+  const prevKeyEnv = process.env.DAP_KEY_PATH;
+  process.env.DAP_HUB_URL = hub.url;
+  process.env.DAP_KEY_PATH = path.join(KEYDIR, 'shared-' + ++keySeq + '.key');
+  let ext1: DapExtension | undefined;
+  let ext2: DapExtension | undefined;
+  try {
+    // No overrides: the production path — settings resolve from env, and two
+    // sessions with one identity key + url must share ONE client/socket.
+    ext1 = dapExtension(fakeCtx().ctx);
+    await nextEvent(ext1.client, 'welcome');
+    ext2 = dapExtension(fakeCtx().ctx);
+    assert.equal(ext2.client, ext1.client, 'second session reuses the shared client');
+    const agentId = ext1.client.agentId;
+    assert.equal(hub.log.filter((l) => l === 'hello-verified:' + agentId).length, 1, 'exactly ONE connection helloed the hub');
+    assert.ok(!hub.log.some((l) => l.startsWith('evict:')), 'no eviction war on the hub');
+
+    ext1.dispose(); // first session gone — refs remain, socket stays usable
+    assert.equal(ext1.client.connected, true, 'shared client survives one dispose');
+
+    const closed = nextEvent(ext1.client, 'close');
+    ext2.dispose(); // last ref out: the socket finally stops
+    await closed;
+    await hub.waitOffline(agentId);
+    assert.equal(ext1.client.connected, false, 'socket stopped after the last dispose');
+    assert.equal(hub.log.filter((l) => l === 'hello-verified:' + agentId).length, 1, 'still exactly one hello (no reconnect)');
+  } finally {
+    if (prevUrl === undefined) delete process.env.DAP_HUB_URL;
+    else process.env.DAP_HUB_URL = prevUrl;
+    if (prevKeyEnv === undefined) delete process.env.DAP_KEY_PATH;
+    else process.env.DAP_KEY_PATH = prevKeyEnv;
+    ext1?.dispose();
+    ext2?.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers notify rows (online default, all includes offline)', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    hub.drop(extB.client.agentId);
+    await hub.waitOffline(extB.client.agentId);
+
+    assert.ok(command(a, 'dap_status'), 'dap_status command registered');
+    assert.ok(command(a, 'dap_peers'), 'dap_peers command registered');
+    const notified: string[] = [];
+    const cmdCtx = { ui: { notify: (t: string) => void notified.push(t) }, hasUI: true };
+
+    const status = command(a, 'dap_status').handler('', cmdCtx) as string;
+    const parsed = JSON.parse(status) as { agentId: string; connected: boolean };
+    assert.equal(parsed.agentId, extA.client.agentId, 'status JSON carries the agentId');
+    assert.equal(parsed.connected, true);
+
+    const presenceA = nextEvent(extA.client, 'presence');
+    assert.match(command(a, 'dap_peers').handler('', cmdCtx) as string, /listing online agents…/);
+    await presenceA;
+    await microtasksSettled(); // the notify rides a microtask after the presence emission
+    assert.ok(notified.at(-1)!.includes('on ' + extA.client.agentId + ' alice'), 'online row notified: ' + notified.at(-1));
+    assert.ok(!notified.at(-1)!.includes(extB.client.agentId), 'offline agent hidden by default');
+
+    const presenceAll = nextEvent(extA.client, 'presence');
+    assert.match(command(a, 'dap_peers').handler('all', cmdCtx) as string, /listing all agents…/);
+    await presenceAll;
+    await microtasksSettled();
+    assert.ok(notified.at(-1)!.includes('off ' + extB.client.agentId + ' bob'), 'all includes the offline agent: ' + notified.at(-1));
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});

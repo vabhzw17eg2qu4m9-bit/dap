@@ -91,6 +91,19 @@ function parseChankeyInvite(text: string): { channel: string; pub: string; priv:
   }
 }
 
+/** omp runs this factory once per agent session (main + every subagent),
+ *  each instance opening its own socket with the same identity key — the
+ *  hub's one-connection-per-agent law turns that into an N-way eviction war
+ *  (every hello evicts the previous socket). One client per identity+url per
+ *  process, shared and refcounted across sessions, ends it. Tests always
+ *  pass overrides and bypass the map entirely. */
+interface SharedClient {
+  client: DapClient;
+  refs: number;
+  key: string;
+}
+const sharedClients = new Map<string, SharedClient>();
+
 /**
  * oh-my-pi DAP/1 extension. Default-export factory:
  * registers dap_send/dap_dm/dap_invite/dap_inbox/dap_whois tools, keeps one
@@ -103,13 +116,24 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   const settings = resolveDapSettings(overrides);
   let keys: KeyPair = loadOrCreateKeys(settings.keyPath);
 
-  const client = new DapClient({
+  // Production omp path (no overrides): share/refcount one client per
+  // identity+url across sessions; tests pass overrides and stay singleton-free.
+  const shareKey = Object.keys(overrides).length === 0 ? settings.keyPath + '|' + settings.url : undefined;
+  const existing = shareKey === undefined ? undefined : sharedClients.get(shareKey);
+  const client = existing?.client ?? new DapClient({
     url: settings.url,
     keys,
     name: settings.name,
     backoff: overrides.backoff,
     timers: overrides.timers,
   });
+  let shared: SharedClient | undefined;
+  if (shareKey !== undefined) {
+    shared = existing ?? { client, refs: 0, key: shareKey };
+    if (!existing) sharedClients.set(shareKey, shared);
+    shared.refs++;
+  }
+  const created = existing === undefined; // this call constructed the client
   const agentId = client.agentId; // available synchronously — no await needed
   ctx.setLabel('DAP — distributed agents');
   // Persistent connection line in the omp footer (visible without asking):
@@ -396,20 +420,21 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
 
+  /** One payload for the dap_status tool and the /dap_status command (DRY). */
+  const statusPayload = () => ({
+    connected: client.connected,
+    agentId,
+    name: settings.name,
+    url: settings.url,
+    channels: Object.keys(cryptoCtx.channels),
+    welcomes: client.welcomeCount,
+    hellos: client.helloCount,
+  });
   ctx.registerTool({
     name: 'dap_status',
     description: 'Own DAP connection status: are we connected to the hub, our agentId, name, hub url, known channels.',
     parameters: { type: 'object', properties: {} },
-    execute: async () =>
-      toolResult({
-        connected: client.connected,
-        agentId,
-        name: settings.name,
-        url: settings.url,
-        channels: Object.keys(cryptoCtx.channels),
-        welcomes: client.welcomeCount,
-        hellos: client.helloCount,
-      }),
+    execute: async () => toolResult(statusPayload()),
   });
 
   ctx.registerTool({
@@ -447,6 +472,14 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     persistDapConfig({ url: host ? url : undefined, name, channels: channel ? [channel] : undefined }, configFile);
     if (channel && !cryptoCtx.channels[channel]) cryptoCtx.channels[channel] = createChannel(channel).pub;
     client.retarget({ url: host ? url : undefined, keys: nextKeys, name });
+    // Sessions spawned after this resolve the persisted url/name to nextKey —
+    // re-key so they reuse this retargeted client instead of a second socket.
+    const nextKey = (name ? defaultKeyPath(name) : settings.keyPath) + '|' + settings.url;
+    if (shared !== undefined && nextKey !== shared.key) {
+      if (sharedClients.get(shared.key) === shared) sharedClients.delete(shared.key);
+      shared.key = nextKey;
+      sharedClients.set(nextKey, shared);
+    }
     renderStatus('connecting…');
     return { ok: true, url: settings.url, name: settings.name ?? client.agentId, agentId: client.agentId, channels: Object.keys(cryptoCtx.channels) };
   };
@@ -534,14 +567,53 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       return out;
     },
   });
+  ctx.registerCommand?.('dap_status', {
+    description: '/dap_status — own DAP connection status (agentId, name, hub url, channels, welcome/hello counts)',
+    handler: (_args: string, cmdCtx?: CommandCtx): string => {
+      const out = JSON.stringify(statusPayload());
+      cmdCtx?.ui?.notify(out, 'info');
+      return out;
+    },
+  });
+  ctx.registerCommand?.('dap_peers', {
+    description: '/dap_peers [all] — agents on the hub (online only by default; pass "all" to include offline)',
+    handler: (args: string, cmdCtx?: CommandCtx): string => {
+      const down = requireConnected();
+      if (down) {
+        cmdCtx?.ui?.notify(down.error, 'error');
+        return down.error;
+      }
+      const includeOffline = args.trim().toLowerCase() === 'all';
+      void client
+        .presence()
+        .then((agents) => {
+          const rows = (includeOffline ? agents : agents.filter((a) => a.online))
+            .map((a) => `${a.online ? 'on' : 'off'} ${a.agentId}${a.name ? ' ' + a.name : ''}`)
+            .join('\n');
+          const out = rows || 'no agents online';
+          cmdCtx?.ui?.notify(out, 'info');
+        })
+        .catch((err: unknown) => cmdCtx?.ui?.notify(`peers failed: ${String(err)}`, 'error'));
+      // omp discards handler return values — the verdict goes through the UI.
+      return includeOffline ? 'listing all agents…' : 'listing online agents…';
+    },
+  });
   const dispose = (): void => {
     if (pollerHandle !== undefined) pollerCtx?.clearTimer(pollerHandle);
     pollerHandle = undefined;
+    if (shared === undefined) {
+      client.stop();
+      return;
+    }
+    if (--shared.refs > 0) return; // another session still holds this client
+    // Last session out: stop the socket; reclaim only the map slot we own
+    // (a retarget may have re-keyed it to a fresh identity).
+    if (sharedClients.get(shared.key) === shared) sharedClients.delete(shared.key);
     client.stop();
   };
   // Clean exit: closing the socket lets the hub deregister immediately
   // (identity + mailbox survive for offline DMs).
   ctx.on('session_shutdown', dispose);
-  client.connect();
+  if (created) client.connect(); // a reused client is already connected
   return { client, inbox, dispose };
 }
