@@ -7,7 +7,7 @@ import dapExtension, { type DapExtension } from '../src/index.ts';
 import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.ts';
 import { persistDapConfig, readDapConfig, resolveDapSettings } from '../src/config.ts';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.ts';
-import type { DapClient, MsgFrame, Timers } from '../src/conn.ts';
+import { DapClient, type MsgFrame, type Timers } from '../src/conn.ts';
 import type { CommandCtx, ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.ts';
 import { FakeHub } from './fake-hub.ts';
 
@@ -297,6 +297,50 @@ test('backoff doubles 1s..30s cap against a dead endpoint (no real sleeps)', asy
     assert.deepEqual(ext.client.backoffSchedule, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
   } finally {
     ext.dispose();
+  }
+});
+
+test('retarget does not self-evict: stale socket close is inert (the /dap host name bug)', async () => {
+  const hub = await new FakeHub().listen();
+  // Reconnect-interval capture: after retarget settles, NOTHING may be scheduled
+  // (the bug scheduled a reconnect from the old socket's late 'close' event).
+  const scheduled: { fn: () => void }[] = [];
+  const timers: Timers = {
+    setInterval: (fn) => {
+      const t = { fn };
+      scheduled.push(t);
+      return t;
+    },
+    clearInterval: (h) => {
+      const i = scheduled.indexOf(h as { fn: () => void });
+      if (i >= 0) scheduled.splice(i, 1);
+    },
+  };
+  const client = new DapClient({
+    url: hub.url,
+    keys: loadOrCreateKeys(nextKeyPath()),
+    name: 'original',
+    timers,
+  });
+  try {
+    client.connect();
+    await eventCountAtLeast(client, 'welcome', 1);
+
+    client.retarget({ keys: loadOrCreateKeys(nextKeyPath()), name: 'renamed' });
+    await eventCountAtLeast(client, 'welcome', 2);
+    await microtasksSettled();
+    await microtasksSettled(); // the old socket's async 'close' must have landed by now
+
+    assert.equal(client.welcomeCount, 2);
+    assert.equal(client.helloCount, 2, 'exactly the two real connects helloed');
+    assert.ok(!hub.log.some((l) => l.startsWith('evict:')), 'no self-eviction: ' + hub.log.join(' | '));
+    assert.equal(scheduled.length, 0, 'stale close schedules no reconnect');
+    assert.equal(client.connected, true, 'stale close did not clobber live state');
+    const agents = await client.presence(); // the user-visible symptom was this timing out
+    assert.ok(agents.some((a) => a.agentId === client.agentId && a.name === 'renamed'), 'renamed agent online');
+  } finally {
+    client.stop();
+    await hub.close();
   }
 });
 
@@ -926,18 +970,30 @@ test('dap_status: identity + connection state the agent can read about itself', 
   }
 });
 
-test('dap_peers: presence lists every agent including self', async () => {
+test('dap_peers: lists only other online agents — self and offline excluded', async () => {
   const hub = await new FakeHub().listen();
-  const cap = fakeCtx();
-  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'peer-a' });
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const c = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'peer-a' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'peer-b' });
+  const extC = dapExtension(c.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'gone-c' });
   try {
-    await nextEvent(ext.client, 'welcome');
-    const r = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(cap, 'dap_peers');
-    const self = r.agents.find((a) => a.agentId === ext.client.agentId);
-    assert.ok(self, 'own agentId present in presence');
-    assert.equal(self.online, true);
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    await nextEvent(extC.client, 'welcome');
+    hub.drop(extC.client.agentId);
+    await hub.waitOffline(extC.client.agentId);
+
+    const r = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(a, 'dap_peers');
+    assert.ok(r.agents.some((x) => x.agentId === extB.client.agentId), 'other online agent listed');
+    assert.ok(!r.agents.some((x) => x.agentId === extA.client.agentId), 'self never listed');
+    assert.ok(!r.agents.some((x) => x.agentId === extC.client.agentId), 'offline agent excluded');
+    assert.ok(r.agents.every((x) => x.online === true), 'all entries online');
   } finally {
-    ext.dispose();
+    extA.dispose();
+    extB.dispose();
+    extC.dispose();
     await hub.close();
   }
 });
@@ -978,35 +1034,6 @@ test('footer status line: persistent connection info visible without asking', as
   }
 });
 
-test('dap_peers: online-only by default, includeOffline lists everyone', async () => {
-  const hub = await new FakeHub().listen();
-  const a = fakeCtx();
-  const b = fakeCtx();
-  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'online-a' });
-  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'gone-b' });
-  try {
-    await nextEvent(extA.client, 'welcome');
-    await nextEvent(extB.client, 'welcome');
-    hub.drop(extB.client.agentId);
-    await hub.waitOffline(extB.client.agentId);
-
-    const online = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(a, 'dap_peers');
-    assert.ok(online.agents.some((x) => x.agentId === extA.client.agentId), 'self listed');
-    assert.ok(!online.agents.some((x) => x.agentId === extB.client.agentId), 'offline agent hidden by default');
-    assert.ok(online.agents.every((x) => x.online === true), 'all entries online');
-
-    const all = await run<{ agents: string[] }>(a, 'dap_peers', { includeOffline: true });
-    assert.ok(
-      (all.agents as unknown as Array<{ agentId: string }>).some((x) => x.agentId === extB.client.agentId),
-      'includeOffline:true lists the offline agent',
-    );
-  } finally {
-    extA.dispose();
-    extB.dispose();
-    await hub.close();
-  }
-});
-
 test('dap_connect: retargets to another hub, renames identity, persists config + default room', async () => {
   const hub1 = await new FakeHub().listen();
   const hub2 = await new FakeHub().listen();
@@ -1031,9 +1058,12 @@ test('dap_connect: retargets to another hub, renames identity, persists config +
     assert.equal(saved.url, hub2.url, 'config persisted to DAP_CONFIG_FILE path, not ~/.dap');
     assert.equal(saved.name, 'renamed');
     assert.ok(saved.channels?.includes('lobby'), 'default room persisted');
-    const w2 = nextEvent(ext.client, 'welcome');
-    await w2; // connected to the SECOND hub
+    await nextEvent(ext.client, 'welcome'); // connected to the SECOND hub
     assert.equal(ext.client.welcomeCount, 2);
+    // The lobby join is sent from the welcome handler; its reply lands one wire
+    // round later. (The pre-guard suite passed here on a STALE 'joined' emitted
+    // by the superseded hub1 socket — exactly the bug the socket guards fix.)
+    await eventCountAtLeast(ext.client, 'joined', 1);
     assert.ok(ext.client.eventCount('joined') >= 1, 'lobby joined after connect');
   } finally {
     if (prevCfgEnv === undefined) delete process.env.DAP_CONFIG_FILE;
@@ -1083,15 +1113,18 @@ test('per-process singleton: second session reuses the client (no eviction war)'
   }
 });
 
-test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers notify rows (online default, all includes offline)', async () => {
+test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers notify rows (online only, self excluded)', async () => {
   const hub = await new FakeHub().listen();
   const a = fakeCtx();
   const b = fakeCtx();
+  const c = fakeCtx();
   const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'alice' });
   const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'bob' });
+  const extC = dapExtension(c.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'carol' });
   try {
     await nextEvent(extA.client, 'welcome');
     await nextEvent(extB.client, 'welcome');
+    await nextEvent(extC.client, 'welcome');
     hub.drop(extB.client.agentId);
     await hub.waitOffline(extB.client.agentId);
 
@@ -1109,17 +1142,13 @@ test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers n
     assert.match(command(a, 'dap_peers').handler('', cmdCtx) as string, /listing online agents…/);
     await presenceA;
     await microtasksSettled(); // the notify rides a microtask after the presence emission
-    assert.ok(notified.at(-1)!.includes('on ' + extA.client.agentId + ' alice'), 'online row notified: ' + notified.at(-1));
-    assert.ok(!notified.at(-1)!.includes(extB.client.agentId), 'offline agent hidden by default');
-
-    const presenceAll = nextEvent(extA.client, 'presence');
-    assert.match(command(a, 'dap_peers').handler('all', cmdCtx) as string, /listing all agents…/);
-    await presenceAll;
-    await microtasksSettled();
-    assert.ok(notified.at(-1)!.includes('off ' + extB.client.agentId + ' bob'), 'all includes the offline agent: ' + notified.at(-1));
+    assert.ok(notified.at(-1)!.includes('on ' + extC.client.agentId + ' carol'), 'other online row notified: ' + notified.at(-1));
+    assert.ok(!notified.at(-1)!.includes(extA.client.agentId), 'self excluded from notify');
+    assert.ok(!notified.at(-1)!.includes(extB.client.agentId), 'offline agent excluded from notify');
   } finally {
     extA.dispose();
     extB.dispose();
+    extC.dispose();
     await hub.close();
   }
 });

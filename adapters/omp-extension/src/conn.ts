@@ -107,11 +107,24 @@ export class DapClient {
     this.ws = ws;
     ws.on('error', () => {}); // 'close' always follows; schedule from there
     ws.on('open', () => {
+      if (this.ws !== ws) {
+        // stale socket: superseded by retarget/reconnect; its replacement owns
+        // the state now. Drop it unauthenticated — it must never hello: an
+        // orphan hello would evict the live socket at the hub.
+        ws.close();
+        return;
+      }
       this.watchdog.start(ws); // refresh while idle; terminate a dead conn
       this.sendHello();
     });
-    ws.on('message', (data) => this.handleFrame(data.toString()));
-    ws.on('close', () => this.onClose());
+    ws.on('message', (data) => {
+      if (this.ws !== ws) return; // stale socket: superseded by retarget/reconnect
+      this.handleFrame(data.toString());
+    });
+    ws.on('close', () => {
+      if (this.ws !== ws) return; // stale socket: superseded by retarget/reconnect
+      this.onClose();
+    });
   }
 
   /** Runtime retarget (dap_connect): stop everything, swap url and/or
@@ -121,8 +134,13 @@ export class DapClient {
     if (this.timer !== undefined) this.timers.clearInterval(this.timer);
     this.timer = undefined;
     this.watchdog.stop();
-    this.ws?.close();
+    // Detach BEFORE closing: ws dispatches 'close' synchronously inside
+    // .close() in some states, and the socket-identity guard must already
+    // see this socket as stale — else onClose runs mid-retarget and arms a
+    // spurious reconnect (observed live: one self-evict per /dap retarget).
+    const old = this.ws;
     this.ws = undefined;
+    old?.close();
     this.connected = false;
     this.stopped = false; // connect() again after the implicit stop
     if (next.url) this.opts.url = next.url;

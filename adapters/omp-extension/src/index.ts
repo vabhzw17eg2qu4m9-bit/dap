@@ -439,14 +439,10 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_peers',
-    description: 'Agents on the hub, ONLINE ONLY by default (id, name, lastSeen). Discover agentIds here — they are 16-hex ids, never names. Set includeOffline:true to also list offline agents (their DMs queue to the hub mailbox).',
-    parameters: {
-      type: 'object',
-      properties: { includeOffline: { type: 'boolean', description: 'Also list offline agents (default false)' } },
-    },
-    execute: async (_toolCallId, params) => {
-      const all = await client.presence();
-      const agents = params.includeOffline === true ? all : all.filter((a) => a.online);
+    description: 'Agents on the hub: ONLINE agents only, excluding this agent itself. Discover agentIds here — they are 16-hex ids, never names.',
+    parameters: { type: 'object', properties: {} },
+    execute: async () => {
+      const agents = (await client.presence()).filter((a) => a.online && a.agentId !== client.agentId);
       return toolResult({ agents });
     },
   });
@@ -576,18 +572,18 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
   ctx.registerCommand?.('dap_peers', {
-    description: '/dap_peers [all] — agents on the hub (online only by default; pass "all" to include offline)',
-    handler: (args: string, cmdCtx?: CommandCtx): string => {
+    description: '/dap_peers — online agents on the hub (excluding this agent)',
+    handler: (_args: string, cmdCtx?: CommandCtx): string => {
       const down = requireConnected();
       if (down) {
         cmdCtx?.ui?.notify(down.error, 'error');
         return down.error;
       }
-      const includeOffline = args.trim().toLowerCase() === 'all';
       void client
         .presence()
         .then((agents) => {
-          const rows = (includeOffline ? agents : agents.filter((a) => a.online))
+          const rows = agents
+            .filter((a) => a.online && a.agentId !== client.agentId)
             .map((a) => `${a.online ? 'on' : 'off'} ${a.agentId}${a.name ? ' ' + a.name : ''}`)
             .join('\n');
           const out = rows || 'no agents online';
@@ -595,7 +591,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
         })
         .catch((err: unknown) => cmdCtx?.ui?.notify(`peers failed: ${String(err)}`, 'error'));
       // omp discards handler return values — the verdict goes through the UI.
-      return includeOffline ? 'listing all agents…' : 'listing online agents…';
+      return 'listing online agents…';
     },
   });
   const dispose = (): void => {
