@@ -126,7 +126,7 @@ export class DapClient {
   private readonly maxMs: number;
   private readonly inboxMsgs: MsgEvent[] = [];
   private readonly known = new Map<string, AgentInfo>();
-  private readonly whoisWaiters = new Map<string, ((info: AgentInfo | undefined) => void)[]>();
+  private readonly whoisWaiters = new Map<string, ((info: AgentInfo | undefined, err?: Error) => void)[]>();
   private readonly readyWaiters: (() => void)[] = [];
   /** True when channel keys persist to opts.channelsFile (no explicit list). */
   private readonly useChannelFile: boolean;
@@ -171,6 +171,7 @@ export class DapClient {
 
   stop(): void {
     this.stopped = true;
+    this.failWhoisWaiters('whois: client stopped'); // the close guard below skips onDisconnect for a retired socket
     this.watchdog.stop();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.ws?.close();
@@ -188,11 +189,10 @@ export class DapClient {
     this.ws = null;
     this.welcomed = false;
     this.stopped = false; // connect() again after the implicit stop
+    this.failWhoisWaiters('whois: retargeted — the retired socket can never answer');
     if (next.url) this.opts.url = next.url;
-    if (next.keyPath) {
-      this.id = loadIdentity(next.keyPath);
-      this.known.clear();
-    }
+    if (next.keyPath) this.id = loadIdentity(next.keyPath);
+    this.known.clear(); // other hub and/or other identity: registry cache is stale
     if (next.name !== undefined) this.opts.name = next.name;
     this.delay = this.initialMs;
     this.connect();
@@ -352,6 +352,7 @@ export class DapClient {
       if (this.ws === ws) this.onDisconnect();
     });
     ws.on('error', (err) => {
+      if (this.ws !== ws) return; // stale socket: retired by stop()/retarget()
       this.lastError = String(err);
     }); // close always follows
   }
@@ -404,14 +405,19 @@ export class DapClient {
    *  whois they answer fails fast instead of hanging forever. */
   private onHubErrorFrame(frame: dap.Frame): void {
     this.lastError = `hub error ${frame.code}: ${frame.msg}`;
-    const event: HubErrorEvent = { code: String(frame.code), msg: String(frame.msg), ts: Date.now() };
-    this.errorRing.push(event);
-    if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
-    this.opts.onHubError?.(event);
+    this.surfaceError(String(frame.code), String(frame.msg));
     if (frame.code === 'unknown_agent') {
       for (const resolves of this.whoisWaiters.values()) for (const r of resolves) r(undefined);
       this.whoisWaiters.clear();
     }
+  }
+
+  /** One surfaced hub-side failure: bounded ring (drained by dap_inbox) + host hook. */
+  private surfaceError(code: string, msg: string): void {
+    const event: HubErrorEvent = { code, msg, ts: Date.now() };
+    this.errorRing.push(event);
+    if (this.errorRing.length > ERRORS_CAP) this.errorRing.shift();
+    this.opts.onHubError?.(event);
   }
 
   private onWelcome(): void {
@@ -429,6 +435,7 @@ export class DapClient {
   private onDisconnect(): void {
     this.watchdog.stop();
     this.welcomed = false;
+    this.failWhoisWaiters('whois: hub connection closed');
     if (this.stopped) return;
     const wait = this.delay;
     this.delay = Math.min(this.delay * 2, this.maxMs);
@@ -452,15 +459,34 @@ export class DapClient {
   private agentInfo(agentId: string): Promise<AgentInfo> {
     const cached = this.known.get(agentId);
     if (cached) return Promise.resolve(cached);
-    const { promise, resolve } = Promise.withResolvers<AgentInfo | undefined>();
+    const { promise, resolve, reject } = Promise.withResolvers<AgentInfo | undefined>();
     const list = this.whoisWaiters.get(agentId) ?? [];
-    list.push(resolve);
+    const done = (info?: AgentInfo, err?: Error): void => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(info);
+    };
+    const timer = setTimeout(() => {
+      const i = list.indexOf(done);
+      if (i >= 0) list.splice(i, 1);
+      reject(new Error(`whois ${agentId}: hub did not reply`));
+    }, READY_TIMEOUT_MS);
+    list.push(done);
     this.whoisWaiters.set(agentId, list);
     this.ws?.send(JSON.stringify({ op: 'whois', agentId }));
     return promise.then((info) => {
       if (!info) throw new Error(`unknown_agent: ${agentId}`);
       return info;
     });
+  }
+
+  /** Pending whois never outlives its socket: close/retarget/stop fail every
+   *  waiter so dm()/whois() error out instead of hanging on a retired socket. */
+  private failWhoisWaiters(reason: string): void {
+    if (this.whoisWaiters.size === 0) return;
+    const err = new Error(reason);
+    for (const resolves of this.whoisWaiters.values()) for (const r of resolves) r(undefined, err);
+    this.whoisWaiters.clear();
   }
 
   private async onMsg(frame: dap.Frame): Promise<void> {
@@ -478,6 +504,7 @@ export class DapClient {
       this.opts.onMessage?.(ev);
     } catch (err) {
       this.lastError = `undecryptable msg: ${String(err)}`;
+      this.surfaceError('undecryptable', String(err)); // ring + hook: visible via dap_inbox
     }
   }
 

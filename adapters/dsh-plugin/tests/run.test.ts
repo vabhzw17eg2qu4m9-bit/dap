@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, statSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -695,6 +696,91 @@ test('error surfacing: hub error frame -> followup notice + dap_inbox errors', a
     const again = (await inbox.execute({})) as { errors: unknown[] };
     assert.deepEqual(again.errors, []);
   } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('undecryptable inbound msg surfaces via followup + dap_inbox errors (never silent)', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    // A DM-shaped frame whose ciphertext cannot open (tampered/wrong key):
+    // it must ride the same surfacing path as hub error frames.
+    hub.send({ op: 'msg', to: hub.pluginAgentId, from: hub.peerId, id: randomUUID(), ts: Date.now(), ciphertext: 'not-a-valid-seal' });
+    await until(() => fc.followups.some((t) => t.includes('undecryptable')));
+    const inbox = (await tool(fc, 'dap_inbox').execute({})) as { messages: unknown[]; errors: Array<{ code: string; msg: string }> };
+    assert.equal(inbox.errors.length, 1);
+    assert.equal(inbox.errors[0].code, 'undecryptable');
+    assert.ok(inbox.errors[0].msg.length > 0, 'carries the decrypt failure');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('url-only retarget clears cached peer keys: the hub-A entry never decrypts hub-B traffic', async () => {
+  const hub1 = await new FakeHub().start();
+  const hub2 = await new FakeHub().start();
+  const dir = tmpDir('dsh-stale');
+  const fc = fakeCtx();
+  const client = plugin.apply(fc.ctx, {
+    url: hub1.url,
+    keyPath: join(dir, 'a.key'),
+    channelsFile: join(dir, 'channels.json'),
+    backoff: { initialMs: 10, maxMs: 40 },
+  });
+  try {
+    await hub1.waitFor((f) => f.op === 'flush');
+    // Poison the registry cache from hub A: it answers unknown ids with OUR
+    // keys, so `known` now holds a wrong x25519 key under hub B's peer id.
+    const targetId = hub2.peerId;
+    await client.whois(targetId);
+    // URL-only retarget (dap_connect <host>, no name => keyPath: undefined).
+    await tool(fc, 'dap_connect').execute({ host: hub2.url.replace(/^ws:\/\//, '') });
+    await hub2.waitFor((f) => f.op === 'flush');
+    assert.equal(hub2.pluginAgentId, client.agentId, 'same identity, new hub');
+    // A peer DM on hub B must decrypt with the fresh registry, not the cache.
+    hub2.pushDm('fresh-hub ping');
+    await until(() => fc.followups.some((t) => t.includes('fresh-hub ping')));
+    const inbox = (await tool(fc, 'dap_inbox').execute({})) as {
+      messages: Array<{ text: string }>;
+      errors: Array<{ code: string }>;
+    };
+    assert.ok(inbox.messages.some((m) => m.text === 'fresh-hub ping'), 'decrypted via the hub-B key');
+    assert.deepEqual(inbox.errors, [], 'no undecryptable fallback');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub1.stop();
+    await hub2.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('whois/agentInfo fails bounded when the hub never answers (dm/whois cannot hang forever)', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  const client = plugin.apply(fc.ctx, {
+    url: hub.url,
+    keyPath: tmpKeyPath(),
+    channels: channelConfig(hub),
+    backoff: { initialMs: 10, maxMs: 40 },
+  });
+  let arm: NodeJS.Timeout | undefined;
+  try {
+    await hub.waitFor((f) => f.op === 'flush');
+    hub.answerWhois = false; // retired/silent socket: the whois reply never comes
+    // Watchdog race: the bounded wait must reject on its own — a hang fails
+    // the test outright instead of stalling the suite. Real timer needed:
+    // the 5s bound lives inside client.ts and this node:test suite has no
+    // fake-timer seam (integration case against the platform clock).
+    const hung = new Promise<never>((_, reject) => {
+      arm = setTimeout(() => reject(new Error('whois hung: agentInfo must fail bounded')), 8_000);
+    });
+    await assert.rejects(Promise.race([client.whois(hub.peerId), hung]), /hub did not reply/);
+  } finally {
+    clearTimeout(arm);
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
   }

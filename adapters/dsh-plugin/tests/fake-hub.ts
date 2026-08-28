@@ -27,6 +27,8 @@ export class FakeHub {
   /** channel -> registered chanPubkey (b64); first joiner creates (hub law). */
   readonly chanPubkeys = new Map<string, string>();
   hellos = 0;
+  /** Test switch: drop whois queries on the floor (bounded-wait tests). */
+  answerWhois = true;
   private wss = new WebSocketServer({ port: 0 });
   private agents = new Map<string, HubAgent>();
   private lastAgentId = '';
@@ -110,6 +112,7 @@ export class FakeHub {
   }
 
   private onWhois(frame: dap.Frame, ws: WebSocket): void {
+    if (!this.answerWhois) return;
     const q = String(frame.agentId);
     const isPeer = q === this.peerId;
     const known = this.agents.get(q);
