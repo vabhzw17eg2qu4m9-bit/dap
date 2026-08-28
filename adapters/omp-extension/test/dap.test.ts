@@ -1078,6 +1078,53 @@ test('/dap re-key stays live: status id, inbound AAD, outbound keys all follow t
   }
 });
 
+test('re-key then host-only retarget: a fresh session reuses the shared client (no second socket)', async () => {
+  const hub = await new FakeHub().listen();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-share-'));
+  const prevHome = process.env.HOME;
+  const prevUrl = process.env.DAP_HUB_URL;
+  // Production-faithful: no DAP_CONFIG_FILE — settings AND persistence both
+  // use ~/.dap/config.json under the tmp HOME.
+  process.env.HOME = home; // hostname-key and name-key both resolve under tmp
+  process.env.DAP_HUB_URL = hub.url;
+  const a = fakeCtx();
+  const extA = dapExtension(a.ctx); // production path: shared client, no overrides
+  let extB: DapExtension | undefined;
+  try {
+    await nextEvent(extA.client, 'welcome');
+    const oldId = extA.client.agentId;
+
+    await run(a, 'dap_connect', { host: `127.0.0.1:${hub.port}`, name: 'swapped' });
+    await eventCountAtLeast(extA.client, 'welcome', 2);
+    const newId = extA.client.agentId;
+
+    // Host-only retarget on the re-keyed client: the shared-client key must
+    // follow the NEW identity path, else a fresh session computes a
+    // different shareKey and spawns a second socket under the OLD identity.
+    await run(a, 'dap_connect', { host: `127.0.0.1:${hub.port}` });
+    await microtasksSettled();
+    await microtasksSettled();
+
+    const b = fakeCtx();
+    extB = dapExtension(b.ctx); // fresh session: resolves persisted name → swapped-key path
+    await microtasksSettled();
+    await microtasksSettled();
+    assert.equal(extB.client, extA.client, 'fresh session reuses the retargeted shared client');
+    const newIdHellos = hub.log.filter((l) => l === 'hello-verified:' + newId).length;
+    assert.equal(newIdHellos, 1, 'exactly one connection under the new identity (got ' + newIdHellos + ')');
+    const oldIdHellos = hub.log.filter((l) => l === 'hello-verified:' + oldId).length;
+    assert.equal(oldIdHellos, 1, 'the old identity never reconnects');
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevUrl === undefined) delete process.env.DAP_HUB_URL;
+    else process.env.DAP_HUB_URL = prevUrl;
+    extB?.dispose();
+    extA.dispose();
+    await hub.close();
+  }
+});
+
 test('footer status line: persistent connection info visible without asking', async () => {
   const hub = await new FakeHub().listen();
   const cap = fakeCtx();

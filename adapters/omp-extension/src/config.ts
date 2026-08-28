@@ -27,7 +27,7 @@ export const optStr = (v: unknown): string | undefined => (typeof v === 'string'
 
 /** Read ~/.dap/config.json; a missing or invalid file counts as absent.
  *  `invites` is normalized to [] (files written before the key lack it). */
-export function readDapConfig(file = path.join(os.homedir(), '.dap', 'config.json')): DapFileConfig {
+export function readDapConfig(file = optStr(process.env.DAP_CONFIG_FILE) ?? path.join(os.homedir(), '.dap', 'config.json')): DapFileConfig {
   try {
     const cfg = JSON.parse(fs.readFileSync(file, 'utf8')) as DapFileConfig;
     return { ...cfg, invites: Array.isArray(cfg.invites) ? cfg.invites : [] };
@@ -42,7 +42,7 @@ export function readDapConfig(file = path.join(os.homedir(), '.dap', 'config.jso
  *  authoritative list — delivered entries are removed by the caller. */
 export function persistDapConfig(
   update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
-  file = path.join(os.homedir(), '.dap', 'config.json'),
+  file = optStr(process.env.DAP_CONFIG_FILE) ?? path.join(os.homedir(), '.dap', 'config.json'),
 ): void {
   const cur = readDapConfig(file);
   const next: DapFileConfig = { ...cur };

@@ -474,7 +474,11 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     let nextKeys: KeyPair | undefined;
     if (name) {
       settings.name = name;
-      nextKeys = loadOrCreateKeys(defaultKeyPath(name));
+      settings.keyPath = defaultKeyPath(name); // a later host-only retarget
+      // must key the shared client by the NEW path — the original
+      // settings.keyPath made a fresh session compute a different shareKey
+      // and spawn a second socket under the OLD identity.
+      nextKeys = loadOrCreateKeys(settings.keyPath);
       keys = nextKeys; // cryptoCtx.keys is a live getter over this binding
     }
     if (host) settings.url = url;
@@ -483,7 +487,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     client.retarget({ url: host ? url : undefined, keys: nextKeys, name });
     // Sessions spawned after this resolve the persisted url/name to nextKey —
     // re-key so they reuse this retargeted client instead of a second socket.
-    const nextKey = (name ? defaultKeyPath(name) : settings.keyPath) + '|' + settings.url;
+    const nextKey = settings.keyPath + '|' + settings.url;
     if (shared !== undefined && nextKey !== shared.key) {
       if (sharedClients.get(shared.key) === shared) sharedClients.delete(shared.key);
       shared.key = nextKey;
