@@ -8,3 +8,4 @@ profile-reports/
 .iterations.jsonl.bak
 *.log
 hub/dap-hub
+dist/

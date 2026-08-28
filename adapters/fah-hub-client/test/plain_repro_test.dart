@@ -64,7 +64,7 @@ void main() {
       () async {
     final dir = await Directory.systemTemp.createTemp('dap_key');
     addTearDown(() => dir.delete(recursive: true));
-    final keyPath = '\${dir.path}/flutter_agent_harness.key';
+    final keyPath = '${dir.path}/flutter_agent_harness.key';
 
     // Real identity on disk, but the stored pub line is some OTHER key.
     await HubIdentity.load(keyPath);
@@ -103,7 +103,7 @@ void main() {
       () async {
     final dir = await Directory.systemTemp.createTemp('dap_rt');
     addTearDown(() => dir.delete(recursive: true));
-    final keyPath = '\${dir.path}/rt.key';
+    final keyPath = '${dir.path}/rt.key';
     final first = await HubIdentity.load(keyPath);
     final second = await HubIdentity.load(keyPath);
     expect(second.agentId, first.agentId);
@@ -114,7 +114,7 @@ void main() {
   test('torn x25519pub line does not break load', () async {
     final dir = await Directory.systemTemp.createTemp('dap_torn');
     addTearDown(() => dir.delete(recursive: true));
-    final keyPath = '\${dir.path}/torn.key';
+    final keyPath = '${dir.path}/torn.key';
     await HubIdentity.load(keyPath);
     final lines = await File(keyPath).readAsLines();
     await File(keyPath).writeAsString([
