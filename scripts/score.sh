@@ -12,13 +12,12 @@ has() { command -v "$1" >/dev/null 2>&1; }
 # --- precompute test results (each heavy command runs once) ---
 GO_OK=0; has go && GO_OK=1
 NPM_OK=0; has npm && NPM_OK=1
-DART_OK=0; has dart && DART_OK=1
 
 hub_build_rc=1
 hub_test_rc=1
 hub_filter_rc=1
 crap_rc=1
-mcp_rc=1; omp_rc=1; dsh_rc=1; fah_rc=1
+mcp_rc=1; omp_rc=1; dsh_rc=1; mcp_tsc_rc=1; omp_tsc_rc=1; dsh_tsc_rc=1
 
 if [ "$GO_OK" = 1 ] && [ -d hub ] && ls hub/*.go >/dev/null 2>&1; then
   (cd hub && timeout 60 go build ./... >/dev/null 2>&1); hub_build_rc=$?
@@ -41,11 +40,13 @@ npm_dir_test adapters/mcp-bridge; mcp_rc=$?
 npm_dir_test adapters/omp-extension; omp_rc=$?
 npm_dir_test adapters/dsh-plugin;     dsh_rc=$?
 [ "$NPM_OK" = 0 ] && NOTES+=("npm toolchain missing")
-if [ "$DART_OK" = 1 ] && [ -f adapters/fah-hub-client/pubspec.yaml ]; then
-  (cd adapters/fah-hub-client && timeout 180 dart test >/dev/null 2>&1); fah_rc=$?
-else
-  [ "$DART_OK" = 0 ] && NOTES+=("dart toolchain missing")
-fi
+tsc_check() { # dir -> rc via npx tsc --noEmit
+  [ "$NPM_OK" = 1 ] && [ -f "$1/tsconfig.json" ] \
+    && (cd "$1" && timeout 60 npx tsc --noEmit >/dev/null 2>&1)
+}
+tsc_check adapters/mcp-bridge;    mcp_tsc_rc=$?
+tsc_check adapters/omp-extension; omp_tsc_rc=$?
+tsc_check adapters/dsh-plugin;    dsh_tsc_rc=$?
 
 # site link integrity: every local href/src in site/**/*.html resolves to a file
 site_links_rc=1
@@ -97,8 +98,9 @@ if [ "$omp_rc" = 0 ] && grep -rq 'registerTool' adapters/omp-extension/src 2>/de
   && grep -rq 'setInterval' adapters/omp-extension/src 2>/dev/null; then
   R[c9_omp_extension]=pass; else R[c9_omp_extension]=fail; fi
 
-# c10: flutter_agent_harness hub client — dart test green
-[ "$fah_rc" = 0 ] && R[c10_fah_tests]=pass || R[c10_fah_tests]=fail
+# c10: TS adapters typecheck — npx tsc --noEmit clean in mcp-bridge, omp-extension, dsh-plugin
+if [ "$mcp_tsc_rc" = 0 ] && [ "$omp_tsc_rc" = 0 ] && [ "$dsh_tsc_rc" = 0 ]; then
+  R[c10_ts_typecheck]=pass; else R[c10_ts_typecheck]=fail; fi
 
 # c11: deepseek-harness plugin — suite green + uses ctx.tools.register
 if [ "$dsh_rc" = 0 ] && grep -rq 'ctx.tools.register\|ctx\.tools\.register' adapters/dsh-plugin/src 2>/dev/null; then
@@ -144,18 +146,17 @@ if [ "$mcp_rc" = 0 ] && grep -qi 'glossary' docs/protocol.md 2>/dev/null \
 zero_config_ok() { # <src-dir> <test-dir> <suite-rc>
   [ "$3" = 0 ] || return 1
   grep -rqE 'dap_invite|inviteTo' "$1" 2>/dev/null || return 1
-  grep -rqE 'defaultKeyPath|keys/fah' "$1" 2>/dev/null || return 1
+  grep -rqE 'defaultKeyPath' "$1" 2>/dev/null || return 1
   grep -rqE 'newChannelKeypair|ChannelStore' "$1" 2>/dev/null || return 1
   grep -rqE 'invite|zero.?config|auto.?keygen' "$2" 2>/dev/null || return 1
 }
 if zero_config_ok adapters/omp-extension/src adapters/omp-extension/test "$omp_rc" \
   && zero_config_ok adapters/mcp-bridge/src adapters/mcp-bridge/tests "$mcp_rc" \
-  && zero_config_ok adapters/dsh-plugin/src adapters/dsh-plugin/tests "$dsh_rc" \
-  && zero_config_ok adapters/fah-hub-client/lib adapters/fah-hub-client/test "$fah_rc"; then
+  && zero_config_ok adapters/dsh-plugin/src adapters/dsh-plugin/tests "$dsh_rc"; then
   R[c18_zero_config]=pass; else R[c18_zero_config]=fail; fi
 
 # --- JSON output ---
-ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_fah_tests c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links c17_min_token_protocol c18_zero_config"
+ORDER="c1_hub_build c2_crypto_tests c3_routing_tests c4_presence_tests c5_crap_gate c6_deploy_artifacts c7_mcp_tests c8_mcp_conformance c9_omp_extension c10_ts_typecheck c11_dsh_plugin c12_authoring_doc c13_protocol_doc c14_research_doc c15_site_content c16_site_links c17_min_token_protocol c18_zero_config"
 score=0
 parts=""
 for k in $ORDER; do

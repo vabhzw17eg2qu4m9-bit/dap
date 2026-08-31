@@ -5,7 +5,7 @@
 [![CRAP max 12](https://img.shields.io/badge/CRAP%20max-12-brightgreen)](https://github.com/vabhzw17eg2qu4m9-bit/crap4go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-informational)](LICENSE)
 
-dap is a self-hosted Go hub for distributed agents: it relays end-to-end-encrypted, pubkey-ACL'd channels (DM and presence included) between four agent-harness adapters — the omp extension, the MCP bridge, the deepseek-harness plugin, and the flutter_agent_harness client. The wire contract lives in [docs/protocol.md](docs/protocol.md).
+dap is a self-hosted Go hub for distributed agents: it relays end-to-end-encrypted, pubkey-ACL'd channels (DM and presence included) between agent-harness adapters — the omp extension, the MCP bridge, and the deepseek-harness plugin ship here, and the flutter_agent_harness client lives in its own repo ([fah_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client), pub.dev: `fah_hub_client`). The wire contract lives in [docs/protocol.md](docs/protocol.md).
 
 ## Run
 
@@ -72,7 +72,7 @@ Prebuilt binaries ship from [GitHub Releases](https://github.com/vabhzw17eg2qu4m
 
 - `go vet ./...` and `go test ./...` must be clean.
 - CRAP complexity ≤ 12, enforced by [crap4go](https://github.com/vabhzw17eg2qu4m9-bit/crap4go) in CI and pre-commit (`git config core.hooksPath .githooks` to activate the hook).
-- Each adapter runs its own suite: `npm test` / `dart test` per adapter.
+- Each adapter runs its own suite (`npm test` per adapter; the extracted fah client runs `dart test` in its own repo).
 
 ## Repo layout
 
@@ -81,7 +81,7 @@ hub/                                 Go hub (module github.com/vabhzw17eg2qu4m9-
 adapters/omp-extension/              omp extension adapter
 adapters/mcp-bridge/                 MCP bridge adapter
 adapters/dsh-plugin/                 deepseek-harness plugin adapter
-adapters/fah-hub-client/             flutter_agent_harness client adapter
+adapters/fah-hub-client.md          pointer: fah client moved to its own repo (pub.dev: fah_hub_client)
 docs/protocol.md                     DAP/1 wire contract
 docs/authoring.md                    authoring guide
 docs/research.md                     research notes

@@ -112,12 +112,12 @@ kimi-code uses its plugin manifest — tools then surface as `mcp__dap__dap_send
 
 The same `mcpServers` entry shape (or `mcp.json` / `.mcp.json`) drops into every other MCP client's config.
 
-### 2.3 fah — flutter_agent_harness (push inbound, upstreamable PR)
+### 2.3 fah — flutter_agent_harness (push inbound; extracted to fah_hub_client)
 
-fah's messaging seam is the `MessagingRepository` interface (`lib/src/messaging/messaging_repository.dart`) — its doc comment invites network implementations. Implement it over the envelope, expose it through a `FahPlugin` (which provides `registerTool` / `registerSlashCommand`, config from `.fah/packages.yaml`), and deliver inbound at the turn boundary via `Agent.externalSteeringSource` (an idle-wake watcher re-opens the loop). Crypto via the `cryptography` package (Ed25519 + X25519 + ChaCha20-Poly1305). Shaped as a PR against IstiN/flutter_agent_harness (`lib/src/hub/`), mirroring the existing A2A phase.
+fah's messaging seam is the `MessagingRepository` interface (`lib/src/messaging/messaging_repository.dart`) — its doc comment invites network implementations. Implement it over the envelope, expose it through a `FahPlugin` (which provides `registerTool` / `registerSlashCommand`, config from `.fah/packages.yaml`), and deliver inbound at the turn boundary via `Agent.externalSteeringSource` (an idle-wake watcher re-opens the loop). Crypto via the `cryptography` package (Ed25519 + X25519 + ChaCha20-Poly1305). Shaped as a PR against IstiN/flutter_agent_harness (`lib/src/hub/`), mirroring the existing A2A phase. A complete implementation ships as its own package: https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client (pub.dev: `fah_hub_client`).
 
 ```dart
-// adapters/fah-hub-client — sketch
+// github.com/vabhzw17eg2qu4m9-bit/fah_hub_client (pub.dev: fah_hub_client) — sketch
 class HubMessagingRepository implements MessagingRepository {
   final DapEnvelope _dap;                                    // 'cryptography' package
   final _messages = StreamController<ChatMessage>.broadcast();

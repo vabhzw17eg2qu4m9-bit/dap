@@ -28,7 +28,7 @@ score = passing_criteria / 18
 | c7 | **MCP bridge tests** | `npm test` in `adapters/mcp-bridge/` green |
 | c8 | **MCP conformance** | tests cover `tools/list` handshake + a live round-trip through a spawned hub binary |
 | c9 | **omp extension** | suite green; `registerTool` + `setInterval` reconnect in `src/` |
-| c10 | **fah hub client** | `dart test` in `adapters/fah-hub-client/` green |
+| c10 | **TS typecheck** | `npx tsc --noEmit` clean in `adapters/mcp-bridge/`, `adapters/omp-extension/`, `adapters/dsh-plugin/` |
 | c11 | **dsh plugin** | suite green; uses `ctx.tools.register` in `src/` |
 | c12 | **Authoring guide** | `docs/authoring.md` covers omp, MCP, fah, dsh paths + envelope contract |
 | c13 | **Protocol spec** | `docs/protocol.md` covers ed25519, x25519, channel, DM |
@@ -36,7 +36,7 @@ score = passing_criteria / 18
 | c15 | **Public site content** | `site/index.html` presents the project: name + what it is, E2E encryption + adapters, quickstart |
 | c16 | **Public site integrity** | every local `href`/`src` in `site/**/*.html` resolves to an existing file |
 | c17 | **Self-developed agent language** | agents develop the language themselves at runtime: two agents negotiate a shared glossary (propose→ack, no human-fixed dictionary), then converse in it; mcp-bridge tests prove (1) comprehension — B expands A's compacted messages correctly using only what they negotiated, (2) ≥50% token/size reduction vs unnegotiated prose across the conversation, (3) round-trip fidelity of the negotiated glossary |
-| c18 | **Zero-config onboarding (every adapter)** | ALL FOUR adapter suites green AND each has: invite tool (`dap_invite`/`inviteTo`), name-derived identity default, channel keygen/persistence, zero-config tests — an agent on any harness needs at most `DAP_AGENT_NAME` |
+| c18 | **Zero-config onboarding (every adapter)** | ALL in-repo adapter suites green AND each has: invite tool (`dap_invite`/`inviteTo`), name-derived identity default, channel keygen/persistence, zero-config tests — an agent on any harness needs at most `DAP_AGENT_NAME` (fah's zero-config lives in its own repo: github.com/vabhzw17eg2qu4m9-bit/fah_hub_client) |
 
 ### Metric Mutability
 
@@ -59,9 +59,9 @@ Stop and report when ANY of:
 
 ## Bootstrap
 
-1. Toolchains: Go ≥ 1.22, Node ≥ 20, Dart ≥ 3; `git config core.hooksPath .githooks`
+1. Toolchains: Go ≥ 1.22, Node ≥ 20; `git config core.hooksPath .githooks`
 2. Build the CRAP gate: `mkdir -p bin .tools && git clone --depth 1 https://github.com/vabhzw17eg2qu4m9-bit/crap4go .tools/crap4go && (cd .tools/crap4go && go build -o ../../bin/crap4go .)`
-3. `npm install` in `adapters/mcp-bridge`, `adapters/omp-extension`, `adapters/dsh-plugin`; `dart pub get` in `adapters/fah-hub-client`
+3. `npm install` in `adapters/mcp-bridge`, `adapters/omp-extension`, `adapters/dsh-plugin`
 4. Record the baseline: run `./scripts/score.sh` — expect 1 (c14 only)
 
 ## Improvement Loop
@@ -120,7 +120,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 |---|---|---|
 | omp extension | c9 | ExtensionAPI: `registerTool` (send/dm/inbox), inbound → `sendMessage` steer injection wakes idle turn, `ctx.setInterval` reconnect, `appendEntry` durable inbox state |
 | omp zero-config UX | c18 | `~/.dap/config.json` (env > file > defaults); identity `~/.dap/keys/<name|hostname>.key` auto 0600; channel keypair auto-keygen + persist on first send; `dap_invite` ships the channel key inside an E2E DM (`{t:chankey}`), recipient auto-persists + auto-joins |
-| fah hub client | c10 | Implement `MessagingRepository` over WSS + `FahPlugin`; `hub:` yaml config section; delivery via `Agent.externalSteeringSource`; add `cryptography` dep for ed25519 — shape as upstreamable PR to IstiN/flutter_agent_harness |
+| TS typecheck (ex-fah) | c10 | fah hub client extracted to https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client (pub.dev: `fah_hub_client`) — its dart/crap4dart/coverage/publish gates live there; c10 now verifies `npx tsc --noEmit` in the three in-repo adapters |
 | dsh plugin | c11 | Cordis `apply(ctx)`: `ctx.tools.register()` + inbound wake via `Agent.followup()`; package as `dsh.bundle` |
 
 ### Docs (c12, c13)
@@ -156,7 +156,7 @@ Commit messages: `[S:N→N] cN-slug: what you did`
 | `hub/**` | Go hub source + tests | Yes |
 | `adapters/mcp-bridge/**` | Universal MCP adapter | Yes |
 | `adapters/omp-extension/**` | omp extension | Yes |
-| `adapters/fah-hub-client/**` | flutter_agent_harness client (PR source) | Yes |
+| `adapters/fah-hub-client.md` | pointer — flutter_agent_harness client moved to github.com/vabhzw17eg2qu4m9-bit/fah_hub_client (pub.dev: `fah_hub_client`) | Yes |
 | `adapters/dsh-plugin/**` | deepseek-harness Cordis plugin | Yes |
 | `site/**` | Public presentation site (static) | Yes |
 | `docs/research.md` | Feasibility study (done) | No — historical record |
