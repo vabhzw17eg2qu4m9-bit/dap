@@ -66,14 +66,18 @@ jobs:
           EOF
 
   binaries:
-    name: Continuous binaries
+    name: Versioned release (binaries)
     runs-on: ubuntu-latest
     needs: quality
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # full history: derive the next semver tag from existing v* tags
 
       - uses: actions/setup-go@v5
         with:
@@ -108,21 +112,34 @@ jobs:
           (cd dist && sha256sum dap-hub_*.tar.gz dap-hub_*.zip > sha256sums.txt)
           ls -lh dist
 
-      - name: Publish rolling release (continuous)
+      - name: Derive next version tag (patch bump)
+        id: version
+        run: |
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -z "$LATEST" ]; then
+            TAG="v0.1.0"
+            echo "No previous tag found — starting at $TAG"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
+            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "$LATEST → $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release ${{ steps.version.outputs.tag }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete continuous --cleanup-tag -y || true
-          gh release create continuous dist/* \
-            --target $GITHUB_SHA \
-            --prerelease \
-            --title "Continuous build" \
+          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
             --notes "Automated build from main@${GITHUB_SHA:0:7}. Binaries: 6 platforms + sha256sums.txt."
 
   docker:
     name: Multi-arch image (ghcr.io)
     runs-on: ubuntu-latest
-    needs: quality
+    needs: [quality, binaries]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       packages: write
@@ -169,5 +186,6 @@ jobs:
           tags: |
             ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest
             ghcr.io/vabhzw17eg2qu4m9-bit/dap:sha-${{ github.sha }}
+            ghcr.io/vabhzw17eg2qu4m9-bit/dap:${{ needs.binaries.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

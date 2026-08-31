@@ -61,7 +61,7 @@ The image is a plain HTTP server on port 8080. Create one ECS/Fargate task defin
 
 ## Binaries
 
-Prebuilt binaries ship from GitHub Releases as the [`continuous`](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases/tag/continuous) prerelease: 6 archives named `dap-hub_<os>_<arch>` for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64, plus `sha256sums.txt`.
+Prebuilt binaries ship from [GitHub Releases](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases). Every push to `main` auto-generates the next semver tag (`vX.Y.Z`, patch bump from `v0.1.0`) and publishes a release with 6 archives named `dap-hub_<os>_<arch>` for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64, plus `sha256sums.txt`. Container image tags track the same version (`:vX.Y.Z`, `:latest`, `:sha-<commit>`).
 
 ## Quality gates
 
