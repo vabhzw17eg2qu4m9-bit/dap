@@ -15,7 +15,7 @@ import WebSocket from 'ws';
 import * as dap from './crypto.js';
 import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog } from './keepalive.js';
 import { loadChannelKeys, parseChankeyInvite, persistChannelKeys } from './channels.js';
-import { persistDapConfig, readDapConfig, type PendingInvite } from './config.js';
+import { optStr, persistDapConfig, readDapConfig, type PendingInvite } from './config.js';
 
 /** A hub `error` frame observed on the wire (unknown_agent, access_denied, …)
  *  — plus locally-detected inbound failures (`undecryptable`), which carry
@@ -137,6 +137,22 @@ const INVITE_POLL_MS = 15_000;
  *  the trailing /ws path from a full hub URL. */
 const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
 
+/** Frozen help text for a 401-rejected dial (identical across adapters). */
+export const DIAL_401_HELP =
+  'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
+
+/** Bearer token for dial auth, resolved fresh per dial: DAP_CLIENT_SECRET env
+ *  > config clientSecret (issued by a previous enrollment) > DAP_MASTER_SECRET
+ *  env (marks the dial enroll-mode) > null — dial headerless; the hub 401s. */
+function resolveAuthToken(): { token: string; enroll: boolean } | null {
+  const client = optStr(process.env.DAP_CLIENT_SECRET);
+  if (client) return { token: client, enroll: false };
+  const persisted = optStr(readDapConfig().clientSecret);
+  if (persisted) return { token: persisted, enroll: false };
+  const master = optStr(process.env.DAP_MASTER_SECRET);
+  return master ? { token: master, enroll: true } : null;
+}
+
 export function loadIdentity(keyPath: string): Identity {
   if (existsSync(keyPath)) {
     const f = JSON.parse(readFileSync(keyPath, 'utf8')) as Record<string, string>;
@@ -190,6 +206,9 @@ export class DapClient {
   private readonly maxMs: number;
   private delay: number;
   private welcomed = false;
+  /** Set per dial that presented the master secret: the issued client secret
+   *  is awaited after welcome ({"t":"enroll"} → {"t":"enrolled","secret"}). */
+  private enrollPending = false;
   private stopped = false;
 
   constructor(opts: ClientOpts) {
@@ -562,14 +581,29 @@ export class DapClient {
 
   private connect(): void {
     if (this.stopped) return;
-    this.ws = new WebSocket(this.opts.url);
+    const auth = resolveAuthToken();
+    this.enrollPending = auth?.enroll === true;
+    this.ws = new WebSocket(this.opts.url, auth ? { headers: { Authorization: `Bearer ${auth.token}` } } : undefined);
+    // A listener here suppresses ws's default error emission, so this handler
+    // owns the non-101 surface: 401 carries the enrollment how-to; close
+    // (terminate) always follows and the reconnect backoff takes over.
+    this.ws.on('unexpected-response', (_req, res) => {
+      const code = res.statusCode ?? 0;
+      this.lastError = code === 401 ? DIAL_401_HELP : `Unexpected server response: ${code}`;
+      if (code === 401) this.ringError({ code: 'unauthorized', msg: DIAL_401_HELP, ts: Date.now() });
+      this.ws?.terminate();
+    });
     this.ws.on('open', () => {
       this.watchdog.start(this.ws!); // refresh while idle; terminate a dead conn
       this.sendHello();
     });
     this.ws.on('message', (data) => this.handleRaw(String(data)));
+    // Post-open socket errors only: a dial-phase 401 already owns lastError
+    // (the terminate here fires a late generic error that must not clobber it).
+    this.ws.on('error', (err) => {
+      if (this.ws?.readyState === WebSocket.OPEN) this.lastError = String(err);
+    }); // close always follows
     this.ws.on('close', () => this.onDisconnect());
-    this.ws.on('error', (err) => { this.lastError = String(err); }); // close always follows
   }
 
   private sendHello(): void {
@@ -595,13 +629,15 @@ export class DapClient {
       this.lastError = 'bad frame (not JSON)';
       return;
     }
-    switch (frame.op) {
+    const kind = frame.op ?? frame.t; // enroll frames speak `t`, DAP frames `op`
+    switch (kind) {
       case 'welcome': this.onWelcome(); break;
       case 'joined': this.onJoined(String(frame.channel)); break;
       case 'agent_info': this.onAgentInfo(frame); break;
       case 'presence': this.onPresence(frame); break;
       case 'msg': void this.onMsg(frame); break;
       case 'error': this.onError(frame); break;
+      case 'enrolled': this.onEnrolled(String(frame.secret ?? '')); break;
       default: break; // flushed: nothing to do
     }
   }
@@ -612,12 +648,22 @@ export class DapClient {
     this.delay = this.initialMs; // backoff resets after a successful welcome
     this.joined.clear(); // hub membership is in-memory: re-join on demand
     this.ws?.send(JSON.stringify({ op: 'flush' })); // drain offline mailbox
+    if (this.enrollPending) this.ws?.send(JSON.stringify({ t: 'enroll' }));
     for (const wake of this.readyWaiters.splice(0)) wake();
     // Membership: join every known channel after each welcome (idempotent;
     // reconnect-safe — the hub's live membership dies with the connection).
     // Join failures surface via the error ring / onHubError, never silently.
     for (const [name, ch] of this.channels) void this.join(name, ch.pub).catch(() => {});
     if (this.opts.invites) this.startInvitePoller(); // restart redelivery
+  }
+
+  /** Enrollment verdict: persist the issued client secret (never logged) for
+   *  every later dial and keep the master-authed connection. */
+  private onEnrolled(secret: string): void {
+    if (!this.enrollPending || !secret) return;
+    this.enrollPending = false;
+    persistDapConfig({ clientSecret: secret });
+    console.error('enrolled: client secret persisted');
   }
 
   private onJoined(channel: string): void {

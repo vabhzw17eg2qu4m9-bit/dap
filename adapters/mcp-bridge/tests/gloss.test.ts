@@ -9,8 +9,9 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DapClient, type MsgEvent } from '../src/client.js';
+import { readDapConfig } from '../src/config.js';
 import { GlossAgent, type ChatEvent } from '../src/gloss.js';
-import { startHub } from './hub.js';
+import { pinMasterAuth, startHub } from './hub.js';
 import { pollUntil } from './util.js';
 
 const HUB = startHub(); // one live hub per test process; reaped in after()
@@ -76,9 +77,13 @@ const LIVE: Fixture[] = []; // every fixture ever booted — after() reaps all, 
 async function boot(): Promise<Fixture> {
   const hub = await HUB;
   const chan = `gloss${++seq}`;
-  const key = (tag: string) => join(mkdtempSync(join(tmpdir(), `dap-gl-${tag}-`)), 'k');
-  const A = new GlossAgent(new DapClient({ url: hub.url, keyPath: key('a'), name: `gl-a-${seq}` }));
-  const B = new GlossAgent(new DapClient({ url: hub.url, keyPath: key('b'), name: `gl-b-${seq}` }));
+  const dirA = mkdtempSync(join(tmpdir(), 'dap-gl-a-'));
+  const dirB = mkdtempSync(join(tmpdir(), 'dap-gl-b-'));
+  const cfgA = join(dirA, 'config.json');
+  const unA = pinMasterAuth(hub, cfgA);
+  const A = new GlossAgent(new DapClient({ url: hub.url, keyPath: join(dirA, 'k'), name: `gl-a-${seq}` }));
+  const B = new GlossAgent(new DapClient({ url: hub.url, keyPath: join(dirB, 'k'), name: `gl-b-${seq}` }));
+  let unB: () => void = () => {};
   const framesA: MsgEvent[] = [];
   const framesB: MsgEvent[] = [];
   const chatsA: ChatEvent[] = [];
@@ -88,12 +93,18 @@ async function boot(): Promise<Fixture> {
   A.onChat((e) => chatsA.push(e));
   B.onChat((e) => chatsB.push(e));
   A.start();
+  await A.client.ready();
+  await pollUntil(() => readDapConfig(cfgA).clientSecret !== undefined, 5000, 20); // A's enrollment persisted
+  unB = pinMasterAuth(hub, join(dirB, 'config.json'));
   B.start();
-  await Promise.all([A.client.ready(), B.client.ready()]);
+  await B.client.ready();
   const ch = await A.client.ensureChannel(chan);
   B.client.addChannel({ name: chan, pub: ch.pub, priv: ch.priv }); // out-of-band key distribution
   await B.client.join(chan, ch.pub);
-  const f: Fixture = { chan, conv: `chan:${chan}`, A, B, framesA, framesB, chatsA, chatsB, stop: () => { A.stop(); B.stop(); } };
+  const f: Fixture = {
+    chan, conv: `chan:${chan}`, A, B, framesA, framesB, chatsA, chatsB,
+    stop: () => { A.stop(); B.stop(); unB(); unA(); },
+  };
   LIVE.push(f);
   return f;
 }

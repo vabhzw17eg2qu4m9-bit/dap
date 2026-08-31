@@ -17,6 +17,8 @@ export interface DapFileConfig {
   channelsFile?: string;
   /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
   channels?: string[];
+  /** Hub-issued client secret (enrollment); the master secret is never persisted. */
+  clientSecret?: string;
   /** Armed invite-by-name entries; removed once delivered. */
   invites?: PendingInvite[];
 }
@@ -41,7 +43,7 @@ export function readDapConfig(file = optStr(process.env.DAP_CONFIG_FILE) ?? path
  *  launch auto-connects with the same identity. `invites` is the
  *  authoritative list — delivered entries are removed by the caller. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string },
   file = optStr(process.env.DAP_CONFIG_FILE) ?? path.join(os.homedir(), '.dap', 'config.json'),
 ): void {
   const cur = readDapConfig(file);
@@ -52,6 +54,7 @@ export function persistDapConfig(
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
   if (update.invites) next.invites = update.invites;
+  if (update.clientSecret) next.clientSecret = update.clientSecret;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }
@@ -61,6 +64,7 @@ export interface SettingsOverrides {
   keyPath?: string;
   name?: string;
   channelsFile?: string;
+  clientSecret?: string;
 }
 
 export interface DapSettings {
@@ -68,6 +72,7 @@ export interface DapSettings {
   keyPath: string;
   name?: string;
   channelsFile: string;
+  clientSecret?: string;
 }
 
 /** Default identity file is derived from the agent name (or hostname):
@@ -87,13 +92,15 @@ export function resolveDapSettings(overrides: SettingsOverrides = {}): DapSettin
   const name = overrides.name ?? optStr(process.env.DAP_AGENT_NAME) ?? file.name;
   return {
     url: overrides.url ?? optStr(process.env.DAP_HUB_URL) ?? file.url ?? DEFAULT_URL,
+    name,
     keyPath:
       overrides.keyPath ?? optStr(process.env.DAP_KEY_PATH) ?? file.keyPath ?? defaultKeyPath(name),
-    name,
     channelsFile:
       overrides.channelsFile ??
       optStr(process.env.DAP_CHANNELS_FILE) ??
       file.channelsFile ??
       path.join(home, '.dap', 'channels.json'),
+    // DAP_CLIENT_SECRET env beats the persisted clientSecret (same chain as url/name).
+    clientSecret: overrides.clientSecret ?? optStr(process.env.DAP_CLIENT_SECRET) ?? file.clientSecret,
   };
 }

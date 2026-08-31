@@ -71,6 +71,8 @@ type client struct {
 	pubkey    string
 	x25519    string
 	name      string
+	auth      authKind // set at the upgrade: master or issued-secret agent
+	boundName string   // authAgent only: the name the secret is bound to
 	// errCode is the error code sent for the op currently being
 	// dispatched; touched only by this client's read-loop goroutine.
 	errCode string
@@ -133,13 +135,16 @@ type hub struct {
 	sendIDs        *sendIDCache
 	handlers       map[string]handlerFunc
 	adminToken     string
+	masterSecret   string
 	storePath      string
+	secretsPath    string
+	secrets        map[string]string // enrolled name → sha256 hex of issued secret
 	log            *log.Logger
 	now            func() int64
 	pingEvery      time.Duration
 }
 
-func newHub(adminToken, storePath string, logOut io.Writer) *hub {
+func newHub(cfg hubConfig, logOut io.Writer) *hub {
 	h := &hub{
 		clients:        map[string]*client{},
 		agents:         map[string]*agentEntry{},
@@ -148,8 +153,11 @@ func newHub(adminToken, storePath string, logOut io.Writer) *hub {
 		mailboxDropped: map[string]bool{},
 		nonces:         newNonceCache(),
 		sendIDs:        newSendIDCache(),
-		adminToken:     adminToken,
-		storePath:      storePath,
+		adminToken:     cfg.AdminToken,
+		masterSecret:   cfg.MasterSecret,
+		storePath:      cfg.StorePath,
+		secretsPath:    cfg.SecretsPath,
+		secrets:        map[string]string{},
 		log:            log.New(logOut, "", log.LstdFlags|log.Lmicroseconds),
 		now:            func() int64 { return time.Now().UnixMilli() },
 		pingEvery:      pingEvery,
@@ -161,18 +169,23 @@ func newHub(adminToken, storePath string, logOut io.Writer) *hub {
 		"join":           h.handleJoin,
 		"send":           h.handleSend,
 		"flush":          h.handleFlush,
+		"enroll":         h.handleEnroll,
 	}
 	return h
 }
 
 // handleWS upgrades, then runs the read loop for the connection's life.
 func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
+	kind, bound, ok := h.wsAuth(w, r)
+	if !ok {
+		return
+	}
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}
 	c.SetReadLimit(2 * maxFrameBytes) // hard DoS cap; protocol check below
-	cl := &client{h: h, conn: c, send: make(chan []byte, sendBuffer), rejectCh: make(chan []byte, 1), closed: make(chan struct{})}
+	cl := &client{h: h, conn: c, send: make(chan []byte, sendBuffer), rejectCh: make(chan []byte, 1), closed: make(chan struct{}), auth: kind, boundName: bound}
 	h.logf("ws_open", "remote", r.RemoteAddr)
 	go h.writePump(cl)
 	h.readLoop(cl, r.Context())
@@ -213,18 +226,19 @@ func (h *hub) dispatch(cl *client, data []byte) {
 		h.logOp(cl, "", "", codeBadFrame)
 		return
 	}
-	if !cl.authed && f.Op != "hello" {
+	op := frameOp(f, raw)
+	if !cl.authed && op != "hello" {
 		h.sendErr(cl, codeNotAuth, "send hello first")
-		h.logOp(cl, f.Op, f.ID, codeNotAuth)
+		h.logOp(cl, op, f.ID, codeNotAuth)
 		return
 	}
-	if fn, ok := h.handlers[f.Op]; ok {
+	if fn, ok := h.handlers[op]; ok {
 		fn(cl, f, raw)
-		h.logOp(cl, f.Op, f.ID, cl.errCode)
+		h.logOp(cl, op, f.ID, cl.errCode)
 		return
 	}
-	h.sendErr(cl, codeBadFrame, "unknown op "+f.Op)
-	h.logOp(cl, f.Op, f.ID, codeBadFrame)
+	h.sendErr(cl, codeBadFrame, "unknown op "+op)
+	h.logOp(cl, op, f.ID, codeBadFrame)
 }
 
 // logOp traces one dispatched op frame and how routing ended.
@@ -291,7 +305,8 @@ func (c *client) drop() {
 // connection must never accept a frame — checking c.closed BEFORE the
 // select removes the race where both cases are ready and the frame is
 // queued into a write pump that is already gone (logged online, lost).
-func (c *client) sendFrame(f frame) bool {
+// Accepts any marshalable reply shape (frame, enrolledReply).
+func (c *client) sendFrame(f any) bool {
 	b, err := json.Marshal(f)
 	if err != nil {
 		return false

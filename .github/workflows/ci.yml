@@ -112,7 +112,7 @@ jobs:
           (cd dist && sha256sum dap-hub_*.tar.gz dap-hub_*.zip > sha256sums.txt)
           ls -lh dist
 
-      - name: Derive next version tag (patch bump)
+      - name: Derive next version tag (conventional-commit bump)
         id: version
         run: |
           LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
@@ -121,8 +121,21 @@ jobs:
             echo "No previous tag found — starting at $TAG"
           else
             IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
-            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
-            echo "$LATEST → $TAG"
+            LOG=$(git log "${LATEST}..HEAD" --format=%s%n%b)
+            if printf '%s\n' "$LOG" | grep -q '!:' || printf '%s\n' "$LOG" | grep -q '^BREAKING CHANGE:'; then
+              if [ "$MAJOR" -gt 0 ]; then
+                TAG="v$((MAJOR + 1)).0.0"
+              else
+                TAG="v0.$((MINOR + 1)).0"
+              fi
+              echo "$LATEST → $TAG (breaking)"
+            elif printf '%s\n' "$LOG" | grep -q '^feat'; then
+              TAG="v${MAJOR}.$((MINOR + 1)).0"
+              echo "$LATEST → $TAG (feat)"
+            else
+              TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+              echo "$LATEST → $TAG (patch)"
+            fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 

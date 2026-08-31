@@ -24,6 +24,9 @@ export interface DapFileConfig {
   channels?: string[];
   /** Armed invite-by-name entries; removed once delivered. */
   invites?: PendingInvite[];
+  /** Hub-issued client secret, persisted after master-secret enrollment; the
+   *  master secret itself is never persisted. */
+  clientSecret?: string;
 }
 
 export interface DapSettings {
@@ -58,7 +61,7 @@ export function readDapConfig(file = defaultConfigFile()): DapFileConfig {
  *  `invites` is the authoritative list — delivered entries are removed by
  *  the caller. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string },
   file = defaultConfigFile(),
 ): void {
   const cur = readDapConfig(file);
@@ -69,6 +72,7 @@ export function persistDapConfig(
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
   if (update.invites) next.invites = update.invites;
+  if (update.clientSecret) next.clientSecret = update.clientSecret;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }

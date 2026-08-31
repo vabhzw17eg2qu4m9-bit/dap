@@ -3,3 +3,6 @@ coverage.out
 channels.json
 channels.json.tmp
 *.tmp
+secrets.json
+.env
+hub

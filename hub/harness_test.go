@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
@@ -25,12 +26,20 @@ import (
 	"github.com/coder/websocket"
 )
 
-const adminTestToken = "test-admin-token"
+const (
+	adminTestToken   = "test-admin-token"
+	testMasterSecret = "test-master-secret"
+)
 
 func newTestHub(t *testing.T) (*hub, *httptest.Server, *bytes.Buffer) {
 	t.Helper()
 	logbuf := &bytes.Buffer{}
-	h := newHub(adminTestToken, filepath.Join(t.TempDir(), "channels.json"), logbuf)
+	h := newHub(hubConfig{
+		AdminToken:   adminTestToken,
+		MasterSecret: testMasterSecret,
+		StorePath:    filepath.Join(t.TempDir(), "channels.json"),
+		SecretsPath:  filepath.Join(t.TempDir(), "secrets.json"),
+	}, logbuf)
 	h.pingEvery = time.Hour // dedicated ping test overrides this
 	srv := httptest.NewServer(buildMux(h))
 	t.Cleanup(srv.Close)
@@ -100,17 +109,36 @@ func writeSigned(t *testing.T, c *websocket.Conn, priv ed25519.PrivateKey, m map
 	writeJSONFrame(t, c, sign(t, priv, m))
 }
 
-func dial(t *testing.T, srv *httptest.Server) *websocket.Conn {
+// dial opens /ws. bearer overrides the default master-secret header:
+// pass "" for no Authorization header at all (401 path), or a full
+// header value like "Bearer <issued secret>" to dial as an agent.
+func dial(t *testing.T, srv *httptest.Server, bearer ...string) *websocket.Conn {
 	t.Helper()
-	url := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws"
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	c, _, err := websocket.Dial(ctx, url, nil)
+	c, err := dialConn(t, srv, bearer...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.CloseNow() })
 	return c
+}
+
+// dialConn is dial without the fatal: callers assert on upgrade
+// rejections (HTTP 401).
+func dialConn(t *testing.T, srv *httptest.Server, bearer ...string) (*websocket.Conn, error) {
+	t.Helper()
+	token := "Bearer " + testMasterSecret
+	if len(bearer) > 0 {
+		token = bearer[0]
+	}
+	header := http.Header{}
+	if token != "" {
+		header.Set("Authorization", token)
+	}
+	url := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: header})
+	return c, err
 }
 
 func readFrameT(t *testing.T, c *websocket.Conn, d time.Duration) (frame, error) {
@@ -128,6 +156,27 @@ func readFrameT(t *testing.T, c *websocket.Conn, d time.Duration) (frame, error)
 	var f frame
 	err = json.Unmarshal(data, &f)
 	return f, err
+}
+
+// readRawT reads one frame as a generic map — for the frozen enroll
+// wire shapes ("t" field) that do not parse into the typed frame.
+func readRawT(t *testing.T, c *websocket.Conn) map[string]any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, r, err := c.Reader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
 }
 
 // readUntilFn returns the first frame matching want; skip lists ops to

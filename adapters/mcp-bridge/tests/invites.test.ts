@@ -17,7 +17,7 @@ import { buildServer } from '../src/server.js';
 import { persistDapConfig, readDapConfig } from '../src/config.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { startHub } from './hub.js';
+import { pinMasterAuth, startHub } from './hub.js';
 import { pollUntil } from './util.js';
 
 const hub = await startHub(); // one hub per test file (hub.ts caches)
@@ -62,7 +62,9 @@ const unpin = (prev: string | undefined): void => {
 };
 
 test('dap_invite <unknown name>: arms a pending invite, persists (deduped), returns the connect line', async () => {
-  const prev = pin(join(tmp(), 'config.json'));
+  const cfg = join(tmp(), 'config.json');
+  const prev = pin(cfg);
+  const unAuth = pinMasterAuth(hub, cfg); // A enrolls; the issued secret lands in cfg
   const A = new DapClient({
     url, keyPath: keyFile(), name: 'inviter-a', channelsFile: join(tmp(), 'ch-a.json'),
     invites: true, invitePollMs: 10_000, // tick never fires: only arm-time state is under test
@@ -86,24 +88,30 @@ test('dap_invite <unknown name>: arms a pending invite, persists (deduped), retu
     assert.deepEqual(readDapConfig(process.env.DAP_CONFIG_FILE).invites, [{ name: 'carol', channel: 'general' }], 'deduped');
   } finally {
     await mcp.close();
+    unAuth();
     A.stop();
     unpin(prev);
   }
 });
 
 test('pending invite: the name connects later -> poller DMs the chankey, invitee joins, pending removed', async () => {
-  const prev = pin(join(tmp(), 'config.json'));
+  const cfg = join(tmp(), 'config.json');
+  const prev = pin(cfg);
+  const unAuth = pinMasterAuth(hub, cfg);
   const A = new DapClient({
     url, keyPath: keyFile(), name: 'inviter-b', channelsFile: join(tmp(), 'ch-a.json'),
     invites: true, invitePollMs: 40, // fast tick: delivery comes from the poller
   });
   const mcp = await mcpAround(A);
   const B = new DapClient({ url, keyPath: keyFile(), name: 'dave', channelsFile: join(tmp(), 'ch-b.json') });
+  let unB: () => void = () => {};
   try {
     A.start();
     await A.ready();
+    await pollUntil(() => readDapConfig(cfg).clientSecret !== undefined, 5000, 20); // A's enrollment persisted to cfg
     assert.equal((await invite(mcp, { channel: 'general', agent: 'dave' })).pending, true);
 
+    unB = pinMasterAuth(hub, join(tmp(), 'config-b.json')); // dave enrolls into his own config
     B.start(); // dave comes online AFTER the arm — only the poller can deliver
     await B.ready();
     await pollUntil(() => B.joinedChannels.includes('general'), 5000, 20);
@@ -114,6 +122,8 @@ test('pending invite: the name connects later -> poller DMs the chankey, invitee
     );
   } finally {
     await mcp.close();
+    unB();
+    unAuth();
     A.stop();
     B.stop();
     unpin(prev);
@@ -121,15 +131,21 @@ test('pending invite: the name connects later -> poller DMs the chankey, invitee
 });
 
 test('dap_invite <online name>: immediate chankey DM, nothing armed', async () => {
-  const prev = pin(join(tmp(), 'config.json'));
+  const cfg = join(tmp(), 'config.json');
+  const prev = pin(cfg);
+  const unAuth = pinMasterAuth(hub, cfg);
   const A = new DapClient({
     url, keyPath: keyFile(), name: 'inviter-c', channelsFile: join(tmp(), 'ch-a.json'),
     invites: true, invitePollMs: 10_000,
   });
   const B = new DapClient({ url, keyPath: keyFile(), name: 'erin', channelsFile: join(tmp(), 'ch-b.json') });
   const mcp = await mcpAround(A);
+  let unB: () => void = () => {};
   try {
     A.start();
+    await A.ready();
+    await pollUntil(() => readDapConfig(cfg).clientSecret !== undefined, 5000, 20); // A's enrollment persisted
+    unB = pinMasterAuth(hub, join(tmp(), 'config-b.json'));
     B.start();
     await Promise.all([A.ready(), B.ready()]);
     const res = await invite(mcp, { channel: 'immediate', agent: 'ERIN' }); // case-insensitive match
@@ -140,6 +156,8 @@ test('dap_invite <online name>: immediate chankey DM, nothing armed', async () =
     assert.deepEqual(readDapConfig(process.env.DAP_CONFIG_FILE).invites, [], 'nothing armed for an online name');
   } finally {
     await mcp.close();
+    unB();
+    unAuth();
     A.stop();
     B.stop();
     unpin(prev);
@@ -147,25 +165,37 @@ test('dap_invite <online name>: immediate chankey DM, nothing armed', async () =
 });
 
 test('dap_invite <ambiguous name>: honest failure listing both ids, nothing armed', async () => {
-  const prev = pin(join(tmp(), 'config.json'));
+  const cfg = join(tmp(), 'config.json');
+  const prev = pin(cfg);
+  const unAuth = pinMasterAuth(hub, cfg);
   const A = new DapClient({
     url, keyPath: keyFile(), name: 'inviter-d', channelsFile: join(tmp(), 'ch-a.json'),
     invites: true, invitePollMs: 10_000,
   });
   const zoe1 = new DapClient({ url, keyPath: keyFile(), name: 'zoe', channelsFile: join(tmp(), 'ch-1.json') });
   const zoe2 = new DapClient({ url, keyPath: keyFile(), name: 'zoe', channelsFile: join(tmp(), 'ch-2.json') });
+  let unZoe1: () => void = () => {};
+  let unZoe2: () => void = () => {};
   const mcp = await mcpAround(A);
   try {
     A.start();
+    await A.ready();
+    await pollUntil(() => readDapConfig(cfg).clientSecret !== undefined, 5000, 20); // A's enrollment persisted
+    unZoe1 = pinMasterAuth(hub, join(tmp(), 'config-1.json'));
     zoe1.start();
+    await zoe1.ready();
+    unZoe2 = pinMasterAuth(hub, join(tmp(), 'config-2.json'));
     zoe2.start();
-    await Promise.all([A.ready(), zoe1.ready(), zoe2.ready()]);
+    await zoe2.ready();
     const out = await mcp.callTool({ name: 'dap_invite', arguments: { channel: 'general', agent: 'zoe' } });
     assert.equal(out.isError, true, 'ambiguous name is an honest failure, never ok:true');
     assert.match(String(out.content?.find((c) => c.type === 'text')?.text), /"zoe" is ambiguous/);
     assert.deepEqual(readDapConfig(process.env.DAP_CONFIG_FILE).invites, [], 'nothing armed');
   } finally {
     await mcp.close();
+    unZoe2();
+    unZoe1();
+    unAuth();
     A.stop();
     zoe1.stop();
     zoe2.stop();
@@ -174,7 +204,9 @@ test('dap_invite <ambiguous name>: honest failure listing both ids, nothing arme
 });
 
 test('pending invites survive a restart: the welcome-time check delivers without waiting a tick', async () => {
-  const prev = pin(join(tmp(), 'config.json'));
+  const cfg = join(tmp(), 'config.json');
+  const prev = pin(cfg);
+  const unAuth = pinMasterAuth(hub, cfg);
   const dir = tmp();
   const keyA = join(dir, 'a.key');
   const chFile = join(dir, 'channels.json');
@@ -182,21 +214,27 @@ test('pending invites survive a restart: the welcome-time check delivers without
   const A1 = new DapClient({ url, keyPath: keyA, name: 'inviter-e', channelsFile: chFile, invites: true, invitePollMs: 60_000 });
   const mcp1 = await mcpAround(A1);
   const B = new DapClient({ url, keyPath: keyFile(), name: 'frank', channelsFile: join(tmp(), 'ch-b.json') });
+  let unB: () => void = () => {};
   try {
     A1.start();
     await A1.ready();
+    await pollUntil(() => readDapConfig(cfg).clientSecret !== undefined, 5000, 20); // A1's enrollment persisted to cfg
     await invite(mcp1, { channel: 'general', agent: 'frank' });
     await mcp1.close();
     A1.stop(); // the inviter goes away entirely
 
+    unB = pinMasterAuth(hub, join(tmp(), 'config-b.json'));
     B.start();
     await B.ready();
+    unB(); // frank is on; A2's restart dial needs cfg (its persisted secret) active
     const A2 = new DapClient({ url, keyPath: keyA, name: 'inviter-e', channelsFile: chFile, invites: true, invitePollMs: 60_000 });
     A2.start(); // restart: pendings load from config, welcome check delivers
     await pollUntil(() => B.joinedChannels.includes('general'), 5000, 20);
     assert.deepEqual(readDapConfig(process.env.DAP_CONFIG_FILE).invites, [], 'pending consumed after restart delivery');
     A2.stop();
   } finally {
+    unB();
+    unAuth();
     B.stop();
     unpin(prev);
   }

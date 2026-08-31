@@ -37,9 +37,10 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
       DAP_HUB_URL: hub.url,
       DAP_KEY_PATH: join(dir, 'agent.key'),
       DAP_CHANNELS_FILE: join(dir, 'channels.json'),
+      DAP_CONFIG_FILE: join(dir, 'config.json'),
+      DAP_MASTER_SECRET: hub.masterSecret, // first connect enrolls; the issued secret persists to DAP_CONFIG_FILE
       DAP_AGENT_NAME: 'conformance-1',
     } as Record<string, string>,
-    stderr: 'ignore',
   });
   const client = new Client({ name: 'dap-conformance-check', version: '0.1.0' });
   await client.connect(transport); // performs the MCP initialize handshake

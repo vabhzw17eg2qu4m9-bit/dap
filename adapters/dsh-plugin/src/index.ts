@@ -44,6 +44,8 @@ export interface DapPluginConfig {
 const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
 
 const S = (v: unknown): string => String(v);
+/** Frozen adapter-contract enrollment notice (never carries the secret). */
+const ENROLL_NOTICE = 'enrolled: client secret persisted';
 
 export default {
   name: 'dsh-dap',
@@ -64,6 +66,7 @@ export default {
       channels: config.channels,
       channelsFile: config.channels ? undefined : settings.channelsFile,
       backoff: config.backoff,
+      clientSecret: settings.clientSecret,
       onReady: () => pollPending(), // welcome/reconnect: redeliver pendings without waiting a tick
       onMessage: announce,
       onInvite: (invite, from) => {
@@ -72,6 +75,10 @@ export default {
       onHubError: (e) => {
         ctx.logger?.warn(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
         ctx.agent?.followup(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`);
+      },
+      onEnrolled: () => {
+        ctx.logger?.warn(ENROLL_NOTICE);
+        ctx.agent?.followup(ENROLL_NOTICE);
       },
     });
     client.start();
@@ -182,7 +189,14 @@ export default {
             persistInvites();
           }
           pollPending(); // arm-time check: the name may have connected just now
-          return { ok: true, pending: true, name: who, channel, connectLine: `send to ${who}:  /dap ${hostOf(settings.url)} ${who}` };
+          return {
+            ok: true,
+            pending: true,
+            name: who,
+            channel,
+            connectLine: `send to ${who}:  /dap ${hostOf(settings.url)} ${who}`,
+            hint: 'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)',
+          };
         } catch (err) {
           return { ok: false, error: String(err) };
         }

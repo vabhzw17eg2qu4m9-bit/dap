@@ -14,7 +14,9 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/dap-hub /usr/local/bin/dap-hub
 COPY --from=build --chown=65532:65532 /out/data /data
 USER nonroot
-ENV HUB_ADDR=:8080 HUB_CHANNELS_FILE=/data/channels.json
+# HUB_MASTER_SECRET is REQUIRED: the hub refuses to start without it.
+# Empty default here — inject the real secret at deploy time.
+ENV HUB_ADDR=:8080 HUB_CHANNELS_FILE=/data/channels.json HUB_SECRETS_FILE=/data/secrets.json HUB_MASTER_SECRET=
 EXPOSE 8080
 VOLUME /data
 ENTRYPOINT ["dap-hub"]

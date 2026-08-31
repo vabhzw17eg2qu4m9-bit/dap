@@ -67,3 +67,33 @@ func TestNoPlaintextInHubState(t *testing.T) {
 		}
 	}
 }
+
+// TestNoPlaintextIssuedSecret: the enroll reply's plaintext secret must
+// never reach the secrets file (hash only) or the logs.
+func TestNoPlaintextIssuedSecret(t *testing.T) {
+	h, srv, logbuf := newTestHub(t)
+	c := dial(t, srv)
+	a := newAgent(t, "alice")
+	writeSigned(t, c, a.priv, helloMap(a))
+	readUntil(t, c, "welcome")
+	writeJSONFrame(t, c, map[string]any{"t": "enroll"})
+	reply := readRawT(t, c)
+	secret, _ := reply["secret"].(string)
+	if secret == "" {
+		t.Fatal("no issued secret in reply")
+	}
+	c.CloseNow()
+
+	secretsBytes, err := os.ReadFile(h.secretsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(secretsBytes, []byte(sha256Hex(secret))) {
+		t.Fatal("secrets file must contain the issued hash")
+	}
+	for name, blob := range map[string][]byte{"secrets file": secretsBytes, "log": logbuf.Bytes()} {
+		if bytes.Contains(blob, []byte(secret)) {
+			t.Fatalf("issued plaintext secret leaked into hub %s", name)
+		}
+	}
+}

@@ -11,10 +11,34 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:cryptography/cryptography.dart';
 
 class FakeHub {
+  FakeHub({this.masterSecret});
+
+  /// When set, every `/ws` dial needs `Authorization: Bearer <token>`
+  /// with either the master secret or the issued client secret — a
+  /// rejected dial gets HTTP 401 before the upgrade (hub contract).
+  final String? masterSecret;
+
+  /// Client secret issued by the last accepted enroll (bound to
+  /// [issuedName]); a re-enroll replaces it — the old secret then 401s.
+  String? issuedSecret;
+  String? issuedName;
+  int enrollCount = 0;
+
+  /// `Authorization` header of every `/ws` dial (bearer-header capture).
+  final dialAuths = <String?>[];
+
+  final _enrollEvents = StreamController<String>.broadcast();
+
+  /// Fires with the issued secret for every accepted enroll.
+  Stream<String> get enrollments => _enrollEvents.stream;
+
+  final _random = Random();
+
   HttpServer? _server;
 
   /// Persistent agent registry (survives disconnects, like presence).
@@ -25,10 +49,8 @@ class FakeHub {
   final _mailboxes = <String, List<Map<String, dynamic>>>{};
   final _nonces = <String>{};
   final _helloEvents = StreamController<String>.broadcast();
-
   int _hellosSeen = 0;
 
-  /// Accepted hellos so far (reconnect/retarget double-loop detection).
   int get hellosSeen => _hellosSeen;
 
   int rejectedHellos = 0;
@@ -83,6 +105,7 @@ class FakeHub {
     await _helloEvents.close();
     await _offlineEvents.close();
     await _joinEvents.close();
+    await _enrollEvents.close();
     await _server?.close(force: true);
   }
 
@@ -100,8 +123,19 @@ class FakeHub {
         await request.response.close();
       } else if (request.uri.path == '/ws' &&
           WebSocketTransformer.isUpgradeRequest(request)) {
-        final ws = await WebSocketTransformer.upgrade(request);
-        unawaited(_handle(ws));
+        final auth = request.headers.value(HttpHeaders.authorizationHeader);
+        dialAuths.add(auth);
+        final token = _bearer(auth);
+        if (masterSecret != null &&
+            token != masterSecret &&
+            token != issuedSecret) {
+          request.response.statusCode = HttpStatus.unauthorized;
+          request.response.write('unauthorized');
+          await request.response.close();
+        } else {
+          final ws = await WebSocketTransformer.upgrade(request);
+          unawaited(_handle(ws, token));
+        }
       } else {
         request.response.statusCode = 404;
         await request.response.close();
@@ -109,15 +143,19 @@ class FakeHub {
     }
   }
 
-  Future<void> _handle(WebSocket ws) async {
+  Future<void> _handle(WebSocket ws, String? token) async {
     String? agentId;
     try {
       await for (final Object data in ws) {
         final frame = (jsonDecode(data as String) as Map).cast<String, dynamic>();
+        if (frame['t'] == 'enroll') {
+          _enroll(ws, agentId, token);
+          continue;
+        }
         final op = frame['op'] as String?;
         switch (op) {
           case 'hello':
-            agentId = await _hello(ws, frame);
+            agentId = await _hello(ws, frame, token);
           case 'whois':
             _whois(ws, frame);
           case 'send' when agentId != null:
@@ -141,11 +179,29 @@ class FakeHub {
     }
   }
 
-  Future<String?> _hello(WebSocket ws, Map<String, dynamic> frame) async {
+  Future<String?> _hello(
+    WebSocket ws,
+    Map<String, dynamic> frame,
+    String? token,
+  ) async {
     final verdict = await _checkHello(frame);
     if (verdict != null) {
       rejectedHellos++;
       _reply(ws, {'op': 'error', 'code': verdict, 'msg': verdict});
+      await ws.close();
+      return null;
+    }
+    // Client-secret connections are bound to the enrolling hello name
+    // (hub contract): a different name on that secret is rejected.
+    if (token == issuedSecret &&
+        issuedName != null &&
+        frame['name'] != issuedName) {
+      rejectedHellos++;
+      _reply(ws, {
+        'op': 'error',
+        'code': 'name_mismatch',
+        'msg': 'client secret is bound to "$issuedName"',
+      });
       await ws.close();
       return null;
     }
@@ -168,6 +224,33 @@ class FakeHub {
       'agentId': agentId,
     });
     return agentId;
+  }
+
+  /// `Bearer <token>` → token (null when the header is absent/malformed).
+  static String? _bearer(String? header) => header == null
+      ? null
+      : RegExp('^Bearer (.+)\$', caseSensitive: false)
+          .firstMatch(header)
+          ?.group(1);
+
+  /// `{"t":"enroll"}` — master-authenticated, post-hello conns only.
+  /// Issues a base64url 32-byte client secret bound to the hello name;
+  /// a re-enroll replaces the previous secret (old secret then 401s).
+  void _enroll(WebSocket ws, String? agentId, String? token) {
+    if (token != masterSecret || agentId == null) {
+      _reply(ws, {
+        't': 'error',
+        'code': 'unauthorized',
+        'msg': 'enroll needs a master-authenticated connection after hello',
+      });
+      return;
+    }
+    issuedSecret =
+        base64Url.encode(List<int>.generate(32, (_) => _random.nextInt(256)));
+    issuedName = _registry[agentId]?.name;
+    enrollCount++;
+    if (!_enrollEvents.isClosed) _enrollEvents.add(issuedSecret!);
+    _reply(ws, {'t': 'enrolled', 'secret': issuedSecret});
   }
 
   /// null = accepted, otherwise the error code.

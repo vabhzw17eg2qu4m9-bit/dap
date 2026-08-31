@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import dapExtension, { type DapExtension } from '../src/index.ts';
@@ -18,7 +19,7 @@ const nextKeyPath = (): string => path.join(KEYDIR, 'key-' + ++keySeq + '.json')
 // Determinism: pin HOME (defaults resolve under KEYDIR) and clear any DAP_*
 // env leaked in from the machine running the tests.
 process.env.HOME = KEYDIR;
-const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE'];
+const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CLIENT_SECRET', 'DAP_MASTER_SECRET'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
 
@@ -297,6 +298,138 @@ test('backoff doubles 1s..30s cap against a dead endpoint (no real sleeps)', asy
     assert.deepEqual(ext.client.backoffSchedule, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
   } finally {
     ext.dispose();
+  }
+});
+
+/** Upgrade-only stub: answers every dial with the hub's pre-Accept 401 and
+ *  records each attempt's Authorization header. */
+async function deniedHub(): Promise<{ url: string; seen: (string | undefined)[]; close(): Promise<void> }> {
+  const server = http.createServer();
+  const seen: (string | undefined)[] = [];
+  server.on('upgrade', (req, socket) => {
+    seen.push(req.headers.authorization);
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nunauthorized');
+    socket.destroy();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  return {
+    url: 'ws://127.0.0.1:' + port + '/ws',
+    seen,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+test('dial carries Authorization: Bearer (clientSecret, or DAP_MASTER_SECRET in enroll mode)', async () => {
+  const hub = await deniedHub();
+  let c = new DapClient({ url: hub.url, keys: loadOrCreateKeys(nextKeyPath()), clientSecret: 'client-secret-1' });
+  try {
+    const denied = nextEvent(c, 'denied');
+    c.connect();
+    await denied;
+    c.stop(); // within the 1s backoff window: no second dial
+    assert.deepEqual(hub.seen, ['Bearer client-secret-1']);
+
+    process.env.DAP_MASTER_SECRET = 'master-secret-1';
+    c = new DapClient({ url: hub.url, keys: loadOrCreateKeys(nextKeyPath()) });
+    const denied2 = nextEvent(c, 'denied');
+    c.connect();
+    await denied2;
+    assert.deepEqual(hub.seen, ['Bearer client-secret-1', 'Bearer master-secret-1'], 'master secret dials in enroll mode');
+  } finally {
+    delete process.env.DAP_MASTER_SECRET;
+    c.stop();
+    await hub.close();
+  }
+});
+
+test('token precedence: DAP_CLIENT_SECRET env beats the persisted config clientSecret', async () => {
+  const hub = await deniedHub();
+  const cfgFile = path.join(KEYDIR, 'cfg-tok-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'from-config' }));
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevEnv = process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_CLIENT_SECRET = 'from-env';
+  const clock = new ManualTimers();
+  let ext = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: nextKeyPath(), timers: clock.timers });
+  try {
+    await nextEvent(ext.client, 'denied');
+    assert.equal(hub.seen[0], 'Bearer from-env', 'env beats config file');
+    ext.dispose();
+    delete process.env.DAP_CLIENT_SECRET;
+    ext = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: nextKeyPath(), timers: clock.timers });
+    await nextEvent(ext.client, 'denied');
+    assert.equal(hub.seen[1], 'Bearer from-config', 'persisted clientSecret used when env is silent');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevEnv === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevEnv;
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('headerless dial: hub 401 surfaces the frozen error text (once per streak)', async () => {
+  const hub = await deniedHub();
+  const cap = fakeCtx();
+  const clock = new ManualTimers();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), timers: clock.timers });
+  try {
+    const denied = nextEvent(ext.client, 'denied');
+    const closed1 = nextEvent(ext.client, 'close'); // pre-registered: close follows denied in the same burst
+    await denied;
+    await closed1; // close armed the reconnect timer
+    clock.fireAll(); // dial 2
+    await nextEvent(ext.client, 'close');
+    clock.fireAll(); // dial 3
+    await nextEvent(ext.client, 'close');
+    assert.deepEqual(hub.seen, [undefined, undefined, undefined], 'no secrets: headerless dials');
+    assert.deepEqual(cap.sent.map((s) => s.msg), [
+      '[dap] hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect',
+    ]);
+  } finally {
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('auto-enroll: master dial -> {"t":"enroll"} -> issued secret persisted and reused on reconnect', async () => {
+  const hub = await new FakeHub({ masterSecret: 'master-enroll-token' }).listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-enroll-' + ++keySeq + '.json');
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_MASTER_SECRET = 'master-enroll-token';
+  const cap = fakeCtx();
+  const clock = new ManualTimers();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'enrollee', timers: clock.timers });
+  try {
+    const enrolled = nextEvent<{ secret: string }>(ext.client, 'enrolled');
+    await nextEvent(ext.client, 'welcome');
+    const { secret } = await enrolled;
+    assert.deepEqual(hub.enrollRequests, [ext.client.agentId], 'enroll only after hello, master-auth only');
+    assert.equal(readDapConfig(cfgFile).clientSecret, secret, 'issued secret persisted to DAP_CONFIG_FILE');
+    assert.ok(!fs.readFileSync(cfgFile, 'utf8').includes('master-enroll-token'), 'master secret never persisted');
+    assert.ok(!JSON.stringify(cap.sent).includes(secret), 'secret never surfaces in messages');
+
+    // Reconnect: the issued secret rides the dial; no second enroll.
+    const closed = nextEvent(ext.client, 'close');
+    hub.drop(ext.client.agentId);
+    await closed;
+    const welcome2 = nextEvent(ext.client, 'welcome');
+    clock.fireAll();
+    await welcome2;
+    assert.deepEqual(hub.upgrades, ['master-enroll-token', secret], 'reconnect used the issued secret');
+    assert.deepEqual(hub.enrollRequests, [ext.client.agentId], 'no re-enroll with the client secret');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    ext.dispose();
+    await hub.close();
   }
 });
 
@@ -609,7 +742,9 @@ test('/dap invite (no args) and bare /dap: print the paste-ready connect line (h
   try {
     await nextEvent(ext.client, 'welcome');
     const dap = command(cap, 'dap');
-    const line = `send to other user:  /dap 127.0.0.1:${hub.port} <name>`; // ws://…/ws stripped to host:port
+    const line =
+      `send to other user:  /dap 127.0.0.1:${hub.port} <name>\n` + // ws://…/ws stripped to host:port
+      'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)';
     assert.equal(dap.handler('invite'), line);
     // omp discards handler return values — the share line must arrive via cmdCtx.ui.notify.
     const notified: string[] = [];

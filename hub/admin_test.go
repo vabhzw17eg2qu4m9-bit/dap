@@ -37,7 +37,7 @@ func TestAdminUnauthorized(t *testing.T) {
 	}
 
 	// hub configured without a token rejects everything
-	empty := newHub("", filepath.Join(t.TempDir(), "channels.json"), io.Discard)
+	empty := newHub(hubConfig{StorePath: filepath.Join(t.TempDir(), "channels.json")}, io.Discard)
 	esrv := httptest.NewServer(buildMux(empty))
 	t.Cleanup(esrv.Close)
 	resp := adminReq(t, esrv.URL, http.MethodGet, "/api/agents", "anything", nil)
@@ -101,7 +101,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	// a fresh hub restores name, pubkey and ACL
-	h2 := newHub(adminTestToken, h.storePath, io.Discard)
+	h2 := newHub(hubConfig{AdminToken: adminTestToken, StorePath: h.storePath}, io.Discard)
 	h2.loadChannels()
 	ch := h2.channels["general"]
 	if ch == nil || ch.Pubkey != "cpub" || len(ch.Allowed) != 1 || ch.Allowed[0] != a.pubB64 {
@@ -111,7 +111,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	// corrupt store: parse failure is logged, boot continues empty
 	corrupt := filepath.Join(t.TempDir(), "bad.json")
 	os.WriteFile(corrupt, []byte("{not json"), 0o600)
-	h3 := newHub(adminTestToken, corrupt, io.Discard)
+	h3 := newHub(hubConfig{AdminToken: adminTestToken, StorePath: corrupt}, io.Discard)
 	h3.loadChannels()
 	if len(h3.channels) != 0 {
 		t.Fatal("corrupt store should yield no channels")
