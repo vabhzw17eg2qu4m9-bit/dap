@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
@@ -46,7 +46,7 @@ jobs:
         run: |
           mkdir -p bin .tools
           git clone --depth 1 https://github.com/vabhzw17eg2qu4m9-bit/crap4go .tools/crap4go
-          (cd .tools/crap4go && go build -o ../bin/crap4go .)
+          (cd .tools/crap4go && go build -o ../../bin/crap4go .)
           (cd hub && ../bin/crap4go --run-tests --threshold 12 .)
 
       # Measured: 3.02% on 2026-08-31; threshold = max(1.0, next 0.5) = 3.5.
@@ -73,7 +73,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
@@ -128,7 +128,7 @@ jobs:
       packages: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # No qemu: hub/Dockerfile cross-compiles via TARGETARCH (CGO-free).
       - uses: docker/setup-buildx-action@v3
