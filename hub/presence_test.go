@@ -38,6 +38,46 @@ func TestPresence(t *testing.T) {
 	}
 }
 
+// Query-id correlation (BUG 5): the presence answer echoes a request
+// frame id as replyTo; an id-less query answer and every broadcast
+// push carry no replyTo, so a broadcast can never complete a pending
+// query waiter with a partial roster.
+func TestPresenceQueryEchoesRequestID(t *testing.T) {
+	_, srv, _ := newTestHub(t)
+	a := newAgent(t, "a")
+	ca := connect(t, srv, a)
+	joinChan(t, ca, a, "general", "cpub")
+
+	writeJSONFrame(t, ca, map[string]any{"op": "presence_query", "id": "q1"})
+	m := readRawUntilFn(t, ca, func(m map[string]any) bool { return m["op"] == "presence" })
+	if m["replyTo"] != "q1" {
+		t.Fatalf("presence answer replyTo %v, want q1", m["replyTo"])
+	}
+
+	writeJSONFrame(t, ca, map[string]any{"op": "presence_query"})
+	m = readRawUntilFn(t, ca, func(m map[string]any) bool { return m["op"] == "presence" })
+	if _, ok := m["replyTo"]; ok {
+		t.Fatalf("id-less presence answer must not carry replyTo: %v", m)
+	}
+}
+
+func TestPresenceBroadcastCarriesNoReplyTo(t *testing.T) {
+	_, srv, _ := newTestHub(t)
+	a, b := newAgent(t, "a"), newAgent(t, "b")
+	ca := connect(t, srv, a)
+	joinChan(t, ca, a, "general", "cpub")
+	cb := connect(t, srv, b)
+	joinChan(t, cb, b, "general", "cpub")
+
+	// b's join pushes a presence broadcast to a (member sharing the channel).
+	m := readRawUntilFn(t, ca, func(m map[string]any) bool {
+		return m["op"] == "presence" && len(m["agents"].([]any)) == 1
+	})
+	if _, ok := m["replyTo"]; ok {
+		t.Fatalf("presence broadcast must not carry replyTo: %v", m)
+	}
+}
+
 func TestOfflineMailbox(t *testing.T) {
 	_, srv, _ := newTestHub(t)
 	a, b := newAgent(t, "a"), newAgent(t, "b")

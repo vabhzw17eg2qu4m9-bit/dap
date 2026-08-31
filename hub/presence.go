@@ -13,8 +13,12 @@ func (h *hub) handleWhois(cl *client, f frame, _ map[string]any) {
 }
 
 // handlePresenceQuery lists every known agent with online state.
-func (h *hub) handlePresenceQuery(cl *client, _ frame, _ map[string]any) {
-	cl.sendFrame(frame{Op: "presence", Agents: h.presenceList()})
+// The answer echoes a request frame id as replyTo (absent when the
+// query carried none); broadcast pushes never carry replyTo — clients
+// complete a pending query only on a replyTo match, so a concurrent
+// broadcast cannot satisfy it with a partial roster.
+func (h *hub) handlePresenceQuery(cl *client, f frame, _ map[string]any) {
+	cl.sendFrame(frame{Op: "presence", ReplyTo: f.ID, Agents: h.presenceList()})
 }
 
 // presenceList snapshots the agent registry (no pruning — see lookupAgent).

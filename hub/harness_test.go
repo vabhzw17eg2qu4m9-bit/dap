@@ -204,6 +204,20 @@ func readUntil(t *testing.T, c *websocket.Conn, op string, skip ...string) frame
 	return readUntilFn(t, c, func(f frame) bool { return f.Op == op }, skip...)
 }
 
+// readRawUntilFn returns the first raw frame (generic map) matching
+// want — for wire-level assertions the typed frame cannot express
+// (a field's presence vs absence).
+func readRawUntilFn(t *testing.T, c *websocket.Conn, want func(map[string]any) bool) map[string]any {
+	for range 200 {
+		m := readRawT(t, c)
+		if want(m) {
+			return m
+		}
+	}
+	t.Fatal("no matching raw frame arrived")
+	return nil
+}
+
 // expectQuiet asserts no frame arrives within the window (deadline-based
 // negative check — never a sleep-based sync).
 func expectQuiet(t *testing.T, c *websocket.Conn, window time.Duration) {

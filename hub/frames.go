@@ -50,6 +50,7 @@ type frame struct {
 	To         string      `json:"to,omitempty"`
 	From       string      `json:"from,omitempty"`
 	ID         string      `json:"id,omitempty"`
+	ReplyTo    string      `json:"replyTo,omitempty"`
 	Ciphertext string      `json:"ciphertext,omitempty"`
 	Count      int         `json:"count,omitempty"`
 	Agents     []agentInfo `json:"agents,omitempty"`
