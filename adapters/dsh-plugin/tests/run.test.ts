@@ -119,7 +119,7 @@ test('dap_status: identity, link state, channels and handshake counters', async 
   }
 });
 
-test('dap_peers: online only by default; includeOffline:true also lists a dropped agent', async () => {
+test('dap_peers: online only, no flags, own entry marked self', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
   const other = fakeCtx();
@@ -129,7 +129,7 @@ test('dap_peers: online only by default; includeOffline:true also lists a droppe
     const selfId = hub.pluginAgentId; // before the second client takes lastAgentId
 
     // Second client handshakes, then goes away for good: the hub keeps it in
-    // the presence registry, marked offline.
+    // the presence registry, marked offline (the ghost peers must never list).
     const clientOther = plugin.apply(other.ctx, {
       url: hub.url,
       keyPath: tmpKeyPath(),
@@ -142,24 +142,124 @@ test('dap_peers: online only by default; includeOffline:true also lists a droppe
     await until(() => !hub.isOnline(clientOther.agentId));
 
     const def = tool(fc, 'dap_peers');
+    assert.deepEqual(def.inputSchema.properties, {}, 'no parameters: the flag is gone');
     const out = (await def.execute({})) as { agents: Record<string, unknown>[] };
     const wire = await hub.waitFor((f) => f.op === 'presence_query');
     assert.equal(wire.op, 'presence_query', 'asks the hub, not local cache');
     const byId = new Map(out.agents.map((a) => [String(a.agentId), a]));
-    assert.ok(byId.has(selfId), 'lists itself');
-    assert.ok(byId.has(hub.peerId), 'lists the fake-hub peer');
-    assert.ok(!byId.has(clientOther.agentId), 'offline agent excluded by default');
-    assert.ok(out.agents.every((a) => a.online === true), 'default list is online-only');
+    assert.ok(byId.has(selfId), 'own entry kept');
+    assert.ok(byId.has(hub.peerId), 'online peer listed');
+    assert.ok(!byId.has(clientOther.agentId), 'offline ghost never listed');
+    assert.ok(out.agents.every((a) => a.online === true), 'list is online-only');
     const self = byId.get(selfId)!;
+    assert.equal(self.self, true, 'own entry marked self:true');
     assert.equal(self.name, 'dsh-test');
     assert.ok(Number(self.lastSeen) > 0);
-    const full = (await def.execute({ includeOffline: true })) as { agents: Record<string, unknown>[] };
-    const dropped = full.agents.find((a) => String(a.agentId) === clientOther.agentId);
-    assert.ok(dropped, 'includeOffline:true lists the dropped agent');
-    assert.equal(dropped!.online, false);
-    assert.equal(dropped!.name, 'dsh-other');
+    assert.equal(byId.get(hub.peerId)!.self, false, 'peers marked self:false');
+    assert.ok(out.agents.every((a) => a.self === (String(a.agentId) === selfId)), 'self:true iff own agentId');
   } finally {
     for (const f of [fc, other]) for (const cb of f.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('presence correlation: unsolicited stale echo never completes the query (request-id match)', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    hub.holdPresence = true;
+    const pending = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    const query = await hub.waitFor((f) => f.op === 'presence_query');
+    assert.ok(typeof query.id === 'string' && query.id.length > 0, 'the query carries a request id');
+    // An unsolicited one-agent echo for a query we never sent lands first —
+    // only the replyTo-matched answer may complete the wait.
+    hub.send({ op: 'presence', replyTo: 'stale-other-query', agents: [{ agentId: 'f'.repeat(16), name: 'ghost', online: true, lastSeen: Date.now() }] });
+    hub.releasePresence(); // the real two-agent answer, echoing OUR query id
+    const out = await pending;
+    const ids = out.agents.map((a) => String(a.agentId)).sort();
+    assert.ok(ids.includes(hub.pluginAgentId) && ids.includes(hub.peerId), 'the answer roster, not the stale echo');
+    assert.ok(!ids.includes('f'.repeat(16)), 'the stale ghost never surfaces');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('presence correlation: legacy id-less answer still completes (back-compat)', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    hub.holdPresence = true;
+    const pending = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    await hub.waitFor((f) => f.op === 'presence_query');
+    // Legacy hubs answer without replyTo — wire-indistinguishable from a
+    // broadcast, so the frame still completes the pending query.
+    hub.send({ op: 'presence', agents: [{ agentId: hub.pluginAgentId, name: 'dsh-test', online: true, lastSeen: Date.now() }] });
+    const out = await pending;
+    assert.deepEqual(out.agents.map((a) => String(a.agentId)), [hub.pluginAgentId], 'legacy answer completes the wait');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('presence correlation: echo-capable hub latches — a later id-less broadcast never completes a pending query', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    hub.holdPresence = true;
+    // Query A answered WITH replyTo: arms the sticky echo latch.
+    const first = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    await hub.waitFor((f) => f.op === 'presence_query');
+    hub.releasePresence(); // the real echo for A
+    await first;
+    // Query B pends; the hub pushes an UNSOLICITED one-agent broadcast (no replyTo).
+    const second = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    const query = hub.frames.filter((f) => f.op === 'presence_query')[1];
+    hub.send({ op: 'presence', agents: [{ agentId: 'f'.repeat(16), name: 'ghost', online: true, lastSeen: Date.now() }] });
+    // The matching echo for B is injected AFTER the broadcast; WS order
+    // guarantees the broadcast was processed first, so whichever roster
+    // `second` settles with names the frame that completed it.
+    const self = { agentId: hub.pluginAgentId, name: 'dsh-test', online: true, lastSeen: Date.now() };
+    hub.send({ op: 'presence', replyTo: String(query.id), agents: [self, { agentId: hub.peerId, name: 'peer', online: true, lastSeen: Date.now() }] });
+    const out = await second;
+    const ids = out.agents.map((a) => String(a.agentId));
+    assert.ok(ids.includes(hub.pluginAgentId) && ids.includes(hub.peerId), 'completed by the matching echo with the full roster');
+    assert.ok(!ids.includes('f'.repeat(16)), 'BUG 5: the id-less broadcast never completed the query');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('presence correlation: concurrent callers each get their own answer', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    hub.holdPresence = true;
+    const p1 = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    const p2 = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    const queries = hub.frames.filter((f) => f.op === 'presence_query');
+    const self = { agentId: hub.pluginAgentId, name: 'dsh-test', online: true, lastSeen: Date.now() };
+    // Answers in REVERSE order with DISTINCT rosters: only per-id routing
+    // delivers each caller its own roster.
+    hub.send({ op: 'presence', replyTo: String(queries[1].id), agents: [self, { agentId: 'b'.repeat(16), online: true, lastSeen: Date.now() }] });
+    hub.send({ op: 'presence', replyTo: String(queries[0].id), agents: [self, { agentId: 'a'.repeat(16), online: true, lastSeen: Date.now() }] });
+    const [one, two] = (await Promise.all([p1, p2])) as [{ agents: Record<string, unknown>[] }, { agents: Record<string, unknown>[] }];
+    assert.ok(one.agents.some((a) => String(a.agentId) === 'a'.repeat(16)), 'first caller got its own roster');
+    assert.ok(two.agents.some((a) => String(a.agentId) === 'b'.repeat(16)), 'second caller got its own roster');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
   }
 });

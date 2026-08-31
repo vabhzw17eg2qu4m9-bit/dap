@@ -106,7 +106,7 @@ export default {
         const agents = await client.presence();
         for (let i = pendingInvites.length - 1; i >= 0; i--) {
           const pending = pendingInvites[i];
-          const online = agents.filter((x) => x.online && x.agentId !== client.agentId && x.name?.toLowerCase() === pending.name.toLowerCase());
+          const online = agents.filter((x) => x.agentId !== client.agentId && x.name?.toLowerCase() === pending.name.toLowerCase());
           if (online.length !== 1) continue; // still away (or ambiguous): keep waiting
           try {
             await client.invite(online[0].agentId, pending.channel);
@@ -179,7 +179,7 @@ export default {
           if (/^[0-9a-f]{16}$/.test(who)) return void (await client.invite(who, channel));
           const agents = await client.presence();
           const matches = agents.filter((x) => x.name?.toLowerCase() === who.toLowerCase());
-          if (matches.length === 1 && matches[0].online) return void (await client.invite(matches[0].agentId, channel));
+          if (matches.length === 1) return void (await client.invite(matches[0].agentId, channel));
           if (matches.length > 1)
             return { ok: false, error: `"${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}` };
           // Unknown or offline name: not an error — arm now, deliver on arrival.
@@ -226,16 +226,12 @@ export default {
     });
     ctx.tools.register({
       name: 'dap_peers',
-      description: 'Agents on the hub, ONLINE ONLY by default (agentId, name, online, lastSeen). Set includeOffline:true to also list offline agents (their DMs queue to the hub mailbox).',
-      inputSchema: {
-        type: 'object',
-        properties: { includeOffline: { type: 'boolean', description: 'Also list offline agents (default false)' } },
-      },
-      execute: async (a) => {
+      description: 'Online agents on the hub (agentId, name, online, lastSeen): online peers only. Your own entry is included and marked self:true; every other entry is self:false.',
+      inputSchema: { type: 'object', properties: {} },
+      execute: async () => {
         const down = requireConnected();
         if (down) return down;
-        const all = await client.presence();
-        return { agents: a.includeOffline === true ? all : all.filter((p) => p.online) };
+        return { agents: await client.presence() };
       },
     });
 

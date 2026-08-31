@@ -76,10 +76,11 @@ test('MCP conformance: initialize → tools/list → tools/call dap_send round-t
   assert.ok(st.welcomes >= 1, 'at least one successful handshake');
   assert.deepEqual(st.channels, ['conformance']);
 
-  // tools/call dap_peers: the hub registry lists us online
-  const peers = textOf(await client.callTool({ name: 'dap_peers', arguments: {} })) as unknown as { agents: Array<{ agentId: string; online?: boolean }> };
+  // tools/call dap_peers: the hub registry lists us online, marked self
+  const peers = textOf(await client.callTool({ name: 'dap_peers', arguments: {} })) as unknown as { agents: Array<{ agentId: string; online?: boolean; self?: boolean }> };
   const self = (peers.agents ?? []).find((a) => a.agentId === sent.from);
   assert.equal(self?.online, true);
+  assert.equal(self?.self, true);
 
   // tools/call dap_inbox: sender echo of the channel send + the self-DM
   let inbox = {} as InboxResult;

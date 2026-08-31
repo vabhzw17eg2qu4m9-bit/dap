@@ -1,5 +1,6 @@
 // In-test fake DAP/1 hub: verifies hello/send signatures, answers whois (with
-// the additive x25519 field), tracks channel joins (spec § join), routes
+// the additive x25519 field), answers presence_query (echoing the request
+// frame id as replyTo), tracks channel joins (spec § join), routes
 // plugin-to-plugin DMs and channel fan-out, and can push encrypted frames
 // from a synthetic peer agent to any connected plugin.
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -29,6 +30,10 @@ export class FakeHub {
   hellos = 0;
   /** Test switch: drop whois queries on the floor (bounded-wait tests). */
   answerWhois = true;
+  /** Test switch: park presence answers until releasePresence() (the
+   *  query-id correlation tests control answer order). */
+  holdPresence = false;
+  private heldPresence: (() => void)[] = [];
   /** Bearer tokens accepted at upgrade; when set, any other dial gets HTTP 401. */
   authTokens?: Set<string>;
   /** Upgrade Authorization headers, in arrival order (bearer-auth tests). */
@@ -109,7 +114,7 @@ export class FakeHub {
     if (!agentId) return undefined;
     if (frame.op === 'flush') ws.send(JSON.stringify({ op: 'flushed', count: 0 }));
     else if (frame.op === 'whois') this.onWhois(frame, ws);
-    else if (frame.op === 'presence_query') this.onPresenceQuery(ws);
+    else if (frame.op === 'presence_query') this.onPresenceQuery(frame, ws);
     else if (frame.op === 'join') this.onJoin(frame, ws, agentId);
     else if (frame.op === 'send') this.onSend(frame, ws, agentId);
     return undefined;
@@ -164,8 +169,9 @@ export class FakeHub {
   }
 
   /** Spec § presence: registry = connected plugins + the synthetic peer
-   *  (a hub-lifetime agent, always online). */
-  private onPresenceQuery(ws: WebSocket): void {
+   *  (a hub-lifetime agent, always online). The answer echoes a request
+   *  frame id as replyTo (absent when the query carried none). */
+  private onPresenceQuery(frame: dap.Frame, ws: WebSocket): void {
     const agents = [...this.agents.entries()].map(([agentId, a]) => ({
       agentId,
       name: a.name,
@@ -173,7 +179,10 @@ export class FakeHub {
       lastSeen: Date.now(),
     }));
     agents.push({ agentId: this.peerId, name: 'peer', online: true, lastSeen: Date.now() });
-    ws.send(JSON.stringify({ op: 'presence', agents }));
+    const answer: dap.Frame = { op: 'presence', agents };
+    if (typeof frame.id === 'string') answer.replyTo = frame.id;
+    if (this.holdPresence) this.heldPresence.push(() => ws.send(JSON.stringify(answer)));
+    else ws.send(JSON.stringify(answer));
   }
 
   /** Spec § join: first join creates the channel and registers chanPubkey;
@@ -234,6 +243,11 @@ export class FakeHub {
    *  equivalent of the old one-connection hub). */
   send(frame: dap.Frame): void {
     for (const a of this.agents.values()) a.ws?.send(JSON.stringify(frame));
+  }
+
+  /** Send every presence answer parked by holdPresence, in arrival order. */
+  releasePresence(): void {
+    for (const send of this.heldPresence.splice(0)) send();
   }
 
   /** Resolves on the first frame (already received or future) matching pred. */

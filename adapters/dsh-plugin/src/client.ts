@@ -43,6 +43,8 @@ export interface PresenceAgent {
   name?: string;
   online: boolean;
   lastSeen: number;
+  /** True on the requesting agent's own entry (client-side marking). */
+  self: boolean;
 }
 
 export interface ClientOpts {
@@ -151,7 +153,13 @@ export class DapClient {
   /** hello frames sent (connection attempts) / welcome frames received. */
   hellos = 0;
   welcomes = 0;
-  private readonly presenceWaiters: ((f: dap.Frame) => void)[] = [];
+  /** Parked presence() resolvers by request frame id (spec § presence). */
+  private readonly presenceWaiters = new Map<string, (f: dap.Frame) => void>();
+  /** Sticky client-lifetime echo latch: once a replyTo-carrying presence
+   *  answer is seen, the hub is echo-capable and id-less presence frames are
+   *  broadcasts — they must never complete waiters (BUG 5). Never reset on
+   *  reconnect: the every-other-restart race is exactly what this closes. */
+  private echoSeen = false;
   lastError = '';
 
   constructor(opts: ClientOpts) {
@@ -244,25 +252,31 @@ export class DapClient {
     };
   }
 
-  /** Presence list from the hub (spec § presence); bounded wait for the reply. */
+  /** Online-only presence list from the hub (spec § presence): offline
+   *  entries never surface, the requester's own entry stays in with
+   *  `self: true`. The query carries a per-request id; only the answer
+   *  echoing it (replyTo) completes the wait — bounded, like whois. */
   async presence(): Promise<PresenceAgent[]> {
     if (!this.connected) throw new Error(NOT_CONNECTED);
+    const id = randomUUID();
     const { promise, resolve, reject } = Promise.withResolvers<dap.Frame>();
     const timer = setTimeout(() => {
-      const i = this.presenceWaiters.indexOf(resolve);
-      if (i >= 0) this.presenceWaiters.splice(i, 1);
+      if (this.presenceWaiters.get(id) === resolve) this.presenceWaiters.delete(id);
       reject(new Error('presence: hub did not reply'));
     }, READY_TIMEOUT_MS);
-    this.presenceWaiters.push(resolve);
-    this.ws?.send(JSON.stringify({ op: 'presence_query' }));
+    this.presenceWaiters.set(id, resolve);
+    this.ws?.send(JSON.stringify({ op: 'presence_query', id }));
     const frame = await promise.finally(() => clearTimeout(timer));
     const agents = Array.isArray(frame.agents) ? (frame.agents as Record<string, unknown>[]) : [];
-    return agents.map((a) => ({
-      agentId: String(a.agentId),
-      name: a.name === undefined ? undefined : String(a.name),
-      online: Boolean(a.online),
-      lastSeen: Number(a.lastSeen),
-    }));
+    return agents
+      .filter((a) => Boolean(a.online))
+      .map((a) => ({
+        agentId: String(a.agentId),
+        name: a.name === undefined ? undefined : String(a.name),
+        online: true,
+        lastSeen: Number(a.lastSeen),
+        self: String(a.agentId) === this.agentId,
+      }));
   }
 
   /** Send an E2E-encrypted message to a channel. Unknown channel = zero-config
@@ -426,7 +440,7 @@ export class DapClient {
         this.onHubErrorFrame(frame);
         break;
       case 'presence':
-        for (const r of this.presenceWaiters.splice(0)) r(frame);
+        this.resolvePresence(frame);
         break;
       default:
         break; // flushed: nothing to do
@@ -522,6 +536,30 @@ export class DapClient {
       if (!info) throw new Error(`unknown_agent: ${agentId}`);
       return info;
     });
+  }
+
+  /** Route an inbound presence frame to its waiters (spec § presence): an
+   *  answer echoing OUR request id completes only that query — a stale or
+   *  foreign echo matches nobody. A legacy answer carries no replyTo and is
+   *  wire-indistinguishable from a broadcast push, so — until the hub has
+   *  proven it echoes — it completes every pending query one-completes-all.
+   *
+   *  // ponytail: sticky latch, Dart fah_hub_client 0.2.1 parity — armed =
+   *  hub is echo-capable, so id-less frames are broadcasts and get dropped
+   *  (this adapter keeps no roster cache to serve them from). */
+  private resolvePresence(frame: dap.Frame): void {
+    const rid = typeof frame.replyTo === 'string' ? frame.replyTo : '';
+    if (rid) {
+      this.echoSeen = true; // any echo — even a stale one — proves the hub echoes
+      const resolve = this.presenceWaiters.get(rid);
+      if (!resolve) return;
+      this.presenceWaiters.delete(rid);
+      resolve(frame);
+      return;
+    }
+    if (this.echoSeen) return; // echo-capable hub: id-less frame = unsolicited broadcast
+    for (const resolve of [...this.presenceWaiters.values()]) resolve(frame);
+    this.presenceWaiters.clear();
   }
 
   /** Pending whois never outlives its socket: close/retarget/stop fail every

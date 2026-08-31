@@ -37,6 +37,16 @@ export interface PresenceAgent {
   lastSeen?: number;
 }
 
+/** Hub `presence` frame: an ANSWER echoes the presence_query request id as
+ *  `replyTo` (additive hub field); broadcast pushes (peer join/offline to
+ *  channel-mates) never carry it. */
+export interface PresenceFrame {
+  op: 'presence';
+  agents: PresenceAgent[];
+  /** Echo of the request `id` — present only on answers. */
+  replyTo?: string;
+}
+
 export interface AgentInfo {
   agentId: string;
   pubkey: string;
@@ -100,6 +110,14 @@ export class DapClient {
 
   private readonly whoisCache = new Map<string, AgentInfo>();
   private readonly whoisWaiters = new Map<string, Array<(info: AgentInfo | undefined) => void>>();
+  /** Pending presence_query calls, keyed by request id (see presence()). */
+  private readonly presenceWaiters = new Map<string, Array<(agents: PresenceAgent[]) => void>>();
+  /** ponytail: sticky client-lifetime latch — a replyTo echo proves the hub
+   *  is echo-capable, so id-less presence frames are broadcasts (never
+   *  answers) and must not complete waiters. NOT reset on reconnect: echo
+   *  capability doesn't flip with our socket, and resetting reopens the
+   *  every-other-restart reconnect race. */
+  private echoSeen = false;
   /** Subscribe to inbound msg frames. Every subscriber receives each frame
    *  (one client is shared by every omp session in the process — delivery
    *  must fan out, not go to the last subscriber). Returns an unsubscriber. */
@@ -222,12 +240,32 @@ export class DapClient {
     this.send({ op: 'join', channel, chanPubkey: chanPubkeyB64 });
   }
 
-  /** Presence snapshot: every agent the hub knows (id, name, online, lastSeen). */
+  /** Presence snapshot: every agent the hub knows (id, name, online, lastSeen).
+   *  The query carries a unique request id; a current hub echoes it back as
+   *  `replyTo` on the ANSWER, so only our own answer completes the wait — a
+   *  concurrent broadcast can never satisfy it with a partial roster. */
   presence(): Promise<PresenceAgent[]> {
-    const prev = this.eventCount('presence');
-    this.send({ op: 'presence_query' });
-    return this.waitForAfter<{ agents: PresenceAgent[] }>('presence', prev, 5000)
-      .then((f) => f.agents);
+    const id = bytesToHex(randomBytes(16)); // same convention as the hello nonce
+    const { promise, resolve, reject } = Promise.withResolvers<PresenceAgent[]>();
+    let timer: NodeJS.Timeout;
+    const entry = (agents: PresenceAgent[]) => {
+      clearTimeout(timer);
+      resolve(agents);
+    };
+    const waiters = this.presenceWaiters.get(id) ?? [];
+    waiters.push(entry);
+    this.presenceWaiters.set(id, waiters);
+    timer = setTimeout(() => {
+      const list = this.presenceWaiters.get(id);
+      const i = list?.indexOf(entry) ?? -1;
+      if (list && i >= 0) {
+        list.splice(i, 1);
+        if (!list.length) this.presenceWaiters.delete(id);
+      }
+      reject(new Error('timeout waiting for presence'));
+    }, 5000);
+    this.send({ op: 'presence_query', id });
+    return promise;
   }
 
   /** Pubkey directory lookup (needed for DM key agreement). The cache is
@@ -311,6 +349,30 @@ export class DapClient {
         void Promise.all(
           [...this.frameListeners].map((fn) => Promise.resolve(fn(msgFrame)).catch(() => {})),
         ).then(() => this.emit('inbound', msgFrame));
+        break;
+      }
+      case 'presence': {
+        const pf = frame as unknown as PresenceFrame;
+        if (typeof pf.replyTo === 'string') {
+          this.echoSeen = true;
+          // Strict match: only the query this answer echoes completes. A
+          // foreign/stale echo or a broadcast must never satisfy a pending
+          // query with a partial roster.
+          const waiters = this.presenceWaiters.get(pf.replyTo);
+          this.presenceWaiters.delete(pf.replyTo);
+          for (const resolve of waiters ?? []) resolve(pf.agents);
+        } else if (!this.echoSeen) {
+          // ponytail: legacy hub answers carry no replyTo and are
+          // indistinguishable on the wire from broadcast pushes, so they
+          // complete all waiters one-completes-all — a broadcast landing in
+          // that window can still satisfy a query with a partial roster.
+          // Residual legacy-hub race only; the hub-side replyTo echo (every
+          // current hub) is the real fix.
+          const waiters = [...this.presenceWaiters.values()].flat();
+          this.presenceWaiters.clear();
+          for (const resolve of waiters) resolve(pf.agents);
+        }
+        this.emit('presence', pf);
         break;
       }
       case 'agent_info': {

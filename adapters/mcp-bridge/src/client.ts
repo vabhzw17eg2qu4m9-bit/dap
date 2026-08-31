@@ -60,7 +60,12 @@ export interface PresenceAgent {
   name?: string;
   online?: boolean;
   lastSeen?: number;
+  /** Client-side marking (the hub wire is unchanged): true only for this client's own entry. */
+  self: boolean;
 }
+
+/** Parked by presence() until the id-matched answer arrives (or failure). */
+type PresenceWaiter = (err?: Error, agents?: PresenceAgent[]) => void;
 
 export interface StatusInfo {
   connected: boolean;
@@ -191,7 +196,12 @@ export class DapClient {
   hellos = 0;
   welcomes = 0;
   private readonly readyWaiters: Array<(err?: Error) => void> = [];
-  private readonly presenceWaiters: Array<(err?: Error, agents?: PresenceAgent[]) => void> = [];
+  private readonly presenceWaiters = new Map<string, Set<PresenceWaiter>>();
+  // ponytail: client-lifetime echo latch — armed by the first presence answer
+  // carrying replyTo, NEVER reset (reconnect included). Armed = the hub echoes
+  // query ids, so a replyTo-less presence frame is a broadcast and must not
+  // complete waiters; un-armed (legacy hub) = id-less answers still complete.
+  private echoSeen = false;
   private readonly joinWaiters = new Map<string, Array<(err?: Error) => void>>();
   private readonly listeners = new Set<(m: MsgEvent) => void>();
   private ws: WebSocket | null = null;
@@ -289,7 +299,8 @@ export class DapClient {
   private failWaiters(err: Error): void {
     for (const resolves of this.whoisWaiters.values()) for (const done of resolves) done(err);
     this.whoisWaiters.clear();
-    for (const done of this.presenceWaiters.splice(0)) done(err);
+    for (const waiters of this.presenceWaiters.values()) for (const done of waiters) done(err);
+    this.presenceWaiters.clear();
     for (const wake of this.readyWaiters.splice(0)) wake(err);
   }
 
@@ -429,7 +440,7 @@ export class DapClient {
     if (/^[0-9a-f]{16}$/.test(who)) return this.invite(channel, who);
     const wanted = who.toLowerCase();
     const matches = (await this.presence()).filter((a) => a.name?.toLowerCase() === wanted);
-    if (matches.length === 1 && matches[0].online) return this.invite(channel, matches[0].agentId);
+    if (matches.length === 1) return this.invite(channel, matches[0].agentId);
     if (matches.length > 1) {
       throw new Error(`"${who}" is ambiguous — use an id: ${matches.map((m) => m.agentId).join(', ')}`);
     }
@@ -481,7 +492,7 @@ export class DapClient {
       for (let i = this.pendingInvites.length - 1; i >= 0; i--) {
         const pending = this.pendingInvites[i]!;
         const online = agents.filter(
-          (a) => a.online && a.agentId !== this.agentId && a.name?.toLowerCase() === pending.name.toLowerCase(),
+          (a) => a.agentId !== this.agentId && a.name?.toLowerCase() === pending.name.toLowerCase(),
         );
         if (online.length !== 1) continue; // still away (or ambiguous): keep waiting
         try {
@@ -531,30 +542,34 @@ export class DapClient {
       hellos: this.hellos,
     };
   }
-
-  /** Hub presence list (the MCP `dap_peers` tool): every agent in the
-   *  registry with online/lastSeen. Bounded wait, like whois. */
+  /** Hub presence list (the MCP `dap_peers` tool): ONLINE peers only — this
+   *  client's own entry included and marked self:true, all others self:false.
+   *  The query carries an id; a current hub echoes it as `replyTo` and only
+   *  the matching answer completes the wait, so a concurrent broadcast can
+   *  never satisfy the query with a partial roster. Legacy hubs answer
+   *  without replyTo — indistinguishable from broadcasts on the legacy wire,
+   *  so their frames complete waiters legacy-style (residual restart race,
+   *  fixed by the replyTo echo every current hub carries). Bounded wait. */
   async presence(): Promise<PresenceAgent[]> {
     if (!this.connected) throw new Error(NOT_CONNECTED);
+    const id = randomUUID();
+    const waiters = this.presenceWaiters.get(id) ?? new Set<PresenceWaiter>();
+    this.presenceWaiters.set(id, waiters);
     const { promise, resolve, reject } = Promise.withResolvers<PresenceAgent[]>();
-    const done = (err?: Error, agents?: PresenceAgent[]) => {
+    const done: PresenceWaiter = (err, agents) => {
       clearTimeout(timer);
+      waiters.delete(done);
+      if (waiters.size === 0) this.presenceWaiters.delete(id);
       if (err) reject(err); else resolve(agents ?? []);
     };
-    const timer = setTimeout(() => {
-      const i = this.presenceWaiters.indexOf(done);
-      if (i >= 0) this.presenceWaiters.splice(i, 1);
-      reject(new Error('timeout waiting for presence'));
-    }, WAIT_MS);
-    this.presenceWaiters.push(done);
+    const timer = setTimeout(() => done(new Error('timeout waiting for presence')), WAIT_MS);
+    waiters.add(done);
     try {
-      this.sendFrame({ op: 'presence_query' });
+      this.sendFrame({ op: 'presence_query', id });
     } catch (err) {
-      const i = this.presenceWaiters.indexOf(done);
-      if (i >= 0) this.presenceWaiters.splice(i, 1);
       done(err as Error);
     }
-    return promise;
+    return promise.then((agents) => agents.filter((a) => a.online === true));
   }
 
   /** Drain the decrypted inbox (pull-mode inbound — the MCP `dap_inbox` tool). */
@@ -672,20 +687,35 @@ export class DapClient {
     this.joinWaiters.delete(channel);
   }
 
-  /** A presence frame either answers our `presence_query` (full registry
-   *  snapshot) or broadcasts a peer's online/offline to channel-mates —
-   *  both carry the same shape, so both resolve pending waiters. */
+  /** A presence frame is one of: our query's answer (a current hub echoes
+   *  the query id as `replyTo`), a peer join/offline broadcast (never a
+   *  replyTo), or a LEGACY hub's id-less answer — indistinguishable from a
+   *  broadcast on the legacy wire. replyTo present: complete only the
+   *  matching query and arm the echo latch. replyTo absent: a broadcast
+   *  once the latch is armed (dropped — it can never be an answer), legacy
+   *  completion (residual restart race) before that, on hubs that never
+   *  echo. */
   private onPresence(frame: dap.Frame): void {
     const agents = (Array.isArray(frame.agents) ? frame.agents : []).map((a) => {
       const e = a as Record<string, unknown>;
+      const agentId = String(e.agentId);
       return {
-        agentId: String(e.agentId),
+        agentId,
         name: e.name as string | undefined,
         online: e.online as boolean | undefined,
         lastSeen: e.lastSeen as number | undefined,
+        self: agentId === this.agentId,
       };
     });
-    for (const done of this.presenceWaiters.splice(0)) done(undefined, agents);
+    if (frame.replyTo === undefined) {
+      if (this.echoSeen) return; // echo-capable hub: id-less frame is a broadcast, not an answer
+      for (const waiters of this.presenceWaiters.values()) for (const done of waiters) done(undefined, agents);
+      return;
+    }
+    this.echoSeen = true; // first echoed answer proves the hub echoes query ids
+    const waiters = this.presenceWaiters.get(String(frame.replyTo));
+    if (!waiters) return; // someone else's echo or an already-gone query
+    for (const done of waiters) done(undefined, agents);
   }
 
   /** Hub verdicts are never silent: bounded ring (drained by dap_inbox) +

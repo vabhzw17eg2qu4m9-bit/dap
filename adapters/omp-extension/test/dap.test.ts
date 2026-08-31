@@ -1105,7 +1105,7 @@ test('dap_status: identity + connection state the agent can read about itself', 
   }
 });
 
-test('dap_peers: lists only other online agents — self and offline excluded', async () => {
+test('dap_peers: online only, own entry present and marked self', async () => {
   const hub = await new FakeHub().listen();
   const a = fakeCtx();
   const b = fakeCtx();
@@ -1120,15 +1120,143 @@ test('dap_peers: lists only other online agents — self and offline excluded', 
     hub.drop(extC.client.agentId);
     await hub.waitOffline(extC.client.agentId);
 
-    const r = await run<{ agents: Array<{ agentId: string; online: boolean }> }>(a, 'dap_peers');
-    assert.ok(r.agents.some((x) => x.agentId === extB.client.agentId), 'other online agent listed');
-    assert.ok(!r.agents.some((x) => x.agentId === extA.client.agentId), 'self never listed');
-    assert.ok(!r.agents.some((x) => x.agentId === extC.client.agentId), 'offline agent excluded');
+    const r = await run<{ agents: Array<{ agentId: string; online: boolean; self: boolean }> }>(a, 'dap_peers');
+    const own = r.agents.find((x) => x.agentId === extA.client.agentId);
+    assert.ok(own, 'own entry present');
+    assert.equal(own!.self, true, 'own entry marked self');
+    const other = r.agents.find((x) => x.agentId === extB.client.agentId);
+    assert.ok(other, 'other online agent listed');
+    assert.equal(other!.self, false, 'other entry not marked self');
+    assert.ok(!r.agents.some((x) => x.agentId === extC.client.agentId), 'offline agent absent');
     assert.ok(r.agents.every((x) => x.online === true), 'all entries online');
   } finally {
     extA.dispose();
     extB.dispose();
     extC.dispose();
+    await hub.close();
+  }
+});
+
+test('dap_peers: an unsolicited stale presence frame never satisfies a pending query', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'alice' });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'bob' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    hub.holdPresence = true; // keep the real answer back until the frame is injected
+    const pending = run<{ agents: Array<{ agentId: string; self: boolean }> }>(a, 'dap_peers');
+    await hub.waitPresenceQuery(); // query is out; its answer is held
+    // The live-race shape: an unsolicited one-agent presence frame (foreign
+    // replyTo, ghost roster) lands before the real two-agent answer.
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      replyTo: 'stale-other-query',
+      agents: [{ agentId: 'f'.repeat(16), name: 'ghost', online: true }],
+    });
+    hub.releasePresence(); // the real answer (replyTo echo) arrives second
+    const r = await pending;
+    assert.ok(r.agents.some((x) => x.agentId === extA.client.agentId && x.self), 'own entry present');
+    assert.ok(r.agents.some((x) => x.agentId === extB.client.agentId), 'other agent of the answer present');
+    assert.ok(!r.agents.some((x) => x.agentId === 'f'.repeat(16)), 'stale ghost roster never surfaced');
+  } finally {
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('presence: legacy id-less answer still completes (back-compat)', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'solo' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    hub.holdPresence = true;
+    const pending = extA.client.presence();
+    await hub.waitPresenceQuery(); // query out, answer held
+    // A legacy hub answers without replyTo — indistinguishable from a
+    // broadcast on that wire; it must still complete the waiter.
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      agents: [{ agentId: extA.client.agentId, name: 'solo', online: true }],
+    });
+    assert.deepEqual((await pending).map((x) => x.agentId), [extA.client.agentId]);
+  } finally {
+    extA.dispose();
+    await hub.close();
+  }
+});
+
+test('presence: echo latch — an id-less broadcast never completes a query on an echo-capable hub', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'watcher' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    // Query A: the hub's real answer echoes replyTo — this arms the latch.
+    hub.holdPresence = true;
+    const qA = extA.client.presence();
+    await hub.waitPresenceQuery();
+    hub.releasePresence();
+    await qA;
+    // Query B pends; an unsolicited one-agent broadcast (NO replyTo) lands.
+    hub.holdPresence = true; // hold B's real echo behind the broadcast
+    const qB = extA.client.presence();
+    await hub.waitPresenceQuery();
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      agents: [{ agentId: 'e'.repeat(16), name: 'ghost', online: true }],
+    });
+    await eventCountAtLeast(extA.client, 'presence', 2); // broadcast handled
+    assert.equal(
+      await Promise.race([qB, Promise.resolve('pending')]),
+      'pending',
+      'latch armed: the id-less broadcast must not complete the waiter',
+    );
+    // B's real answer (matching replyTo) completes it with the FULL roster.
+    hub.releasePresence();
+    const roster = await qB;
+    const ids = roster.map((x) => x.agentId);
+    assert.ok(ids.includes(extA.client.agentId), 'own entry present');
+    assert.ok(!ids.includes('e'.repeat(16)), 'ghost broadcast roster never surfaced');
+  } finally {
+    extA.dispose();
+    await hub.close();
+  }
+});
+
+test('presence: concurrent callers each get their own answer', async () => {
+  const hub = await new FakeHub().listen();
+  const a = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'caller' });
+  try {
+    await nextEvent(extA.client, 'welcome');
+    hub.holdPresence = true;
+    const p1 = extA.client.presence();
+    const p2 = extA.client.presence();
+    const first = (await hub.waitPresenceQuery()).id as string;
+    const second = (await hub.waitPresenceQuery()).id as string;
+    assert.notEqual(first, second, 'each query carries a unique id');
+    // Answers in REVERSE order with DISTINCT rosters: only per-id routing
+    // delivers each caller its own roster.
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      replyTo: second,
+      agents: [{ agentId: extA.client.agentId, online: true }, { agentId: 'b'.repeat(16), online: true }],
+    });
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      replyTo: first,
+      agents: [{ agentId: extA.client.agentId, online: true }, { agentId: 'a'.repeat(16), online: true }],
+    });
+    const [one, two] = await Promise.all([p1, p2]);
+    assert.ok(one.some((x) => x.agentId === 'a'.repeat(16)), 'first caller got its own roster');
+    assert.ok(two.some((x) => x.agentId === 'b'.repeat(16)), 'second caller got its own roster');
+  } finally {
+    extA.dispose();
     await hub.close();
   }
 });
@@ -1375,7 +1503,7 @@ test('per-process singleton: second session reuses the client (no eviction war)'
   }
 });
 
-test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers notify rows (online only, self excluded)', async () => {
+test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers notify rows (online only, own entry marked self)', async () => {
   const hub = await new FakeHub().listen();
   const a = fakeCtx();
   const b = fakeCtx();
@@ -1405,8 +1533,8 @@ test('/dap_status and /dap_peers commands: status JSON mirrors the tool; peers n
     await presenceA;
     await microtasksSettled(); // the notify rides a microtask after the presence emission
     assert.ok(notified.at(-1)!.includes('on ' + extC.client.agentId + ' carol'), 'other online row notified: ' + notified.at(-1));
-    assert.ok(!notified.at(-1)!.includes(extA.client.agentId), 'self excluded from notify');
-    assert.ok(!notified.at(-1)!.includes(extB.client.agentId), 'offline agent excluded from notify');
+    assert.ok(notified.at(-1)!.includes('on ' + extA.client.agentId + ' alice (self)'), 'own row notified and marked self: ' + notified.at(-1));
+    assert.ok(!notified.at(-1)!.includes(extB.client.agentId), 'offline agent absent from notify');
   } finally {
     extA.dispose();
     extB.dispose();

@@ -71,7 +71,7 @@ test('dap_connect: runtime retarget to a second hub — new identity, default ro
   assert.equal(before.url, hub1.url);
   assert.equal(before.name, 'connect-a');
   const firstId = String(before.agentId);
-  await pollUntil(async () => (await watcher.presence()).some((a) => a.agentId === firstId && a.online === true));
+  await pollUntil(async () => (await watcher.presence()).some((a) => a.agentId === firstId));
 
   // Phase 1 must have enrolled: the issued client secret is in the config.
   const phase1 = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;
@@ -110,7 +110,7 @@ test('dap_connect: runtime retarget to a second hub — new identity, default ro
   assert.equal(inbox.messages.find((m) => m.channel === 'lobby')?.text, 'retargeted');
 
   // Hub1 saw the disconnect: the old identity is offline in its registry.
-  await pollUntil(async () => !(await watcher.presence()).some((a) => a.agentId === firstId && a.online === true));
+  await pollUntil(async () => !(await watcher.presence()).some((a) => a.agentId === firstId));
 
   // Persistence: config file (url/name/channels), name-derived key 0600, lobby keypair.
   const cfg = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;

@@ -1,5 +1,5 @@
 import { loadOrCreateKeys, x25519, b64, unb64, type KeyPair } from './crypto.ts';
-import { DapClient, type Backoff, type Timers } from './conn.ts';
+import { DapClient, type Backoff, type Timers, type PresenceAgent } from './conn.ts';
 import { Inbox, type InboxEntry } from './inbox.ts';
 import {
   encryptForChannel,
@@ -461,12 +461,20 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     execute: async () => toolResult(statusPayload()),
   });
 
+  /** dap_peers snapshot: ONLINE agents only, own entry kept and marked self
+   *  (client-side marking: entry.agentId === our agentId — hub wire format
+   *  is unchanged). */
+  const onlinePeers = async (): Promise<Array<PresenceAgent & { self: boolean }>> =>
+    (await client.presence())
+      .filter((a) => a.online)
+      .map((a) => ({ ...a, self: a.agentId === client.agentId }));
+
   ctx.registerTool({
     name: 'dap_peers',
-    description: 'Agents on the hub: ONLINE agents only, excluding this agent itself. Discover agentIds here — they are 16-hex ids, never names.',
+    description: 'Online agents on the hub: online peers only; your own entry is present and marked self (self: true). Discover agentIds here — they are 16-hex ids, never names.',
     parameters: { type: 'object', properties: {} },
     execute: async () => {
-      const agents = (await client.presence()).filter((a) => a.online && a.agentId !== client.agentId);
+      const agents = await onlinePeers();
       return toolResult({ agents });
     },
   });
@@ -600,19 +608,17 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
   ctx.registerCommand?.('dap_peers', {
-    description: '/dap_peers — online agents on the hub (excluding this agent)',
+    description: '/dap_peers — online agents on the hub (own entry marked self)',
     handler: (_args: string, cmdCtx?: CommandCtx): string => {
       const down = requireConnected();
       if (down) {
         cmdCtx?.ui?.notify(down.error, 'error');
         return down.error;
       }
-      void client
-        .presence()
+      void onlinePeers()
         .then((agents) => {
           const rows = agents
-            .filter((a) => a.online && a.agentId !== client.agentId)
-            .map((a) => `${a.online ? 'on' : 'off'} ${a.agentId}${a.name ? ' ' + a.name : ''}`)
+            .map((a) => `on ${a.agentId}${a.name ? ' ' + a.name : ''}${a.self ? ' (self)' : ''}`)
             .join('\n');
           const out = rows || 'no agents online';
           cmdCtx?.ui?.notify(out, 'info');

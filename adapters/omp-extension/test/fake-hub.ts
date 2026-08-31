@@ -160,7 +160,7 @@ export class FakeHub {
     if (frame.t === 'enroll') return this.enroll(ws, agentId, bearer);
     if (frame.op === 'whois') return this.whois(ws, String(frame.agentId));
     if (frame.op === 'join') return this.join(agentId, ws, frame);
-    if (frame.op === 'presence_query') return this.presence(ws);
+    if (frame.op === 'presence_query') return this.presence(ws, frame);
     if (frame.op === 'send') return this.send(agentId, ws, frame as unknown as SendFrame);
     if (frame.op === 'flush') return this.flush(ws, agentId);
     this.error(ws, 'bad_frame');
@@ -229,15 +229,51 @@ export class FakeHub {
     return undefined;
   }
 
-  private presence(ws: WebSocket): undefined {
+  private presence(ws: WebSocket, frame: Record<string, unknown>): undefined {
+    // Hand the query to a parked waiter, else queue it for waitPresenceQuery.
+    const waiter = this.presenceQueryWaiters.shift();
+    if (waiter) waiter(frame);
+    else this.presenceQueries.push(frame);
     const agents = [...this.agents.entries()].map(([agentId, a]) => ({
       agentId,
       name: a.name,
       online: a.ws !== undefined,
       lastSeen: a.lastSeen,
     }));
-    ws.send(JSON.stringify({ op: 'presence', agents }));
+    // Hub contract: an answer echoes a request id as replyTo (absent when
+    // the query carried none); broadcast pushes never carry one.
+    const answer: Record<string, unknown> = { op: 'presence', agents };
+    if (typeof frame.id === 'string') answer.replyTo = frame.id;
+    if (this.holdPresence) this.heldPresence.push({ ws, answer });
+    else ws.send(JSON.stringify(answer));
     return undefined;
+  }
+
+  /** Regression hooks: hold answers so a test can interleave injected
+   *  frames between the query and its reply (deterministic, no sleeps). */
+  holdPresence = false;
+  private readonly heldPresence: Array<{ ws: WebSocket; answer: Record<string, unknown> }> = [];
+  private readonly presenceQueries: Record<string, unknown>[] = [];
+  private readonly presenceQueryWaiters: Array<(f: Record<string, unknown>) => void> = [];
+
+  /** Next presence_query the hub received (carries the request id). */
+  waitPresenceQuery(): Promise<Record<string, unknown>> {
+    const next = this.presenceQueries.shift();
+    if (next) return Promise.resolve(next);
+    const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+    this.presenceQueryWaiters.push(resolve);
+    return promise;
+  }
+
+  /** Flush held presence answers, oldest first. */
+  releasePresence(): void {
+    for (const { ws, answer } of this.heldPresence.splice(0)) ws.send(JSON.stringify(answer));
+  }
+
+  /** Push a crafted raw frame to one connected agent (stale echoes,
+   *  broadcasts). */
+  sendTo(agentId: string, frame: Record<string, unknown>): void {
+    this.agents.get(agentId)?.ws?.send(JSON.stringify(frame));
   }
 
   private send(from: string, ws: WebSocket, frame: SendFrame): undefined {
