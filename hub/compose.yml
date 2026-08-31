@@ -6,7 +6,9 @@ services:
       - "8787:8080"
     environment:
       HUB_ADMIN_TOKEN: ${HUB_ADMIN_TOKEN:?set HUB_ADMIN_TOKEN before starting}
+      HUB_MASTER_SECRET: ${HUB_MASTER_SECRET:?set HUB_MASTER_SECRET before starting}
       HUB_CHANNELS_FILE: /data/channels.json
+      HUB_SECRETS_FILE: /data/secrets.json
       HUB_ADDR: ":8080"
     volumes:
       - hub-data:/data

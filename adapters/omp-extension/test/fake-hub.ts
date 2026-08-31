@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { verifyFrame, agentIdFor, unb64, type KeyPair } from '../src/crypto.ts';
 
@@ -49,20 +50,45 @@ export class FakeHub {
     res.statusCode = 404;
     res.end();
   });
-  private readonly wss = new WebSocketServer({ server: this.server, path: '/ws' });
+  private readonly wss = new WebSocketServer({ noServer: true });
   private readonly noncesSeen = new Set<string>();
   private readonly mailboxFull = new Set<string>();
   private readonly offlineWaiters = new Map<string, Array<() => void>>();
   private readonly sendWaiters: Array<() => void> = [];
+  /** Enrollment auth (undefined = auth disabled — legacy tests dial freely). */
+  private readonly masterSecret: string | undefined;
+  /** Authorization bearer captured per upgrade attempt (test assertions). */
+  readonly upgrades: (string | undefined)[] = [];
+  /** Secrets issued via {"t":"enroll"} — accepted as bearer on later dials. */
+  private readonly issuedSecrets = new Set<string>();
+  /** agentIds that enrolled (asserts hello-before-enroll, one per connection). */
+  readonly enrollRequests: string[] = [];
   port = 0;
   url = '';
 
-  constructor() {
-    this.wss.on('connection', (ws) => {
+  constructor(opts: { masterSecret?: string } = {}) {
+    this.masterSecret = opts.masterSecret;
+    // Bearer auth is enforced pre-upgrade (the hub 401s before Accept).
+    this.server.on('upgrade', (req, socket, head) => {
+      const token = bearerOf(req.headers.authorization);
+      this.upgrades.push(token);
+      const authed =
+        this.masterSecret === undefined ||
+        token === this.masterSecret ||
+        (token !== undefined && this.issuedSecrets.has(token));
+      if (req.url !== '/ws' || !authed) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nunauthorized');
+        socket.destroy();
+        return;
+      }
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req));
+    });
+    this.wss.on('connection', (ws, req) => {
+      const bearer = bearerOf(req.headers.authorization);
       let agentId = '';
       ws.on('error', () => {});
       ws.on('message', (data) => {
-        agentId = this.handle(ws, agentId, String(data)) ?? agentId;
+        agentId = this.handle(ws, agentId, String(data), bearer) ?? agentId;
       });
       ws.on('close', () => {
         if (agentId && this.agents.get(agentId)?.ws === ws) {
@@ -118,7 +144,7 @@ export class FakeHub {
     return promise;
   }
 
-  private handle(ws: WebSocket, agentId: string, text: string): string | undefined {
+  private handle(ws: WebSocket, agentId: string, text: string, bearer: string | undefined): string | undefined {
     let frame: Record<string, unknown>;
     try {
       frame = JSON.parse(text) as Record<string, unknown>;
@@ -131,6 +157,7 @@ export class FakeHub {
       this.error(ws, 'not_authenticated');
       return undefined;
     }
+    if (frame.t === 'enroll') return this.enroll(ws, agentId, bearer);
     if (frame.op === 'whois') return this.whois(ws, String(frame.agentId));
     if (frame.op === 'join') return this.join(agentId, ws, frame);
     if (frame.op === 'presence_query') return this.presence(ws);
@@ -272,8 +299,26 @@ export class FakeHub {
   private error(ws: WebSocket, code: string): void {
     ws.send(JSON.stringify({ op: 'error', code, msg: code }));
   }
+
+  /** Enroll op (master-auth connections only): issue a fresh 32-byte
+   *  base64url client secret and accept it as bearer on later dials. */
+  private enroll(ws: WebSocket, agentId: string, bearer: string | undefined): undefined {
+    if (bearer === undefined || bearer !== this.masterSecret) {
+      this.error(ws, 'not_master_auth');
+      return undefined;
+    }
+    const secret = randomBytes(32).toString('base64url');
+    this.issuedSecrets.add(secret);
+    this.enrollRequests.push(agentId);
+    ws.send(JSON.stringify({ t: 'enrolled', secret }));
+    return undefined;
+  }
 }
 
 function optName(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+function bearerOf(v: string | undefined): string | undefined {
+  return typeof v === 'string' && v.startsWith('Bearer ') ? v.slice('Bearer '.length) : undefined;
 }

@@ -57,6 +57,19 @@ type frame struct {
 	Msg        string      `json:"msg,omitempty"`
 }
 
+// frameOp resolves the dispatch key. Standard frames carry "op"; the
+// frozen enroll wire shape uses "t" ({"t":"enroll"}). Returns "" when
+// neither holds a string.
+func frameOp(f frame, raw map[string]any) string {
+	if f.Op != "" {
+		return f.Op
+	}
+	if t, ok := raw["t"].(string); ok {
+		return t
+	}
+	return ""
+}
+
 // protoError is an error carrying a spec error code.
 type protoError struct {
 	code string

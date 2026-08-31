@@ -63,6 +63,9 @@ class HubPlugin implements FahPlugin {
     if (_repository != null) return;
     final settings =
         resolveDapSettings(config: _config, environment: environment, home: home);
+    final configFile = defaultDapConfigFile(home, environment);
+    final token = resolveDapClientSecret(
+        environment: environment, config: readDapConfig(configFile));
     _identity = identity ?? await HubIdentity.load(settings.keyPath);
     _client = HubClient(
       config: HubConfig(
@@ -73,6 +76,10 @@ class HubPlugin implements FahPlugin {
       ),
       identity: _identity!,
       channelStore: await ChannelStore.fromFile(settings.channelsFile),
+      clientSecret: token.token,
+      enroll: token.enroll,
+      configFile: configFile,
+      onNotice: (notice) => _io?.writeln('[hub] $notice'),
     );
     // Hub rejections must never be silent: print them to the host terminal.
     _errorSub = _client!.errors.listen(
@@ -153,6 +160,8 @@ class HubPlugin implements FahPlugin {
       file: defaultDapConfigFile(home),
     );
     _io?.writeln('[hub] connected to ${result.url} as ${result.agentId}');
+    _io?.writeln('[hub] first connect needs DAP_MASTER_SECRET set '
+        '(enrolls once, then stored)');
     return result;
   }
 

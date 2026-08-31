@@ -13,16 +13,19 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { DapClient, type MsgEvent } from '../src/client.js';
 import { loadChannelKeys, newChannelKeypair, parseChankeyInvite } from '../src/channels.js';
-import { resolveDapSettings } from '../src/config.js';
+import { readDapConfig, resolveDapSettings } from '../src/config.js';
 import { b64d } from '../src/crypto.js';
-import { startHub } from './hub.js';
+import { pinMasterAuth, startHub } from './hub.js';
 import { pollUntil } from './util.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 // Determinism: clear any DAP_* env leaked in from the machine running the
 // tests (restored after); nothing here may depend on the operator's shell.
-const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CHANNELS'] as const;
+const DAP_ENV_KEYS = [
+  'DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CHANNELS',
+  'DAP_MASTER_SECRET', 'DAP_CLIENT_SECRET', 'DAP_CONFIG_FILE',
+] as const;
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
 test.after(() => {
@@ -97,7 +100,9 @@ test('auto-keygen: send to an unknown channel persists keys; second instance aut
   const dirB = tmp();
   const channelsFile = join(dirA, 'channels.json');
   const A = new DapClient({ url: hub.url, keyPath: keyFile(dirA), channelsFile });
+  const unA = pinMasterAuth(hub, join(dirA, 'config.json'));
   try {
+
     A.start();
     await A.ready();
 
@@ -115,6 +120,7 @@ test('auto-keygen: send to an unknown channel persists keys; second instance aut
     // Fresh instance, same channels file: auto-joins every known channel
     // after welcome — zero config beyond pointing at the same file.
     const B = new DapClient({ url: hub.url, keyPath: keyFile(dirB), channelsFile });
+    const unB = pinMasterAuth(hub, join(dirB, 'config.json'));
     const seenB = collect(B);
     try {
       B.start();
@@ -130,9 +136,11 @@ test('auto-keygen: send to an unknown channel persists keys; second instance aut
       await B.ready();
       await pollUntil(() => B.joinedChannels.includes('zc-auto'));
     } finally {
+      unB();
       B.stop();
     }
   } finally {
+    unA();
     A.stop();
   }
 });
@@ -143,9 +151,11 @@ test('invite: full server (dap_invite tool) invites a plain client; B auto-persi
   // in ~/.dap/keys/mcp/<name>.key (0600) under the pinned HOME.
   const serverHome = tmp();
   const fileA = join(serverHome, 'channels-a.json');
-  const fileB = join(tmp(), 'channels-b.json');
+  const dirB = tmp();
+  const fileB = join(dirB, 'channels-b.json');
   writeFileSync(fileB, '{}', { flag: 'wx' }); // B literally starts with an empty channels file
-  const B = new DapClient({ url: hub.url, keyPath: keyFile(tmp()), channelsFile: fileB });
+  const B = new DapClient({ url: hub.url, keyPath: keyFile(dirB), channelsFile: fileB });
+  const unB = pinMasterAuth(hub, join(dirB, 'config.json'));
   const seenB = collect(B);
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -156,6 +166,8 @@ test('invite: full server (dap_invite tool) invites a plain client; B auto-persi
       DAP_HUB_URL: hub.url,
       DAP_AGENT_NAME: 'zc-server',
       DAP_CHANNELS_FILE: fileA,
+      DAP_CONFIG_FILE: join(serverHome, 'config.json'),
+      DAP_MASTER_SECRET: hub.masterSecret, // the server enrolls at first connect
     } as Record<string, string>,
     stderr: 'ignore',
   });
@@ -186,21 +198,29 @@ test('invite: full server (dap_invite tool) invites a plain client; B auto-persi
     assert.equal(statSync(keyPath).mode & 0o777, 0o600);
   } finally {
     await mcp.close(); // closes stdio; the server child exits with it
+    unB();
     B.stop();
   }
 });
 
 test('chankey DM is not a normal inbox message on B (invite notice instead)', async () => {
   const hub = await startHub();
-  const fileA = join(tmp(), 'channels-a.json');
-  const fileB = join(tmp(), 'channels-b.json');
-  const A = new DapClient({ url: hub.url, keyPath: keyFile(tmp()), channelsFile: fileA });
-  const B = new DapClient({ url: hub.url, keyPath: keyFile(tmp()), channelsFile: fileB });
+  const dirA = tmp();
+  const fileA = join(dirA, 'channels-a.json');
+  const dirB = tmp();
+  const fileB = join(dirB, 'channels-b.json');
+  const A = new DapClient({ url: hub.url, keyPath: keyFile(dirA), channelsFile: fileA });
+  const B = new DapClient({ url: hub.url, keyPath: keyFile(dirB), channelsFile: fileB });
+  const unA = pinMasterAuth(hub, join(dirA, 'config.json'));
+  let unB: () => void = () => {};
   const seenB = collect(B);
   try {
     A.start();
+    await A.ready();
+    await pollUntil(() => readDapConfig(join(dirA, 'config.json')).clientSecret !== undefined, 5000, 20);
+    unB = pinMasterAuth(hub, join(dirB, 'config.json'));
     B.start();
-    await Promise.all([A.ready(), B.ready()]);
+    await B.ready();
 
     await A.invite('zc-notice', B.agentId);
     await pollUntil(() => seenB.has((m) => m.invite === 'zc-notice'));
@@ -229,6 +249,8 @@ test('chankey DM is not a normal inbox message on B (invite notice instead)', as
     assert.equal(parseChankeyInvite('{"t":"other"}'), undefined);
     assert.equal(parseChankeyInvite(valid.replace(kp.pub, 'short')), undefined);
   } finally {
+    unB();
+    unA();
     A.stop();
     B.stop();
     const exit = await hub.stop(); // last live test in this file reaps the hub

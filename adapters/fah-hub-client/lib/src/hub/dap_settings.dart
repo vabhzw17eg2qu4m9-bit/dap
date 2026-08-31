@@ -82,12 +82,21 @@ String dapHostOf(String url) => url
 
 /// `~/.dap/config.json` path — the single authority every reader/writer
 /// of that file goes through ([readDapConfig], [persistDapConfig],
-/// [resolveDapSettings]). [home] overrides `~` (test seam).
-String defaultDapConfigFile([String? home]) => '${_withTrailingSlash(
-      home ?? defaultHome(Platform.environment),
-    )}.dap/config.json';
+/// [resolveDapSettings]). `DAP_CONFIG_FILE` (from [environment], default
+/// `Platform.environment`) wins outright; [home] overrides `~` (test seam).
+String defaultDapConfigFile([
+  String? home,
+  Map<String, String>? environment,
+]) {
+  final env = environment ?? Platform.environment;
+  return env[envConfigFile] ??
+      '${_withTrailingSlash(home ?? defaultHome(env))}.dap/config.json';
+}
 
 const String envChannelsFile = 'DAP_CHANNELS_FILE';
+const String envClientSecret = 'DAP_CLIENT_SECRET';
+const String envMasterSecret = 'DAP_MASTER_SECRET';
+const String envConfigFile = 'DAP_CONFIG_FILE';
 
 /// `~` on POSIX and Windows alike (dart:io has no homedir).
 String defaultHome([Map<String, String> environment = const {}]) =>
@@ -127,8 +136,8 @@ List<PendingInvite> readPendingInvites(String file) {
 }
 
 /// Read-modify-write of `~/.dap/config.json` (dap_connect persistence):
-/// merges [url]/[name]/[channels]; the default-room list only grows (a
-/// union — rooms are never un-remembered). [invites] is the
+/// merges [url]/[name]/[channels]/[clientSecret]; the default-room list
+/// only grows (a union — rooms are never un-remembered). [invites] is the
 /// authoritative pending-invite list — an empty list removes them all
 /// (delivered entries are dropped by the caller). [file] is injectable
 /// for tests. Auto-join on later launches flows through the shared
@@ -138,6 +147,7 @@ Future<void> persistDapConfig({
   String? name,
   List<String>? channels,
   List<PendingInvite>? invites,
+  String? clientSecret,
   String? file,
 }) async {
   final path = file ?? defaultDapConfigFile();
@@ -154,6 +164,7 @@ Future<void> persistDapConfig({
   if (invites != null) {
     next['invites'] = [for (final invite in invites) invite.toJson()];
   }
+  if (clientSecret != null) next['clientSecret'] = clientSecret;
   final target = File(path);
   if (!await target.parent.exists()) {
     await target.parent.create(recursive: true);
@@ -170,7 +181,7 @@ DapSettings resolveDapSettings({
   String? home,
 }) {
   final root = _withTrailingSlash(home ?? defaultHome(environment));
-  final file = readDapConfig(defaultDapConfigFile(root));
+  final file = readDapConfig(defaultDapConfigFile(root, environment));
   String? optStr(String key) =>
       file[key] is String && (file[key] as String).isNotEmpty
           ? file[key] as String
@@ -184,4 +195,30 @@ DapSettings resolveDapSettings({
     channelsFile:
         environment[envChannelsFile] ?? optStr('channelsFile') ?? '${root}.dap/channels.json',
   );
+}
+
+/// Hub dial credential per the enrollment contract: `DAP_CLIENT_SECRET`
+/// (env) > `clientSecret` from `~/.dap/config.json` ([config]) >
+/// `DAP_MASTER_SECRET` (env — enroll-mode: the connection enrolls once
+/// and the hub-issued secret replaces it). `token: null` dials anyway —
+/// the hub answers 401 and the client surfaces the frozen enrollment
+/// hint.
+({String? token, bool enroll}) resolveDapClientSecret({
+  Map<String, String> environment = const {},
+  Map<String, dynamic>? config,
+}) {
+  String? env(String key) {
+    final value = environment[key];
+    return value == null || value.isEmpty ? null : value;
+  }
+
+  final client = env(envClientSecret);
+  if (client != null) return (token: client, enroll: false);
+  final stored = config?['clientSecret'];
+  if (stored is String && stored.isNotEmpty) {
+    return (token: stored, enroll: false);
+  }
+  final master = env(envMasterSecret);
+  if (master != null) return (token: master, enroll: true);
+  return (token: null, enroll: false);
 }

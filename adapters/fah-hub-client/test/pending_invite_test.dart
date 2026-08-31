@@ -107,7 +107,8 @@ void main() {
     expect(result.channel, 'general');
     expect(result.to, 'carol');
     expect(result.connectLine,
-        'send to carol:  /dap 127.0.0.1:${hub.url.port} carol');
+        'send to carol:  /dap 127.0.0.1:${hub.url.port} carol\n'
+        'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)');
     expect((await aJoined).agentId, a.agentId); // inviter joined at arm
     expect(await loadChannelKeys(storeFile), contains('general'));
     expect(readPendingInvites(cfgFile),
@@ -365,7 +366,8 @@ void main() {
     expect(result.ok, isTrue);
     expect(result.pending, isTrue);
     expect(result.connectLine,
-        'send to carol:  /dap 127.0.0.1:${hub.url.port} carol');
+        'send to carol:  /dap 127.0.0.1:${hub.url.port} carol\n'
+        'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)');
     expect(readPendingInvites('${tmp.path}/.dap/config.json'),
         [const PendingInvite(name: 'carol', channel: 'general')]);
     expect((await zedJoined).agentId, plugin.agentId); // created + joined

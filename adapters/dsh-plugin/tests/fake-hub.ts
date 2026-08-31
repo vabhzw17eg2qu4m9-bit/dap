@@ -2,7 +2,7 @@
 // the additive x25519 field), tracks channel joins (spec § join), routes
 // plugin-to-plugin DMs and channel fan-out, and can push encrypted frames
 // from a synthetic peer agent to any connected plugin.
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import * as dap from '../src/crypto.js';
 
@@ -29,7 +29,23 @@ export class FakeHub {
   hellos = 0;
   /** Test switch: drop whois queries on the floor (bounded-wait tests). */
   answerWhois = true;
-  private wss = new WebSocketServer({ port: 0 });
+  /** Bearer tokens accepted at upgrade; when set, any other dial gets HTTP 401. */
+  authTokens?: Set<string>;
+  /** Upgrade Authorization headers, in arrival order (bearer-auth tests). */
+  readonly upgradeAuths: string[] = [];
+  /** Master credential; when set, an `enroll` on a master conn is answered
+   *  with the issued `clientSecret` (enrollment-contract tests). */
+  masterSecret?: string;
+  readonly clientSecret = randomBytes(32).toString('base64url');
+  /** Upgrade Authorization header per live socket (enroll auth check). */
+  private connAuth = new Map<WebSocket, string>();
+  private wss = new WebSocketServer({
+    port: 0,
+    verifyClient: (info: { req: { headers: Record<string, unknown> } }) => {
+      this.upgradeAuths.push(String(info.req.headers.authorization ?? ''));
+      return !this.authTokens || this.authTokens.has(String(info.req.headers.authorization ?? ''));
+    },
+  });
   private agents = new Map<string, HubAgent>();
   private lastAgentId = '';
   private frameWaiters: ((f: dap.Frame) => void)[] = [];
@@ -40,12 +56,14 @@ export class FakeHub {
 
   async start(): Promise<this> {
     const { promise, resolve } = Promise.withResolvers<void>();
-    this.wss.on('connection', (ws) => {
+    this.wss.on('connection', (ws, req) => {
+      this.connAuth.set(ws, String(req.headers.authorization ?? ''));
       let agentId = '';
       ws.on('message', (data) => {
-        agentId = this.onFrame(JSON.parse(String(data)), ws, agentId) ?? agentId;
+        agentId = this.onFrame(JSON.parse(String(data)), ws, agentId, this.connAuth.get(ws) ?? '') ?? agentId;
       });
       ws.on('close', () => {
+        this.connAuth.delete(ws);
         const a = this.agents.get(agentId);
         if (a && a.ws === ws) a.ws = null;
       });
@@ -78,10 +96,15 @@ export class FakeHub {
     return a.x;
   }
 
-  /** Returns the agentId once hello'd, else the previous one. */
-  private onFrame(frame: dap.Frame, ws: WebSocket, agentId: string): string | undefined {
+  /** Returns the agentId once hello'd, else the previous one. `auth` is the
+   *  connection's Authorization header (empty when the dial sent none). */
+  private onFrame(frame: dap.Frame, ws: WebSocket, agentId: string, auth: string): string | undefined {
     this.frames.push(frame);
     for (const notify of this.frameWaiters.splice(0)) notify(frame);
+    if (frame.t === 'enroll') {
+      this.onEnroll(ws, auth);
+      return agentId;
+    }
     if (frame.op === 'hello') return this.onHello(frame, ws);
     if (!agentId) return undefined;
     if (frame.op === 'flush') ws.send(JSON.stringify({ op: 'flushed', count: 0 }));
@@ -90,6 +113,16 @@ export class FakeHub {
     else if (frame.op === 'join') this.onJoin(frame, ws, agentId);
     else if (frame.op === 'send') this.onSend(frame, ws, agentId);
     return undefined;
+  }
+
+  /** Enrollment contract: only a master-authenticated connection gets an
+   *  issued client secret; anything else gets an error frame. */
+  private onEnroll(ws: WebSocket, auth: string): void {
+    if (this.masterSecret !== undefined && auth === `Bearer ${this.masterSecret}`) {
+      ws.send(JSON.stringify({ t: 'enrolled', secret: this.clientSecret }));
+    } else {
+      ws.send(JSON.stringify({ op: 'error', code: 'forbidden', msg: 'enroll requires the master secret' }));
+    }
   }
 
   private onHello(frame: dap.Frame, ws: WebSocket): string {

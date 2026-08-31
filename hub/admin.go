@@ -6,12 +6,11 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 )
 
 // adminOK checks the bearer token; on failure it writes the 401 itself.
 func (h *hub) adminOK(w http.ResponseWriter, r *http.Request) bool {
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	got := bearerToken(r)
 	if got == "" || h.adminToken == "" || !constEq(got, h.adminToken) {
 		h.logf("admin", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "result", "denied")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { randomBytes, bytesToHex } from '@noble/hashes/utils';
 import { signFrame, agentIdFor, b64, type KeyPair } from './crypto.ts';
 import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog, type KeepAliveOptions } from './keepalive.ts';
+import { optStr, persistDapConfig } from './config.ts';
 
 export interface Timers {
   setInterval: (fn: () => void, ms: number) => unknown;
@@ -57,6 +58,11 @@ export interface DapOptions {
   timers?: Timers;
   /** Client keepalive: ping the hub while idle, terminate on missed pong. */
   keepAlive?: Partial<KeepAliveOptions>;
+  /** Hub-issued client secret (config/env-resolved upstream: DAP_CLIENT_SECRET
+   *  > config.json). When absent but DAP_MASTER_SECRET is set, the dial
+   *  carries the master secret and enrolls after welcome; the issued secret
+   *  is persisted and every later dial uses it. */
+  clientSecret?: string;
 }
 
 type Listener = (value: unknown) => void;
@@ -84,6 +90,10 @@ export class DapClient {
   private delay: number;
   private timer: unknown;
   private stopped = false;
+  /** Master-secret dial in flight: send {"t":"enroll"} after welcome. */
+  private enrollPending = false;
+  /** 401 streak marker: 'denied' fires once per failure streak (no spam). */
+  private denied = false;
   private readonly listeners = new Map<string, Set<Listener>>();
   private readonly emitCounts = new Map<string, number>();
   private readonly frameListeners = new Set<(frame: MsgFrame) => void | Promise<void>>();
@@ -113,9 +123,25 @@ export class DapClient {
   connect(): void {
     if (this.stopped) return;
     this.helloCount++;
-    const ws = new WebSocket(this.opts.url);
+    const clientSecret = this.opts.clientSecret;
+    const masterSecret = clientSecret ? undefined : optStr(process.env.DAP_MASTER_SECRET);
+    const token = clientSecret ?? masterSecret;
+    this.enrollPending = masterSecret !== undefined;
+    const ws = new WebSocket(this.opts.url, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
     this.ws = ws;
     ws.on('error', () => {}); // 'close' always follows; schedule from there
+    // Registered so ws emits 'unexpected-response' instead of a generic
+    // 'error' — the HTTP status is the auth verdict (hub 401s pre-upgrade).
+    // With a listener registered ws leaves the socket open: we tear it down
+    // so every failed dial deterministically reaches the 'close' path.
+    ws.on('unexpected-response', (_req, res) => {
+      if (this.ws !== ws) return; // stale socket: superseded by retarget/reconnect
+      if (res.statusCode === 401 && !this.denied) {
+        this.denied = true;
+        this.emit('denied', res.statusCode);
+      }
+      ws.close();
+    });
     ws.on('open', () => {
       if (this.ws !== ws) {
         // stale socket: superseded by retarget/reconnect; its replacement owns
@@ -310,6 +336,8 @@ export class DapClient {
         this.emit('error', frame);
         break;
       default:
+        // Enrollment reply travels as {"t":"enrolled",…} — typed, not an op.
+        if (frame.t === 'enrolled') this.onEnrolled(frame);
         break;
     }
   }
@@ -317,10 +345,25 @@ export class DapClient {
   private onWelcome(welcome: WelcomeInfo & Record<string, unknown>): void {
     this.connected = true;
     this.welcomeCount++;
+    this.denied = false; // authenticated again: a later 401 streak re-surfaces
 
     this.delay = this.backoff.initial; // backoff resets after a successful welcome
     this.send({ op: 'flush' }); // drain offline mailbox
+    if (this.enrollPending) this.send({ t: 'enroll' }); // master-auth connection only
     this.emit('welcome', welcome);
+  }
+
+  /** {"t":"enrolled","secret"}: bind the issued secret to this identity,
+   *  persist it (config file; the master secret is never stored or logged)
+   *  and use it for every later dial — this process (opts mutation) and
+   *  future launches (config.json). */
+  private onEnrolled(frame: Record<string, unknown>): void {
+    const secret = typeof frame.secret === 'string' ? frame.secret : '';
+    if (!this.enrollPending || !secret) return;
+    this.enrollPending = false;
+    this.opts.clientSecret = secret;
+    persistDapConfig({ clientSecret: secret });
+    this.emit('enrolled', frame);
   }
 
   private onClose(): void {

@@ -58,6 +58,11 @@ const toolResult = (result: unknown): AgentToolResult => ({
  *  the trailing /ws path from a full hub URL. */
 const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\/ws$/, '');
 
+/** Hub 401 on the bearer token (frozen text, identical in every adapter):
+ *  surfaced via surface() so the verdict reaches the user even headless. */
+const DENIED_HINT =
+  'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
+
 /** Injection text: enough context for the steered turn to answer in-channel. */
 function formatEntry(entry: InboxEntry, peerName: string): string {
   const where = entry.channel ? '#' + entry.channel : 'DM';
@@ -126,6 +131,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     name: settings.name,
     backoff: overrides.backoff,
     timers: overrides.timers,
+    clientSecret: settings.clientSecret,
   });
   let shared: SharedClient | undefined;
   if (shareKey !== undefined) {
@@ -296,6 +302,10 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     ctx.appendEntry('io.dap.error', { code: 'invite_failed', msg });
     ctx.sendMessage(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
   };
+  // Enrollment auth: a 401 dial failure is never silent; a successful
+  // enrollment is logged without ever printing the secret itself.
+  client.on('denied', () => surface(DENIED_HINT));
+  client.on('enrolled', () => renderStatus('enrolled: client secret persisted'));
   /** Pending by-name invites: `/dap invite <name>` against a user not yet on
    *  the hub. The chankey DM fires automatically once the name appears
    *  online; entries survive restarts in ~/.dap/config.json. */
@@ -516,7 +526,8 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     },
   });
   /** The paste-ready connect line for a brand-new user (sent out-of-band). */
-  const shareLine = (): string => `send to other user:  /dap ${hostOf(settings.url)} <name>`;
+  const shareLine = (): string =>
+    `send to other user:  /dap ${hostOf(settings.url)} <name>\nfirst connect needs DAP_MASTER_SECRET set (enrolls once, then stored)`;
   /** /dap invite <name|agentId> [channel]: names resolve via presence
    *  (case-insensitive; 16-hex ids pass straight through). A name that is
    *  unknown or offline arms a pending invite — the chankey DM fires

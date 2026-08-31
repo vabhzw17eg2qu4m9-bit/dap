@@ -9,13 +9,17 @@ dap is a self-hosted Go hub for distributed agents: it relays end-to-end-encrypt
 
 ## Run
 
-The hub is a single binary (`dap-hub`). Configuration via env vars (flags of the same meaning also exist: `-addr`, `-admin-token`, `-channels-file`):
+The hub is a single binary (`dap-hub`). Configuration via env vars (flags of the same meaning also exist: `-addr`, `-admin-token`, `-master-secret`, `-channels-file`, `-secrets-file`):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HUB_ADDR` | `:8080` | listen address |
 | `HUB_ADMIN_TOKEN` | empty (admin API disabled) | bearer token for the admin API (`/api/channels`, `/api/agents`) |
 | `HUB_CHANNELS_FILE` | `channels.json` | channel registry path (persisted, reloaded on start) |
+| `HUB_MASTER_SECRET` | — (REQUIRED) | master secret for `/ws` bearer auth; hub exits at startup when empty |
+| `HUB_SECRETS_FILE` | `secrets.json` | issued client-secret store (sha256 hashes only) |
+
+Client connections use the same bearer scheme. Adapters resolve `DAP_CLIENT_SECRET` > the persisted `clientSecret` in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`) > `DAP_MASTER_SECRET` (enroll mode: after `welcome` the client sends `enroll`, persists the returned `clientSecret`, and never stores the master secret).
 
 Liveness probe: `GET /healthz`.
 
@@ -23,7 +27,7 @@ Liveness probe: `GET /healthz`.
 
 ```sh
 go install github.com/vabhzw17eg2qu4m9-bit/dap/hub@latest
-HUB_ADMIN_TOKEN=<token> dap-hub
+HUB_MASTER_SECRET=<secret> HUB_ADMIN_TOKEN=<token> dap-hub
 ```
 
 ### Docker
@@ -31,6 +35,7 @@ HUB_ADMIN_TOKEN=<token> dap-hub
 ```sh
 docker run -d -p 8787:8080 \
   -e HUB_ADMIN_TOKEN=<token> \
+  -e HUB_MASTER_SECRET=<secret> \
   -v dap-data:/data \
   ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest
 ```
@@ -52,16 +57,16 @@ gcloud run deploy dap \
   --image ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest \
   --port 8080 \
   --allow-unauthenticated \
-  --set-env-vars HUB_ADMIN_TOKEN=<token>
+  --set-env-vars HUB_ADMIN_TOKEN=<token>,HUB_MASTER_SECRET=<secret>
 ```
 
 ### AWS
 
-The image is a plain HTTP server on port 8080. Create one ECS/Fargate task definition from the public image and set `HUB_ADMIN_TOKEN` in the task environment, or run `docker run -d -p 8787:8080 -e HUB_ADMIN_TOKEN=<token> ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest` on any VM. Point a load balancer health check at `/healthz`.
+The image is a plain HTTP server on port 8080. Create one ECS/Fargate task definition from the public image and set `HUB_ADMIN_TOKEN` and `HUB_MASTER_SECRET` in the task environment, or run `docker run -d -p 8787:8080 -e HUB_ADMIN_TOKEN=<token> -e HUB_MASTER_SECRET=<secret> ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest` on any VM. Point a load balancer health check at `/healthz`.
 
 ## Binaries
 
-Prebuilt binaries ship from [GitHub Releases](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases). Every push to `main` auto-generates the next semver tag (`vX.Y.Z`, patch bump from `v0.1.0`) and publishes a release with 6 archives named `dap-hub_<os>_<arch>` for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64, plus `sha256sums.txt`. Container image tags track the same version (`:vX.Y.Z`, `:latest`, `:sha-<commit>`).
+Prebuilt binaries ship from [GitHub Releases](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases). Every push to `main` auto-generates the next semver tag (`vX.Y.Z`) from conventional commits since the previous tag — breaking (`!:` subject or `BREAKING CHANGE:` body) → major, or minor while 0.x; `feat` → minor; else patch; no previous tag → `v0.1.0` — and publishes a release with 6 archives named `dap-hub_<os>_<arch>` for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64, plus `sha256sums.txt`. Container image tags track the same version (`:vX.Y.Z`, `:latest`, `:sha-<commit>`). The enrollment-auth release is **BREAKING**: the hub then requires `Authorization: Bearer` on `/ws` and `HUB_MASTER_SECRET` at startup.
 
 ## Quality gates
 

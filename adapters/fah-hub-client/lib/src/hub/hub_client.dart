@@ -29,6 +29,13 @@ class HubError implements Exception {
   String toString() => 'HubError($code): $msg';
 }
 
+/// Frozen cross-adapter text for a hub bearer rejection (HTTP 401 before
+/// the websocket upgrade) — byte-identical in every DAP adapter; the hub
+/// answers `unauthorized` for a missing/unknown secret.
+const String unauthorizedMsg = 'hub rejected connection (HTTP 401): '
+    'set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config '
+    'clientSecret to connect';
+
 /// Peer directory entry returned by whois/presence.
 class AgentInfo {
   AgentInfo({
@@ -127,17 +134,43 @@ class HubClient {
     required HubConfig config,
     required HubIdentity identity,
     this.channelStore,
+    String? clientSecret,
+    bool enroll = false,
+    this.configFile,
+    this.onNotice,
     Duration Function(int attempt)? backoff,
     this.pingInterval = const Duration(seconds: 20),
   })  : _config = config,
         _identity = identity,
+        _clientSecret = clientSecret,
+        _enroll = enroll,
         backoff = backoff ?? HubClient.defaultBackoff;
-
   HubConfig _config;
-  HubIdentity _identity;
+
+  /// Bearer token for the hub dial (see [resolveDapClientSecret]): a
+  /// hub-issued client secret, or the master secret while [_enroll].
+  /// Replaced by the hub-issued secret after a successful enroll — later
+  /// dials (reconnects included) authenticate with it.
+  String? _clientSecret;
+
+  /// True while [_clientSecret] is a master secret awaiting enrollment:
+  /// the `{"t":"enroll"}` frame goes out right after each hello until the
+  /// hub answers `enrolled`.
+  bool _enroll;
+
+  /// `~/.dap/config.json` (or `DAP_CONFIG_FILE`): where the hub-issued
+  /// client secret is persisted ([persistDapConfig]). Null skips
+  /// persistence.
+  final String? configFile;
+
+  /// Short user-facing notices (`enrolled: client secret persisted`) —
+  /// the host wires this to its terminal; the secret is never logged.
+  final void Function(String notice)? onNotice;
 
   /// Where to connect (swapped by [retarget]).
   HubConfig get config => _config;
+
+  HubIdentity _identity;
 
   /// Who we are (swapped by [retarget]; a new identity = new agentId).
   HubIdentity get identity => _identity;
@@ -261,7 +294,20 @@ class HubClient {
   Future<bool> _cycle(int epoch) async {
     final WebSocket ws;
     try {
-      ws = await WebSocket.connect(config.url!);
+      ws = await WebSocket.connect(config.url!, headers: {
+        if (_clientSecret != null)
+          HttpHeaders.authorizationHeader: 'Bearer $_clientSecret',
+      });
+    } on WebSocketException catch (error) {
+      if (error.httpStatusCode == HttpStatus.unauthorized) {
+        // Bearer rejected before any websocket — fatal, no retry: the
+        // frozen text tells the operator how to enroll or connect.
+        final rejection = HubError('unauthorized', unauthorizedMsg);
+        if (!_errors.isClosed) _errors.add(rejection); // never silent
+        throw rejection;
+      }
+      _failPending('connect failed');
+      return false;
     } on Object {
       _failPending('connect failed');
       return false;
@@ -289,9 +335,9 @@ class HubClient {
       onError: (Object _) => _abandon(welcomed, done),
       cancelOnError: true,
     );
-    _subscription = sub;
     _hellos++;
     ws.add(jsonEncode(await _helloFrame()));
+    if (_enroll) ws.add(jsonEncode(const {'t': 'enroll'}));
     final bool ok;
     try {
       ok = await welcomed.future;
@@ -656,6 +702,10 @@ class HubClient {
     } on FormatException {
       return;
     }
+    if (frame['t'] == 'enrolled') {
+      _onEnrolled(frame['secret'] as String?);
+      return;
+    }
     switch (frame['op'] as String?) {
       case 'welcome':
         _welcomes++;
@@ -675,6 +725,28 @@ class HubClient {
         if (flush != null && !flush.isCompleted) {
           flush.complete(frame['count'] as int? ?? 0);
         }
+    }
+  }
+
+  /// Hub accepted the enrollment: the issued secret replaces the master
+  /// secret for every future dial (reconnects included), enrollment
+  /// stops, and the secret is persisted to [configFile] — never logged.
+  void _onEnrolled(String? secret) {
+    if (!_enroll || secret == null || secret.isEmpty) return;
+    _enroll = false;
+    _clientSecret = secret;
+    unawaited(_persistEnrolled());
+  }
+
+  Future<void> _persistEnrolled() async {
+    try {
+      final file = configFile;
+      if (file != null) {
+        await persistDapConfig(clientSecret: _clientSecret, file: file);
+      }
+      onNotice?.call('enrolled: client secret persisted');
+    } on Object catch (error) {
+      onNotice?.call('enroll persistence failed: $error');
     }
   }
 
@@ -990,8 +1062,9 @@ class PendingInvites {
       channel: channel,
       to: name,
       pending: true,
-      connectLine:
-          'send to $name:  /dap ${dapHostOf(client.config.url ?? '')} $name',
+      connectLine: 'send to $name:  /dap ${dapHostOf(client.config.url ?? '')}'
+          ' $name\n'
+          'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)',
       error: null,
     );
   }

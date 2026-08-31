@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, statSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
@@ -20,7 +21,7 @@ import { FakeHub, until, channelConfig } from './fake-hub.js';
 // DAP_* env leaked in from the machine running the tests.
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-dap-home-'));
 process.env.HOME = HOME;
-const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CONFIG_FILE'];
+const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CONFIG_FILE', 'DAP_MASTER_SECRET', 'DAP_CLIENT_SECRET'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
 
@@ -867,13 +868,14 @@ test('dap_invite <unknown name>: arms a pending invite (default channel, connect
     const host = hub.url.replace(/^ws:\/\//, '').replace(/\/ws$/, '');
 
     const r = (await tool(fc, 'dap_invite').execute({ to: 'carol' })) as {
-      ok: boolean; pending: boolean; name: string; channel: string; connectLine: string;
+      ok: boolean; pending: boolean; name: string; channel: string; connectLine: string; hint: string;
     };
     assert.equal(r.ok, true);
     assert.equal(r.pending, true);
     assert.equal(r.name, 'carol');
     assert.equal(r.channel, 'general', 'channel defaults to general');
     assert.equal(r.connectLine, `send to carol:  /dap ${host} carol`, 'paste-ready connect line');
+    assert.equal(r.hint, 'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)', 'enrollment hint after the connect line');
 
     // Arm-time channel creation: keygen + join under the INVITER's key.
     await hub.waitFor((f) => f.op === 'join' && f.channel === 'general');
@@ -1045,6 +1047,105 @@ test('config invites back-compat: missing key defaults to [], non-array treated 
     writeFileSync(cfgFile, JSON.stringify({ invites: 'corrupt' }));
     assert.deepEqual(readDapConfig(cfgFile).invites, [], 'non-array invites treated as absent');
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- master-secret enrollment auth (upgrade bearer token, 401, auto-enroll) ----
+
+test('bearer auth: dial sends Authorization, DAP_CLIENT_SECRET > config clientSecret > DAP_MASTER_SECRET', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-auth');
+  const cfgFile = join(dir, 'config.json');
+  const fc = fakeCtx();
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'cfg-issued' }));
+  process.env.DAP_CLIENT_SECRET = 'env-issued';
+  const applyHere = (key: string): void => {
+    plugin.apply(fc.ctx, { url: hub.url, keyPath: join(dir, key), channels: channelConfig(hub), backoff: { initialMs: 10, maxMs: 40 } });
+  };
+  try {
+    applyHere('a.key');
+    await hub.waitFor((f) => f.op === 'flush');
+    assert.equal(hub.upgradeAuths.at(-1), 'Bearer env-issued', 'DAP_CLIENT_SECRET env beats config clientSecret');
+
+    delete process.env.DAP_CLIENT_SECRET;
+    applyHere('b.key');
+    await until(() => hub.hellos >= 2, 5000);
+    assert.equal(hub.upgradeAuths.at(-1), 'Bearer cfg-issued', 'config clientSecret dials without env override');
+
+    // Master-mode dial: no stored secret anywhere — only the master env.
+    delete process.env.DAP_CONFIG_FILE;
+    process.env.DAP_MASTER_SECRET = 'master-tok';
+    applyHere('c.key');
+    await until(() => hub.hellos >= 3, 5000);
+    assert.equal(hub.upgradeAuths.at(-1), 'Bearer master-tok', 'master secret marks the dial (enroll-mode)');
+  } finally {
+    delete process.env.DAP_CLIENT_SECRET;
+    delete process.env.DAP_MASTER_SECRET;
+    delete process.env.DAP_CONFIG_FILE;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('headerless dial: hub 401 -> frozen error surfaced via followup + dap_inbox', async () => {
+  // Standalone HTTP server: rejects every upgrade with 401, like an auth hub.
+  const srv = createServer();
+  srv.on('upgrade', (_req, socket) => {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+  });
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const addr = srv.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  const fc = fakeCtx();
+  try {
+    plugin.apply(fc.ctx, { url: `ws://127.0.0.1:${port}/ws`, keyPath: tmpKeyPath(), backoff: { initialMs: 10, maxMs: 40 } });
+    await until(() => fc.followups.some((t) => t.includes('hub rejected connection (HTTP 401)')));
+    const inbox = (await tool(fc, 'dap_inbox').execute({})) as { errors: Array<{ code: string; msg: string }> };
+    assert.ok(inbox.errors.length >= 1, '401 surfaced in the error ring');
+    assert.equal(inbox.errors[0].code, 'unauthorized');
+    assert.equal(
+      inbox.errors[0].msg,
+      'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect',
+    );
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    srv.close();
+  }
+});
+
+test('auto-enroll: master dial -> enroll -> issued clientSecret persisted; reconnect authenticates with it', async () => {
+  const hub = await new FakeHub().start();
+  hub.masterSecret = 'master-enroll';
+  hub.authTokens = new Set(['Bearer master-enroll', `Bearer ${hub.clientSecret}`]);
+  const dir = tmpDir('dsh-enroll');
+  const cfgFile = join(dir, 'config.json');
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_MASTER_SECRET = 'master-enroll';
+  const fc = fakeCtx();
+  try {
+    plugin.apply(fc.ctx, {
+      url: hub.url, keyPath: join(dir, 'a.key'), channels: channelConfig(hub),
+      backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await hub.waitFor((f) => f.t === 'enroll'); // enroll rides the master-authed connection after welcome
+    await until(() => readDapConfig(cfgFile).clientSecret === hub.clientSecret, 5000);
+    await until(() => fc.followups.some((t) => t.includes('enrolled: client secret persisted')), 5000);
+    assert.ok(fc.followups.every((t) => !t.includes(hub.clientSecret)), 'issued secret never logged');
+
+    // Reconnect: the issued client secret (not the master secret) authenticates.
+    hub.killClient();
+    await until(() => hub.upgradeAuths.at(-1) === `Bearer ${hub.clientSecret}`, 5000);
+    await until(() => hub.hellos >= 2, 5000);
+    assert.equal(hub.frames.filter((f) => f.t === 'enroll').length, 1, 'no re-enroll once the client secret is held');
+  } finally {
+    delete process.env.DAP_MASTER_SECRET;
+    delete process.env.DAP_CONFIG_FILE;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });

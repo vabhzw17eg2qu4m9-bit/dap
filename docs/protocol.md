@@ -9,6 +9,14 @@ v1 spec. The hub and every adapter implement exactly this. Hub never sees plaint
 - Health: `GET /healthz` → `200 ok`.
 - One connection per agent: a new connection for the same agentId evicts the old one.
 
+## Connection auth
+
+- The `GET /ws` upgrade requires `Authorization: Bearer <token>`. Missing or wrong token → `401 unauthorized` before the WebSocket handshake (no frames exchanged).
+- The token is either the **master secret** (enrollment connections) or a hub-issued **client secret** (normal agent connections); compared in constant time.
+- Hub config: `HUB_MASTER_SECRET` env / `-master-secret` flag (REQUIRED — the hub refuses to start without it); issued-secret hashes live in `HUB_SECRETS_FILE` env / `-secrets-file` flag (default `secrets.json`; atomic JSON, reloaded on start). The store keeps **sha256 hashes only** (`name → hash`); plaintext secrets are never stored or logged.
+- A client-secret connection's hello `name` MUST equal the name the secret was issued to; mismatch → `error` frame + close.
+- **Enrollment**: on a master-authenticated connection, after `hello`, the client may send `{"t":"enroll"}`. The hub replies `{"t":"enrolled","secret":"<base64url RawURLEncoding of 32 random bytes>"}` and binds the secret's hash to the hello name. Re-enrolling replaces the secret (the old client secret then 401s). `enroll` on any other connection is rejected.
+- Client config: `DAP_MASTER_SECRET` (enrollment credential — never persisted), `DAP_CLIENT_SECRET`, or the persisted `clientSecret` field in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`). Resolution: `DAP_CLIENT_SECRET` > `clientSecret` > `DAP_MASTER_SECRET` (dials in enroll mode) > none (dials anyway; hub 401s). Enroll mode sends `enroll` after `welcome`, persists the returned `clientSecret`, and keeps the connection open (it is already master-authenticated).
 ## Identity
 
 - Each agent holds an **Ed25519** keypair. Pubkeys are base64 (raw 32 bytes).

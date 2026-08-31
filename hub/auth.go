@@ -257,6 +257,11 @@ func (h *hub) checkHello(f frame, raw map[string]any) *protoError {
 // welcome installs the authenticated client, evicting any previous
 // connection for the same agentId.
 func (h *hub) welcome(cl *client, f frame) {
+	// An issued client secret only authenticates its enrolled name.
+	if cl.auth == authAgent && f.Name != cl.boundName {
+		h.reject(cl, codeDenied, "hello name does not match the enrolled secret")
+		return
+	}
 	pub, _ := base64.StdEncoding.DecodeString(f.Pubkey)
 	cl.agentID = agentIDFor(pub)
 	cl.pubkey = f.Pubkey

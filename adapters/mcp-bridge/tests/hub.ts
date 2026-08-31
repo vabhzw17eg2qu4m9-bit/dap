@@ -17,6 +17,8 @@ export interface HubProc {
   url: string;
   httpUrl: string;
   adminToken: string;
+  /** The hub's master secret (HUB_MASTER_SECRET) — clients enroll with it. */
+  masterSecret: string;
   /** SIGTERM the hub and resolve once the process is reaped. */
   stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
@@ -54,7 +56,7 @@ function pollHealth(url: string, deadlineMs: number): Promise<void> {
   return attempt();
 }
 
-async function boot(): Promise<HubProc> {
+async function boot(masterSecret?: string): Promise<HubProc> {
   const dir = mkdtempSync(join(tmpdir(), 'dap-mcp-hub-'));
   const bin = join(dir, 'dap-hub');
   // Build the live hub from source (cached per test process; GOCACHE dedupes
@@ -64,11 +66,16 @@ async function boot(): Promise<HubProc> {
 
   const port = await freePort();
   const adminToken = randomBytes(16).toString('hex');
+  const master = masterSecret ?? randomBytes(32).toString('base64url');
   const child = spawn(bin, [
     '-addr', `127.0.0.1:${port}`,
     '-admin-token', adminToken,
     '-channels-file', join(dir, 'channels.json'),
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    '-secrets-file', join(dir, 'secrets.json'),
+  ], {
+    env: { ...process.env, HUB_MASTER_SECRET: master },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
 
   const httpUrl = `http://127.0.0.1:${port}`;
   await pollHealth(`${httpUrl}/healthz`, 10_000);
@@ -80,15 +87,36 @@ async function boot(): Promise<HubProc> {
     setTimeout(() => child.kill('SIGKILL'), 5000).unref();
     return promise;
   };
-  return { url: `${httpUrl}/ws`, httpUrl, adminToken, stop };
+  return { url: `${httpUrl}/ws`, httpUrl, adminToken, masterSecret: master, stop };
 }
 
 const hubs = new Map<string, Promise<HubProc>>();
 
 /** Start (or reuse) a named live hub for this test process — tests that need
- *  TWO independent hubs pass distinct names. */
-export function startHub(name = 'main'): Promise<HubProc> {
+ *  TWO independent hubs pass distinct names; a shared `masterSecret` makes
+ *  both hubs accept the same enrollment credential (multi-hub dial flows). */
+export function startHub(name = 'main', masterSecret?: string): Promise<HubProc> {
   let hub = hubs.get(name);
-  if (!hub) hubs.set(name, (hub = boot()));
+  if (!hub) hubs.set(name, (hub = boot(masterSecret)));
   return hub;
+}
+
+const AUTH_ENV_KEYS = ['DAP_MASTER_SECRET', 'DAP_CLIENT_SECRET', 'DAP_CONFIG_FILE'] as const;
+
+/** Point dial auth at `hub`: DAP_MASTER_SECRET (enroll-mode) + a per-client
+ *  DAP_CONFIG_FILE, so the issued client secret persists to a tmp file —
+ *  never the operator's real ~/.dap. Clients sharing one config file share
+ *  one enrolled identity. Returns a restore fn; keep calls LIFO when
+ *  re-pointing mid-test (each snapshot restores independently). */
+export function pinMasterAuth(hub: HubProc, configFile: string): () => void {
+  const saved = Object.fromEntries(AUTH_ENV_KEYS.map((k) => [k, process.env[k]]));
+  process.env.DAP_MASTER_SECRET = hub.masterSecret;
+  delete process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_CONFIG_FILE = configFile;
+  return () => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  };
 }

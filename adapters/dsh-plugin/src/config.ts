@@ -12,7 +12,9 @@ export interface DapFileConfig {
   channelsFile?: string;
   /** Default rooms: ensured (keygen if unknown) and auto-joined after connect. */
   channels?: string[];
-  /** Armed invite-by-name entries; removed once delivered. */
+  /** Hub-issued client secret from master-secret enrollment; beats
+   *  DAP_MASTER_SECRET on every later dial. */
+  clientSecret?: string;
   invites?: PendingInvite[];
 }
 
@@ -35,6 +37,8 @@ export interface DapSettings {
   keyPath: string;
   name?: string;
   channelsFile: string;
+  /** Persisted enrollment secret (env DAP_CLIENT_SECRET overrides at dial). */
+  clientSecret?: string;
 }
 
 export const DEFAULT_URL = 'ws://127.0.0.1:8787/ws';
@@ -60,7 +64,7 @@ export function readDapConfig(file = configPath()): DapFileConfig {
  *  launch auto-connects with the same identity. `invites` is the
  *  authoritative list — delivered entries are removed by the caller. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[] },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string },
   file = configPath(),
 ): void {
   const cur = readDapConfig(file);
@@ -71,6 +75,7 @@ export function persistDapConfig(
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
   if (update.invites) next.invites = update.invites;
+  if (update.clientSecret) next.clientSecret = update.clientSecret;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }
@@ -101,5 +106,6 @@ export function resolveDapSettings(overrides: DapSettingsOverrides = {}): DapSet
       optStr(process.env.DAP_CHANNELS_FILE) ??
       file.channelsFile ??
       join(home, '.dap', 'channels.json'),
+    clientSecret: file.clientSecret,
   };
 }
