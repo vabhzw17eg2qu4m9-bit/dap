@@ -4,19 +4,17 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/dap-hub .
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/dap-hub .
+RUN mkdir -p /out/data
 
-# runtime: debian-slim + curl for the /healthz check
-FROM debian:bookworm-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# runtime: distroless static nonroot (uid 65532; bundles ca-certificates + tzdata).
+# No shell/curl here — health probing is done by the platform (Cloud Run/k8s/ECS HTTP probes on /healthz).
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/dap-hub /usr/local/bin/dap-hub
-RUN mkdir -p /data && chown -R nobody:nogroup /data
-USER nobody
+COPY --from=build --chown=65532:65532 /out/data /data
+USER nonroot
 ENV HUB_ADDR=:8080 HUB_CHANNELS_FILE=/data/channels.json
 EXPOSE 8080
 VOLUME /data
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["dap-hub"]
