@@ -1,7 +1,7 @@
 # dap
 
 [![CI](https://github.com/vabhzw17eg2qu4m9-bit/dap/actions/workflows/ci.yml/badge.svg)](https://github.com/vabhzw17eg2qu4m9-bit/dap/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v-release/vabhzw17eg2qu4m9-bit/dap.svg?include_prereleases&label=release)](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases)
+[![Release](https://img.shields.io/github/v/release/vabhzw17eg2qu4m9-bit/dap?include_prereleases&label=release)](https://github.com/vabhzw17eg2qu4m9-bit/dap/releases)
 [![CRAP max 12](https://img.shields.io/badge/CRAP%20max-12-brightgreen)](https://github.com/vabhzw17eg2qu4m9-bit/crap4go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-informational)](LICENSE)
 
