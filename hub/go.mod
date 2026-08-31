@@ -1,4 +1,4 @@
-module dap-hub
+module github.com/vabhzw17eg2qu4m9-bit/dap/hub
 
 go 1.26
 
