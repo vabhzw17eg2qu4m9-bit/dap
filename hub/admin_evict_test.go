@@ -4,7 +4,9 @@ package main
 // registry eviction (explicit admin action, never automatic).
 
 import (
+	"bytes"
 	"net/http"
+	"os"
 	"testing"
 )
 
@@ -74,5 +76,84 @@ func TestAdminEvictUnauthorized(t *testing.T) {
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("token %q: status %d, want 401", tok, resp.StatusCode)
 		}
+	}
+}
+
+// TestAdminEvictPurgesIssuedSecret: with no other registry entry holding
+// the hello name, eviction must drop the issued secret from memory and
+// rewrite the persisted secrets file without it.
+func TestAdminEvictPurgesIssuedSecret(t *testing.T) {
+	h, srv, _ := newTestHub(t)
+	c := dial(t, srv)
+	a := newAgent(t, "alice")
+	writeSigned(t, c, a.priv, helloMap(a))
+	readUntil(t, c, "welcome")
+	writeJSONFrame(t, c, map[string]any{"t": "enroll"})
+	secret := readRawT(t, c)["secret"].(string)
+
+	peer := newAgent(t, "b")
+	cp := connect(t, srv, peer)
+	c.CloseNow()
+	waitOffline(t, cp, a.id)
+
+	resp := adminReq(t, srv.URL, http.MethodDelete, "/api/agents/"+a.id, adminTestToken, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("evict status %d, want 204", resp.StatusCode)
+	}
+	h.mu.RLock()
+	_, inMem := h.secrets["alice"]
+	h.mu.RUnlock()
+	if inMem {
+		t.Fatal("evicted agent's issued secret still in memory")
+	}
+	file, err := os.ReadFile(h.secretsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(file, []byte("alice")) || bytes.Contains(file, []byte(sha256Hex(secret))) {
+		t.Fatal("secrets file still contains the evicted name or hash")
+	}
+}
+
+// TestAdminEvictKeepsSharedNameSecret: secrets are keyed by hello NAME,
+// which two enrollments can share; evicting one holder must keep the
+// secret so the survivor can still dial in.
+func TestAdminEvictKeepsSharedNameSecret(t *testing.T) {
+	h, srv, logbuf := newTestHub(t)
+	h.mu.Lock()
+	h.agents["id-a"] = &agentEntry{Name: "twin"}
+	h.agents["id-b"] = &agentEntry{Name: "twin"}
+	h.secrets["twin"] = "deadbeef"
+	h.persistSecrets()
+	h.mu.Unlock()
+
+	resp := adminReq(t, srv.URL, http.MethodDelete, "/api/agents/id-a", adminTestToken, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("evict status %d, want 204", resp.StatusCode)
+	}
+	h.mu.RLock()
+	hash, kept := h.secrets["twin"]
+	remaining := 0
+	for _, e := range h.agents {
+		if e.Name == "twin" {
+			remaining++
+		}
+	}
+	h.mu.RUnlock()
+	if !kept || hash != "deadbeef" {
+		t.Fatal("secret for a shared name was purged; survivor dial-in breaks")
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining registry entries named twin: %d, want 1", remaining)
+	}
+	if !bytes.Contains(logbuf.Bytes(), []byte("secret_purge=skipped")) {
+		t.Fatal("skipped secret purge not logged")
+	}
+	file, err := os.ReadFile(h.secretsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(file, []byte("deadbeef")) {
+		t.Fatal("secrets file lost the shared name's hash")
 	}
 }

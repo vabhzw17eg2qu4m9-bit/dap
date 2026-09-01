@@ -108,9 +108,29 @@ func (h *hub) adminEvict(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent is online", http.StatusConflict)
 		return
 	}
+	name := h.agents[id].Name
 	delete(h.agents, id)
 	delete(h.mailbox, id)
 	delete(h.mailboxDropped, id)
+	// The issued secret is keyed by hello NAME, and duplicate enrollments
+	// can share one name. Purge it only when this eviction took the last
+	// registry entry holding the name; otherwise the surviving agent's
+	// dial-in would break.
+	_, held := h.secrets[name]
+	shared := false
+	for _, e := range h.agents {
+		if e.Name == name {
+			shared = true
+			break
+		}
+	}
+	switch {
+	case held && shared:
+		h.logf("admin", "action", "evict", "agent", id, "name", name, "secret_purge", "skipped", "reason", "name still held by another agent")
+	case held:
+		delete(h.secrets, name)
+		h.persistSecrets()
+	}
 	h.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "action", "evict", "agent", id)
