@@ -232,6 +232,9 @@ func (h *hub) dispatch(cl *client, data []byte) {
 		h.logOp(cl, op, f.ID, codeNotAuth)
 		return
 	}
+	// Hot path: one lock per frame keeps registry lastSeen = activity,
+	// not connect time.
+	h.touchLastSeen(cl.agentID)
 	if fn, ok := h.handlers[op]; ok {
 		fn(cl, f, raw)
 		h.logOp(cl, op, f.ID, cl.errCode)
@@ -239,6 +242,17 @@ func (h *hub) dispatch(cl *client, data []byte) {
 	}
 	h.sendErr(cl, codeBadFrame, "unknown op "+op)
 	h.logOp(cl, op, f.ID, codeBadFrame)
+}
+
+// touchLastSeen stamps the sender's registry entry once per
+// authenticated inbound frame, at dispatch — the single activity write
+// (hello's upsert and deregister remain the connect/disconnect writes).
+func (h *hub) touchLastSeen(agentID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e := h.agents[agentID]; e != nil {
+		e.LastSeen = h.now()
+	}
 }
 
 // logOp traces one dispatched op frame and how routing ended.

@@ -65,7 +65,7 @@ Hub → client: `{"op":"welcome","agentId":"a_x"}` or error. Nonce and ts are co
 
 ### presence
 
-`{"op":"presence_query"}` (MAY carry `"id":"<request frame id>"`) → `{"op":"presence","agents":[{"agentId","name","online","lastSeen"},...]}`. The answer to a query that carried an `id` echoes it as `"replyTo"`; a query without `id` gets an answer without `replyTo` (additive — old clients ignore the field). Hub-broadcast `presence` pushes (connect/disconnect to agents sharing a channel, and on `join`) NEVER carry `replyTo`. Clients therefore complete a pending query waiter ONLY on a `replyTo` equal to the request `id`; broadcast pushes update the roster cache only and must never satisfy a query waiter. The registry keeps offline agents addressable (whois, DM→mailbox) for the hub process lifetime.
+`{"op":"presence_query"}` (MAY carry `"id":"<request frame id>"`) → `{"op":"presence","agents":[{"agentId","name","online","lastSeen"},...]}`. The answer to a query that carried an `id` echoes it as `"replyTo"`; a query without `id` gets an answer without `replyTo` (additive — old clients ignore the field). Hub-broadcast `presence` pushes (connect/disconnect to agents sharing a channel, and on `join`) NEVER carry `replyTo`. Clients therefore complete a pending query waiter ONLY on a `replyTo` equal to the request `id`; broadcast pushes update the roster cache only and must never satisfy a query waiter. The registry keeps offline agents addressable (whois, DM→mailbox) for the hub process lifetime. `lastSeen` is the time (ms) of the agent's last authenticated inbound frame, refreshed at dispatch — registry liveness reflects agent ACTIVITY, not connect time (hello's upsert stamps it at connect; disconnect re-stamps it once at close).
 
 ### send (channel)
 
