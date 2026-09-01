@@ -9,3 +9,4 @@ profile-reports/
 *.log
 hub/dap-hub
 dist/
+codebase/
