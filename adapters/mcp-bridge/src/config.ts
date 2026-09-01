@@ -59,9 +59,10 @@ export function readDapConfig(file = defaultConfigFile()): DapFileConfig {
  *  dap_connect persists host/name/default-rooms so the next launch
  *  auto-connects with the same identity and auto-joins the same rooms.
  *  `invites` is the authoritative list — delivered entries are removed by
- *  the caller. */
+ *  the caller. `clientSecret: null` purges the cached secret (401 stale-cache
+ *  recovery); a string persists it. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string | null },
   file = defaultConfigFile(),
 ): void {
   const cur = readDapConfig(file);
@@ -72,7 +73,8 @@ export function persistDapConfig(
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
   if (update.invites) next.invites = update.invites;
-  if (update.clientSecret) next.clientSecret = update.clientSecret;
+  if (update.clientSecret === null) delete next.clientSecret;
+  else if (update.clientSecret) next.clientSecret = update.clientSecret;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }

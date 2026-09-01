@@ -241,9 +241,10 @@ export class FakeHub {
       lastSeen: a.lastSeen,
     }));
     // Hub contract: an answer echoes a request id as replyTo (absent when
-    // the query carried none); broadcast pushes never carry one.
+    // the query carried none); broadcast pushes never carry one. Legacy
+    // mode models a pre-replyTo hub that never echoes.
     const answer: Record<string, unknown> = { op: 'presence', agents };
-    if (typeof frame.id === 'string') answer.replyTo = frame.id;
+    if (!this.legacyAnswers && typeof frame.id === 'string') answer.replyTo = frame.id;
     if (this.holdPresence) this.heldPresence.push({ ws, answer });
     else ws.send(JSON.stringify(answer));
     return undefined;
@@ -253,9 +254,9 @@ export class FakeHub {
    *  frames between the query and its reply (deterministic, no sleeps). */
   holdPresence = false;
   private readonly heldPresence: Array<{ ws: WebSocket; answer: Record<string, unknown> }> = [];
+  legacyAnswers = false;
   private readonly presenceQueries: Record<string, unknown>[] = [];
   private readonly presenceQueryWaiters: Array<(f: Record<string, unknown>) => void> = [];
-
   /** Next presence_query the hub received (carries the request id). */
   waitPresenceQuery(): Promise<Record<string, unknown>> {
     const next = this.presenceQueries.shift();
@@ -269,7 +270,6 @@ export class FakeHub {
   releasePresence(): void {
     for (const { ws, answer } of this.heldPresence.splice(0)) ws.send(JSON.stringify(answer));
   }
-
   /** Push a crafted raw frame to one connected agent (stale echoes,
    *  broadcasts). */
   sendTo(agentId: string, frame: Record<string, unknown>): void {

@@ -62,9 +62,11 @@ export function readDapConfig(file = configPath()): DapFileConfig {
 /** Merge `update` into the DAP config file (read-modify-write, mkdir on
  *  demand): dap_connect persists host/name/default-rooms so the next
  *  launch auto-connects with the same identity. `invites` is the
- *  authoritative list — delivered entries are removed by the caller. */
+ *  authoritative list — delivered entries are removed by the caller.
+ *  `clientSecret: null` purges the cached secret (401 stale-cache
+ *  recovery); a string persists it. */
 export function persistDapConfig(
-  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string },
+  update: { url?: string; name?: string; channels?: string[]; invites?: PendingInvite[]; clientSecret?: string | null },
   file = configPath(),
 ): void {
   const cur = readDapConfig(file);
@@ -75,7 +77,8 @@ export function persistDapConfig(
     next.channels = [...new Set([...(cur.channels ?? []), ...update.channels])];
   }
   if (update.invites) next.invites = update.invites;
-  if (update.clientSecret) next.clientSecret = update.clientSecret;
+  if (update.clientSecret === null) delete next.clientSecret;
+  else if (update.clientSecret) next.clientSecret = update.clientSecret;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
 }

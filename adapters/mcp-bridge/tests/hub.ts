@@ -2,6 +2,8 @@
 // an ephemeral localhost port (offline, deterministic). Readiness = poll
 // GET /healthz under a deadline (never a blind sleep); teardown = SIGTERM and
 // assert the process actually exits.
+import http from 'node:http';
+import { WebSocketServer } from 'ws';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -119,4 +121,63 @@ export function pinMasterAuth(hub: HubProc, configFile: string): () => void {
       else process.env[k] = v;
     }
   };
+}
+
+// --- Stub hub: offline stand-in for the dial-auth / 401 contract tests ----
+
+export interface StubHub {
+  url: string;
+  /** Authorization headers observed, in dial order. */
+  auths: string[];
+  /** Non-hello frames the hub received (enroll probes land here). */
+  frames: Record<string, unknown>[];
+  secret: string;
+  /** Flip what an authenticated dial must present (default: the master). */
+  setAuth(token: string): void;
+  close(): Promise<void>;
+}
+
+/** Hub stand-in: 401s dials whose bearer != the expected token, otherwise
+ *  upgrades, welcomes, and answers {"t":"enroll"} with an issued secret. */
+export async function stubHub(opts: { reject?: boolean; expect?: string; secret?: string } = {}): Promise<StubHub> {
+  let expected: string | undefined = opts.expect; // undefined = accept any bearer
+  const state: StubHub = {
+    url: '',
+    auths: [],
+    frames: [],
+    secret: opts.secret ?? randomBytes(32).toString('base64url'),
+    setAuth(token: string) { expected = token; },
+    close: () => {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      wss.close(() => srv.close(() => resolve()));
+      return promise;
+    },
+  };
+  const wss = new WebSocketServer({ noServer: true });
+  const srv = http.createServer();
+  srv.on('upgrade', (req, socket, head) => {
+    state.auths.push(String(req.headers.authorization ?? ''));
+    // Reject only when asked: blanket (reject) or a pinned expected token.
+    if (opts.reject || (expected !== undefined && state.auths[state.auths.length - 1] !== `Bearer ${expected}`)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.send(JSON.stringify({ op: 'welcome' }));
+      ws.on('message', (data) => {
+        const frame = JSON.parse(String(data)) as Record<string, unknown>;
+        if (frame.op === 'hello') return;
+        state.frames.push(frame);
+        if (frame.t === 'enroll') ws.send(JSON.stringify({ t: 'enrolled', secret: state.secret }));
+      });
+    });
+  });
+  const { promise: listening, resolve: onListening } = Promise.withResolvers<void>();
+  srv.listen(0, '127.0.0.1', onListening);
+  await listening;
+  const addr = srv.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  state.url = `ws://127.0.0.1:${port}/ws`;
+  return state;
 }

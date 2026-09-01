@@ -186,6 +186,7 @@ test('presence correlation: only the replyTo-matched answer completes; stale ech
   try {
     c.start();
     await c.ready();
+    await fake.nextQuery(); // welcome-time warm-up query (result discarded by the client)
 
     const pending = c.presence();
     const queryId = await fake.nextQuery();
@@ -219,6 +220,7 @@ test('presence correlation: legacy id-less answer still completes (back-compat)'
   try {
     c.start();
     await c.ready();
+    await fake.nextQuery(); // welcome-time warm-up query (result discarded by the client)
 
     const pending = c.presence();
     await fake.nextQuery(); // query is out; reply in legacy shape (no replyTo)
@@ -239,6 +241,7 @@ test('presence echo latch: once the hub echoes, id-less broadcasts never complet
   try {
     c.start();
     await c.ready();
+    await fake.nextQuery(); // welcome-time warm-up query (result discarded by the client)
 
     // Query A answered WITH replyTo — arms the client-lifetime latch.
     const a = c.presence();
@@ -267,6 +270,36 @@ test('presence echo latch: once the hub echoes, id-less broadcasts never complet
     await fake.close();
   }
 });
+test('welcome warm-up: the latch is armed before any user query — a join-echo broadcast cannot steal query #1', async () => {
+  const fake = await startFakeHub();
+  const c = fakeClient(fake.url);
+  try {
+    c.start();
+    await c.ready();
+
+    // The warm-up query fires unprompted at welcome; its replyTo echo arms
+    // the echo latch (the warm-up roster itself is discarded by the client).
+    const warmId = await fake.nextQuery();
+    fake.broadcast({ op: 'presence', replyTo: warmId, agents: [{ agentId: c.agentId, online: true }] });
+
+    // FIRST user query; an unsolicited join self-echo (replyTo-less,
+    // one-agent roster — the 0.2.1 first-query steal) races in before the
+    // answer and must NOT complete it.
+    const pending = c.presence();
+    const userId = await fake.nextQuery();
+    fake.broadcast({ op: 'presence', agents: [{ agentId: 'b'.repeat(16), name: 'loner', online: true }] });
+    fake.broadcast({
+      op: 'presence',
+      replyTo: userId,
+      agents: [{ agentId: c.agentId, online: true }, { agentId: 'a'.repeat(16), name: 'peer-a', online: true }],
+    });
+    const agents = await pending;
+    assert.deepEqual(agents.map((x) => x.agentId), [c.agentId, 'a'.repeat(16)]);
+  } finally {
+    c.stop();
+    await fake.close();
+  }
+});
 
 test('presence correlation: concurrent callers each get their own answer', async () => {
   const fake = await startFakeHub();
@@ -274,6 +307,7 @@ test('presence correlation: concurrent callers each get their own answer', async
   try {
     c.start();
     await c.ready();
+    await fake.nextQuery(); // welcome-time warm-up query (result discarded by the client)
 
     const p1 = c.presence();
     const p2 = c.presence();

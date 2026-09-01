@@ -6,14 +6,13 @@
 // ws upgrade (captures the Authorization header); offline, event-driven.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WebSocketServer } from 'ws';
 import { randomBytes } from 'node:crypto';
 import { DapClient, DIAL_401_HELP } from '../src/client.js';
 import { readDapConfig } from '../src/config.js';
+import { pinMasterAuth, startHub, stubHub, type StubHub } from './hub.js';
 import { pollUntil } from './util.js';
 
 // Determinism: no secret env leaks in from the machine running the tests
@@ -28,64 +27,6 @@ after(() => {
 const tmp = (): string => mkdtempSync(join(tmpdir(), 'dap-auth-'));
 const keyFile = (dir: string): string => join(dir, 'agent.key');
 const newSecret = (): string => randomBytes(32).toString('base64url');
-
-interface StubHub {
-  url: string;
-  /** Authorization headers observed, in dial order. */
-  auths: string[];
-  /** Non-hello frames the hub received (enroll probes land here). */
-  frames: Record<string, unknown>[];
-  secret: string;
-  /** Flip what an authenticated dial must present (default: the master). */
-  setAuth(token: string): void;
-  close(): Promise<void>;
-}
-
-/** Hub stand-in: 401s dials whose bearer != the expected token, otherwise
- *  upgrades, welcomes, and answers {"t":"enroll"} with an issued secret. */
-async function stubHub(opts: { reject?: boolean; expect?: string; secret?: string } = {}): Promise<StubHub> {
-  let expected: string | undefined = opts.expect; // undefined = accept any bearer
-  const state: StubHub = {
-    url: '',
-    auths: [],
-    frames: [],
-    secret: opts.secret ?? newSecret(),
-    setAuth(token: string) { expected = token; },
-    close: () => {
-      const { promise, resolve } = Promise.withResolvers<void>();
-      wss.close(() => srv.close(() => resolve()));
-      return promise;
-    },
-  };
-  const wss = new WebSocketServer({ noServer: true });
-  const srv = http.createServer();
-  srv.on('upgrade', (req, socket, head) => {
-    state.auths.push(String(req.headers.authorization ?? ''));
-    // Reject only when asked: blanket (reject) or a pinned expected token.
-    if (opts.reject || (expected !== undefined && state.auths[state.auths.length - 1] !== `Bearer ${expected}`)) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      ws.send(JSON.stringify({ op: 'welcome' }));
-      ws.on('message', (data) => {
-        const frame = JSON.parse(String(data)) as Record<string, unknown>;
-        if (frame.op === 'hello') return;
-        state.frames.push(frame);
-        if (frame.t === 'enroll') ws.send(JSON.stringify({ t: 'enrolled', secret: state.secret }));
-      });
-    });
-  });
-  const { promise: listening, resolve: onListening } = Promise.withResolvers<void>();
-  srv.listen(0, '127.0.0.1', onListening);
-  await listening;
-  const addr = srv.address();
-  const port = typeof addr === 'object' && addr ? addr.port : 0;
-  state.url = `ws://127.0.0.1:${port}/ws`;
-  return state;
-}
-
 const client = (hub: StubHub, dir = tmp()): DapClient =>
   new DapClient({ url: hub.url, keyPath: keyFile(dir) });
 

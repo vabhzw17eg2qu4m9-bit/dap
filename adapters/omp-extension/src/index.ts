@@ -132,6 +132,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     backoff: overrides.backoff,
     timers: overrides.timers,
     clientSecret: settings.clientSecret,
+    clientSecretSource: settings.clientSecretSource,
   });
   let shared: SharedClient | undefined;
   if (shareKey !== undefined) {

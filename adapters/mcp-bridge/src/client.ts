@@ -146,16 +146,21 @@ const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\
 export const DIAL_401_HELP =
   'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
 
+/** Where a dial's bearer token came from — the 401 escalation fires only for
+ *  config-cached secrets (env = explicit user intent, never wiped). */
+type AuthSource = 'env' | 'config' | 'master';
+
 /** Bearer token for dial auth, resolved fresh per dial: DAP_CLIENT_SECRET env
  *  > config clientSecret (issued by a previous enrollment) > DAP_MASTER_SECRET
- *  env (marks the dial enroll-mode) > null — dial headerless; the hub 401s. */
-function resolveAuthToken(): { token: string; enroll: boolean } | null {
+ *  env (marks the dial enroll-mode) > null — dial headerless; the hub 401s.
+ *  `source` says which branch won, so the 401 path can decide on recovery. */
+function resolveAuthToken(): { token: string; enroll: boolean; source: AuthSource } | null {
   const client = optStr(process.env.DAP_CLIENT_SECRET);
-  if (client) return { token: client, enroll: false };
+  if (client) return { token: client, enroll: false, source: 'env' };
   const persisted = optStr(readDapConfig().clientSecret);
-  if (persisted) return { token: persisted, enroll: false };
+  if (persisted) return { token: persisted, enroll: false, source: 'config' };
   const master = optStr(process.env.DAP_MASTER_SECRET);
-  return master ? { token: master, enroll: true } : null;
+  return master ? { token: master, enroll: true, source: 'master' } : null;
 }
 
 export function loadIdentity(keyPath: string): Identity {
@@ -197,10 +202,12 @@ export class DapClient {
   welcomes = 0;
   private readonly readyWaiters: Array<(err?: Error) => void> = [];
   private readonly presenceWaiters = new Map<string, Set<PresenceWaiter>>();
-  // ponytail: client-lifetime echo latch — armed by the first presence answer
-  // carrying replyTo, NEVER reset (reconnect included). Armed = the hub echoes
-  // query ids, so a replyTo-less presence frame is a broadcast and must not
-  // complete waiters; un-armed (legacy hub) = id-less answers still complete.
+  // ponytail: client-lifetime echo latch — armed by the welcome-time warm-up
+  // (the first replyTo-carrying presence answer), NEVER reset (reconnect
+  // included; each welcome re-runs the warm-up until it is). Armed = the hub
+  // echoes query ids, so a replyTo-less presence frame is a broadcast and
+  // must not complete waiters; un-armed (legacy hub) = id-less answers still
+  // complete.
   private echoSeen = false;
   private readonly joinWaiters = new Map<string, Array<(err?: Error) => void>>();
   private readonly listeners = new Set<(m: MsgEvent) => void>();
@@ -219,6 +226,12 @@ export class DapClient {
   /** Set per dial that presented the master secret: the issued client secret
    *  is awaited after welcome ({"t":"enroll"} → {"t":"enrolled","secret"}). */
   private enrollPending = false;
+  /** Source of the current dial's bearer token: the 401 escalation (stale
+   *  config-cache recovery) fires only for config-sourced secrets. */
+  private dialSource: AuthSource | undefined;
+  /** 401 escalation latch: at most ONE stale-cache re-enroll per client —
+   *  the second 401 is fatal with the frozen hint. */
+  private reEnrolled = false;
   private stopped = false;
 
   constructor(opts: ClientOpts) {
@@ -553,23 +566,56 @@ export class DapClient {
   async presence(): Promise<PresenceAgent[]> {
     if (!this.connected) throw new Error(NOT_CONNECTED);
     const id = randomUUID();
-    const waiters = this.presenceWaiters.get(id) ?? new Set<PresenceWaiter>();
-    this.presenceWaiters.set(id, waiters);
     const { promise, resolve, reject } = Promise.withResolvers<PresenceAgent[]>();
     const done: PresenceWaiter = (err, agents) => {
       clearTimeout(timer);
-      waiters.delete(done);
-      if (waiters.size === 0) this.presenceWaiters.delete(id);
+      this.unparkPresenceWaiter(id, done);
       if (err) reject(err); else resolve(agents ?? []);
     };
     const timer = setTimeout(() => done(new Error('timeout waiting for presence')), WAIT_MS);
-    waiters.add(done);
+    this.parkPresenceWaiter(id, done);
     try {
       this.sendFrame({ op: 'presence_query', id });
     } catch (err) {
       done(err as Error);
     }
     return promise.then((agents) => agents.filter((a) => a.online === true));
+  }
+
+  /** Welcome-time warm-up: one throwaway presence_query whose replyTo echo
+   *  arms the echo latch BEFORE any consumer query — without it a fresh
+   *  client's own join self-echo (a replyTo-less broadcast) can steal user
+   *  query #1 and answer it with a one-agent roster. Result discarded;
+   *  retried up to 2 times while the latch is still unarmed (a legacy hub
+   *  answers replyTo-less: the warm-up keeps completing, the latch stays
+   *  unarmed, and the legacy completion path remains for user queries).
+   *  Runs once per welcome; cheap, so reconnects re-run it. */
+  private warmUpPresence(attempt = 0): void {
+    if (this.echoSeen || !this.connected) return;
+    const id = randomUUID();
+    const done: PresenceWaiter = (err) => {
+      this.unparkPresenceWaiter(id, done);
+      if (err === undefined && !this.echoSeen && attempt < 2) this.warmUpPresence(attempt + 1);
+    };
+    this.parkPresenceWaiter(id, done);
+    try {
+      this.sendFrame({ op: 'presence_query', id });
+    } catch {
+      this.unparkPresenceWaiter(id, done); // socket died: the reconnect re-runs the warm-up
+    }
+  }
+
+  /** Park/unpark a presence waiter under its query id (removed when it fires). */
+  private parkPresenceWaiter(id: string, done: PresenceWaiter): void {
+    const waiters = this.presenceWaiters.get(id) ?? new Set<PresenceWaiter>();
+    this.presenceWaiters.set(id, waiters);
+    waiters.add(done);
+  }
+
+  private unparkPresenceWaiter(id: string, done: PresenceWaiter): void {
+    const waiters = this.presenceWaiters.get(id);
+    if (!waiters?.delete(done)) return;
+    if (waiters.size === 0) this.presenceWaiters.delete(id);
   }
 
   /** Drain the decrypted inbox (pull-mode inbound — the MCP `dap_inbox` tool). */
@@ -598,6 +644,7 @@ export class DapClient {
     if (this.stopped) return;
     const auth = resolveAuthToken();
     this.enrollPending = auth?.enroll === true;
+    this.dialSource = auth?.source;
     this.ws = new WebSocket(this.opts.url, auth ? { headers: { Authorization: `Bearer ${auth.token}` } } : undefined);
     // A listener here suppresses ws's default error emission, so this handler
     // owns the non-101 surface: 401 carries the enrollment how-to; close
@@ -605,7 +652,19 @@ export class DapClient {
     this.ws.on('unexpected-response', (_req, res) => {
       const code = res.statusCode ?? 0;
       this.lastError = code === 401 ? DIAL_401_HELP : `Unexpected server response: ${code}`;
-      if (code === 401) this.ringError({ code: 'unauthorized', msg: DIAL_401_HELP, ts: Date.now() });
+      if (code === 401) {
+        this.ringError({ code: 'unauthorized', msg: DIAL_401_HELP, ts: Date.now() });
+        // Stale config-cache recovery (e.g. a hub restart wiped the
+        // server-side secrets): once, when the rejected secret came from the
+        // persisted cache AND a master secret is available, purge the cache —
+        // the scheduled reconnect re-dials in enroll-mode and `enrolled`
+        // persists the new secret. Env-provided secrets are explicit user
+        // intent — never wiped; keys and agentId are untouched either way.
+        if (this.dialSource === 'config' && !this.reEnrolled && optStr(process.env.DAP_MASTER_SECRET)) {
+          this.reEnrolled = true;
+          persistDapConfig({ clientSecret: null });
+        }
+      }
       this.ws?.terminate();
     });
     this.ws.on('open', () => {
@@ -662,6 +721,7 @@ export class DapClient {
     this.welcomes++;
     this.delay = this.initialMs; // backoff resets after a successful welcome
     this.joined.clear(); // hub membership is in-memory: re-join on demand
+    this.warmUpPresence(); // arm the echo latch before any consumer query (join echoes race it)
     this.ws?.send(JSON.stringify({ op: 'flush' })); // drain offline mailbox
     if (this.enrollPending) this.ws?.send(JSON.stringify({ t: 'enroll' }));
     for (const wake of this.readyWaiters.splice(0)) wake();

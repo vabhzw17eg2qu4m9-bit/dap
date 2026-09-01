@@ -78,9 +78,14 @@ const INBOX_CAP = 100;
 const ERRORS_CAP = 20;
 const READY_TIMEOUT_MS = 5000;
 const NOT_CONNECTED = 'not connected to the hub (reconnecting with backoff — retry in a moment)';
-/** Frozen adapter-contract text for an HTTP 401 upgrade rejection. */
-const AUTH_REQUIRED =
+/** Frozen adapter-contract text for an HTTP 401 upgrade rejection
+ *  (identical across adapters). */
+export const AUTH_REQUIRED =
   'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
+
+/** Where a dial's bearer token came from — the 401 escalation fires only for
+ *  config-cached secrets (env = explicit user intent, never wiped). */
+type AuthSource = 'env' | 'config' | 'master';
 
 interface Identity {
   edPriv: Uint8Array;
@@ -141,6 +146,12 @@ export class DapClient {
   private readonly known = new Map<string, AgentInfo>();
   /** This socket dialled with the master secret: enroll after welcome. */
   private enrollMode = false;
+  /** Source of the current dial's bearer token: the 401 escalation (stale
+   *  config-cache recovery) fires only for config-sourced secrets. */
+  private dialSource: AuthSource | undefined;
+  /** 401 escalation latch: at most ONE stale-cache re-enroll per client —
+   *  the second 401 is fatal with the frozen hint. */
+  private reEnrolled = false;
   private ws: WebSocket | null = null;
   private readonly whoisWaiters = new Map<string, ((info: AgentInfo | undefined, err?: Error) => void)[]>();
   private readonly readyWaiters: (() => void)[] = [];
@@ -258,15 +269,7 @@ export class DapClient {
    *  echoing it (replyTo) completes the wait — bounded, like whois. */
   async presence(): Promise<PresenceAgent[]> {
     if (!this.connected) throw new Error(NOT_CONNECTED);
-    const id = randomUUID();
-    const { promise, resolve, reject } = Promise.withResolvers<dap.Frame>();
-    const timer = setTimeout(() => {
-      if (this.presenceWaiters.get(id) === resolve) this.presenceWaiters.delete(id);
-      reject(new Error('presence: hub did not reply'));
-    }, READY_TIMEOUT_MS);
-    this.presenceWaiters.set(id, resolve);
-    this.ws?.send(JSON.stringify({ op: 'presence_query', id }));
-    const frame = await promise.finally(() => clearTimeout(timer));
+    const frame = await this.queryPresence(randomUUID());
     const agents = Array.isArray(frame.agents) ? (frame.agents as Record<string, unknown>[]) : [];
     return agents
       .filter((a) => Boolean(a.online))
@@ -277,6 +280,39 @@ export class DapClient {
         lastSeen: Number(a.lastSeen),
         self: String(a.agentId) === this.agentId,
       }));
+  }
+
+  /** One id-carrying presence query, completed only by its replyTo echo
+   *  (bounded — the legacy one-completes-all path can also complete it). */
+  private queryPresence(id: string): Promise<dap.Frame> {
+    const { promise, resolve, reject } = Promise.withResolvers<dap.Frame>();
+    const timer = setTimeout(() => {
+      if (this.presenceWaiters.get(id) === resolve) this.presenceWaiters.delete(id);
+      reject(new Error('presence: hub did not reply'));
+    }, READY_TIMEOUT_MS);
+    this.presenceWaiters.set(id, resolve);
+    this.ws?.send(JSON.stringify({ op: 'presence_query', id }));
+    return promise.finally(() => clearTimeout(timer));
+  }
+
+  /** Welcome-time warm-up (BUG 5): a throwaway id-carrying presence query
+   *  whose replyTo echo arms the sticky latch BEFORE the first user query —
+   *  closing the window where a legacy/unsolicited id-less roster frame
+   *  completes it one-completes-all. Legacy hubs answer without replyTo:
+   *  the latch stays unarmed and presence() keeps its back-compat path.
+   *  Reconnect re-runs it (cheap); echoSeen stays client-lifetime. Hot-path
+   *  tradeoff: an extra round trip per connection, off the user's latency. */
+  private warmUpEcho(): void {
+    void (async () => {
+      for (let attempt = 0; attempt < 3 && !this.echoSeen; attempt++) {
+        if (!this.connected) return; // socket died mid-warm-up: reconnect re-runs it
+        try {
+          await this.queryPresence(randomUUID()); // result discarded
+        } catch {
+          // never-echoing hub: retry bounded, then stay on the legacy path
+        }
+      }
+    })();
   }
 
   /** Send an E2E-encrypted message to a channel. Unknown channel = zero-config
@@ -362,19 +398,24 @@ export class DapClient {
   }
 
   /** Dial token per the enrollment contract: DAP_CLIENT_SECRET env >
-   *  config clientSecret (opts) > DAP_MASTER_SECRET env (enroll-mode).
-   *  Empty token dials headerless — the hub answers 401. */
-  private dialAuth(): { token: string; enroll: boolean } {
-    const clientSecret = optStr(process.env.DAP_CLIENT_SECRET) ?? this.opts.clientSecret;
-    if (clientSecret) return { token: clientSecret, enroll: false };
+   *  config clientSecret (opts, issued by a previous enrollment) >
+   *  DAP_MASTER_SECRET env (marks the dial enroll-mode). Empty token dials
+   *  headerless — the hub answers 401. `source` says which branch won, so
+   *  the 401 path can decide on recovery. */
+  private dialAuth(): { token: string; enroll: boolean; source: AuthSource | undefined } {
+    const env = optStr(process.env.DAP_CLIENT_SECRET);
+    if (env) return { token: env, enroll: false, source: 'env' };
+    const persisted = optStr(this.opts.clientSecret);
+    if (persisted) return { token: persisted, enroll: false, source: 'config' };
     const master = optStr(process.env.DAP_MASTER_SECRET);
-    return master ? { token: master, enroll: true } : { token: '', enroll: false };
+    return master ? { token: master, enroll: true, source: 'master' } : { token: '', enroll: false, source: undefined };
   }
 
   private connect(): void {
     if (this.stopped) return;
-    const { token, enroll } = this.dialAuth();
+    const { token, enroll, source } = this.dialAuth();
     this.enrollMode = enroll;
+    this.dialSource = source;
     const ws = new WebSocket(this.opts.url, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
     this.ws = ws;
     // Socket-identity guards: a socket retired by stop()/retarget() must not
@@ -390,8 +431,12 @@ export class DapClient {
     ws.on('close', () => {
       if (this.ws === ws) this.onDisconnect();
     });
+    // Post-open socket errors only: a dial-phase 401 already owns lastError
+    // (the terminate in unexpected-response fires a late generic error that
+    // must not clobber it).
     ws.on('error', (err) => {
       if (this.ws !== ws) return; // stale socket: retired by stop()/retarget()
+      if (ws.readyState !== WebSocket.OPEN) return;
       this.lastError = String(err);
     }); // close always follows
     ws.on('unexpected-response', (_req, res) => {
@@ -399,7 +444,20 @@ export class DapClient {
       if (res.statusCode !== 401) return;
       this.lastError = AUTH_REQUIRED;
       this.surfaceError('unauthorized', AUTH_REQUIRED);
-    }); // close always follows
+      // Stale config-cache recovery (e.g. a hub restart wiped the
+      // server-side secrets): once, when the rejected secret came from the
+      // persisted cache AND a master secret is available, purge the cache
+      // (disk + the in-memory copy — the scheduled reconnect re-dials in
+      // enroll-mode and `enrolled` persists the new secret). Env-provided
+      // secrets are explicit user intent — never wiped; keys and agentId
+      // are untouched either way.
+      if (this.dialSource === 'config' && !this.reEnrolled && optStr(process.env.DAP_MASTER_SECRET)) {
+        this.reEnrolled = true;
+        this.opts.clientSecret = undefined;
+        persistDapConfig({ clientSecret: null });
+      }
+      ws.terminate(); // close (and the reconnect backoff) always follows
+    });
   }
 
   private sendHello(): void {
@@ -475,6 +533,7 @@ export class DapClient {
     // Membership: join every known channel after each welcome (idempotent;
     // the first join ever creates the channel and registers its pubkey).
     for (const ch of this.channels.values()) this.join(ch.name, ch.pub);
+    this.warmUpEcho(); // arm the echo latch before any user query (first-query steal window)
     for (const wake of this.readyWaiters.splice(0)) wake();
     this.opts.onReady?.(this.agentId);
   }

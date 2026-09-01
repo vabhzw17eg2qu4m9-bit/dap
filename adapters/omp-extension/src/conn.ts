@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import { randomBytes, bytesToHex } from '@noble/hashes/utils';
 import { signFrame, agentIdFor, b64, type KeyPair } from './crypto.ts';
 import { DEFAULT_KEEP_ALIVE, KeepAliveWatchdog, type KeepAliveOptions } from './keepalive.ts';
-import { optStr, persistDapConfig } from './config.ts';
+import { optStr, persistDapConfig, type ClientSecretSource } from './config.ts';
 
 export interface Timers {
   setInterval: (fn: () => void, ms: number) => unknown;
@@ -73,6 +73,12 @@ export interface DapOptions {
    *  carries the master secret and enrolls after welcome; the issued secret
    *  is persisted and every later dial uses it. */
   clientSecret?: string;
+  /** Where `clientSecret` was resolved from (resolveDapSettings sets it):
+   *  'config' = persisted cache — a hub 401 may recover it via ONE
+   *  enroll-mode retry; 'env' = DAP_CLIENT_SECRET / explicit override —
+   *  user intent, never wiped; unset (no secret, or caller-resolved
+   *  elsewhere) never escalates. */
+  clientSecretSource?: ClientSecretSource;
 }
 
 type Listener = (value: unknown) => void;
@@ -104,6 +110,9 @@ export class DapClient {
   private enrollPending = false;
   /** 401 streak marker: 'denied' fires once per failure streak (no spam). */
   private denied = false;
+  /** What the CURRENT dial's bearer was: 'client' secret, 'master' secret
+   *  (enroll-mode), or 'none' — decides whether a 401 is recoverable. */
+  private dialToken: 'client' | 'master' | 'none' = 'none';
   private readonly listeners = new Map<string, Set<Listener>>();
   private readonly emitCounts = new Map<string, number>();
   private readonly frameListeners = new Set<(frame: MsgFrame) => void | Promise<void>>();
@@ -116,8 +125,11 @@ export class DapClient {
    *  is echo-capable, so id-less presence frames are broadcasts (never
    *  answers) and must not complete waiters. NOT reset on reconnect: echo
    *  capability doesn't flip with our socket, and resetting reopens the
-   *  every-other-restart reconnect race. */
+   *  every-other-restart reconnect race. Armed proactively by the
+   *  welcome-time warm-up (see warmUpPresence). */
   private echoSeen = false;
+  /** Warm-up attempts spent on THIS connection (1 try + 2 retries). */
+  private warmupAttempts = 0;
   /** Subscribe to inbound msg frames. Every subscriber receives each frame
    *  (one client is shared by every omp session in the process — delivery
    *  must fan out, not go to the last subscriber). Returns an unsubscriber. */
@@ -144,6 +156,7 @@ export class DapClient {
     const clientSecret = this.opts.clientSecret;
     const masterSecret = clientSecret ? undefined : optStr(process.env.DAP_MASTER_SECRET);
     const token = clientSecret ?? masterSecret;
+    this.dialToken = clientSecret ? 'client' : masterSecret !== undefined ? 'master' : 'none';
     this.enrollPending = masterSecret !== undefined;
     const ws = new WebSocket(this.opts.url, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
     this.ws = ws;
@@ -154,7 +167,7 @@ export class DapClient {
     // so every failed dial deterministically reaches the 'close' path.
     ws.on('unexpected-response', (_req, res) => {
       if (this.ws !== ws) return; // stale socket: superseded by retarget/reconnect
-      if (res.statusCode === 401 && !this.denied) {
+      if (res.statusCode === 401 && !this.escalateStaleSecret() && !this.denied) {
         this.denied = true;
         this.emit('denied', res.statusCode);
       }
@@ -266,6 +279,19 @@ export class DapClient {
     }, 5000);
     this.send({ op: 'presence_query', id });
     return promise;
+  }
+
+  /** Welcome-time warm-up (once per connection, re-run on reconnect): one
+   *  throwaway presence_query whose replyTo echo arms `echoSeen` BEFORE any
+   *  consumer query — a fresh connection's own join broadcast lands in the
+   *  unarmed window and would otherwise steal the first query's waiter via
+   *  the one-completes-all legacy path. The result is discarded. A legacy
+   *  hub answers without replyTo: the latch stays unarmed, the chain gives
+   *  up after 1 try + 2 retries, and the legacy path remains. */
+  private warmUpPresence(): void {
+    if (this.echoSeen || this.warmupAttempts >= 3) return;
+    this.warmupAttempts++;
+    void this.presence().then(() => this.warmUpPresence()).catch(() => {});
   }
 
   /** Pubkey directory lookup (needed for DM key agreement). The cache is
@@ -412,6 +438,8 @@ export class DapClient {
     this.delay = this.backoff.initial; // backoff resets after a successful welcome
     this.send({ op: 'flush' }); // drain offline mailbox
     if (this.enrollPending) this.send({ t: 'enroll' }); // master-auth connection only
+    this.warmupAttempts = 0; // reconnect re-runs the warm-up (cheap)
+    this.warmUpPresence();
     this.emit('welcome', welcome);
   }
 
@@ -426,6 +454,24 @@ export class DapClient {
     this.opts.clientSecret = secret;
     persistDapConfig({ clientSecret: secret });
     this.emit('enrolled', frame);
+  }
+
+  /** Stale persisted cache (live incident: a hub restart wiped server-side
+   *  secrets, so every previously enrolled client 401-loops on its config
+   *  clientSecret). A 401 on a CONFIG-sourced bearer is recoverable when
+   *  DAP_MASTER_SECRET is available: drop the stale secret from this
+   *  process AND config.json; the scheduled reconnect dials ONCE in
+   *  enroll-mode (master bearer -> hello -> enroll -> onEnrolled re-persists
+   *  the issued secret). Env-sourced and master dials never escalate: env
+   *  is explicit user intent, and a 401 on the enroll-mode dial itself is
+   *  fatal — exactly one retry, no loops. Identity keys are never touched:
+   *  re-enrollment binds to the same hello identity. */
+  private escalateStaleSecret(): boolean {
+    if (this.dialToken !== 'client' || this.opts.clientSecretSource !== 'config') return false;
+    if (!optStr(process.env.DAP_MASTER_SECRET)) return false;
+    this.opts.clientSecret = undefined;
+    persistDapConfig({ clientSecret: null }); // drop the stale cache entry
+    return true;
   }
 
   private onClose(): void {

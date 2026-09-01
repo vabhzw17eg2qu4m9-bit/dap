@@ -171,7 +171,10 @@ test('presence correlation: unsolicited stale echo never completes the query (re
     await hub.waitFor((f) => f.op === 'flush');
     hub.holdPresence = true;
     const pending = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
-    const query = await hub.waitFor((f) => f.op === 'presence_query');
+    // [0] is the welcome warm-up: wait until the USER query is on the wire
+    // (parked) before releasing answers.
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    const query = hub.frames.filter((f) => f.op === 'presence_query')[1];
     assert.ok(typeof query.id === 'string' && query.id.length > 0, 'the query carries a request id');
     // An unsolicited one-agent echo for a query we never sent lands first —
     // only the replyTo-matched answer may complete the wait.
@@ -191,9 +194,9 @@ test('presence correlation: legacy id-less answer still completes (back-compat)'
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
   try {
+    hub.holdPresence = true; // parked BEFORE connect: the warm-up echo never lands, so this hub never echoes
     applyTo(hub, tmpKeyPath(), fc);
     await hub.waitFor((f) => f.op === 'flush');
-    hub.holdPresence = true;
     const pending = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
     await hub.waitFor((f) => f.op === 'presence_query');
     // Legacy hubs answer without replyTo — wire-indistinguishable from a
@@ -201,6 +204,7 @@ test('presence correlation: legacy id-less answer still completes (back-compat)'
     hub.send({ op: 'presence', agents: [{ agentId: hub.pluginAgentId, name: 'dsh-test', online: true, lastSeen: Date.now() }] });
     const out = await pending;
     assert.deepEqual(out.agents.map((a) => String(a.agentId)), [hub.pluginAgentId], 'legacy answer completes the wait');
+    hub.releasePresence(); // settle the parked warm-up echo (no dangling waiter)
   } finally {
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
@@ -216,13 +220,13 @@ test('presence correlation: echo-capable hub latches — a later id-less broadca
     hub.holdPresence = true;
     // Query A answered WITH replyTo: arms the sticky echo latch.
     const first = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
-    await hub.waitFor((f) => f.op === 'presence_query');
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2); // warm-up + A both on the wire
     hub.releasePresence(); // the real echo for A
     await first;
     // Query B pends; the hub pushes an UNSOLICITED one-agent broadcast (no replyTo).
     const second = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
-    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
-    const query = hub.frames.filter((f) => f.op === 'presence_query')[1];
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 3);
+    const query = hub.frames.filter((f) => f.op === 'presence_query')[2];
     hub.send({ op: 'presence', agents: [{ agentId: 'f'.repeat(16), name: 'ghost', online: true, lastSeen: Date.now() }] });
     // The matching echo for B is injected AFTER the broadcast; WS order
     // guarantees the broadcast was processed first, so whichever roster
@@ -248,8 +252,8 @@ test('presence correlation: concurrent callers each get their own answer', async
     hub.holdPresence = true;
     const p1 = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
     const p2 = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
-    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
-    const queries = hub.frames.filter((f) => f.op === 'presence_query');
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 3);
+    const queries = hub.frames.filter((f) => f.op === 'presence_query').slice(1); // [0] is the welcome warm-up
     const self = { agentId: hub.pluginAgentId, name: 'dsh-test', online: true, lastSeen: Date.now() };
     // Answers in REVERSE order with DISTINCT rosters: only per-id routing
     // delivers each caller its own roster.
@@ -258,6 +262,33 @@ test('presence correlation: concurrent callers each get their own answer', async
     const [one, two] = (await Promise.all([p1, p2])) as [{ agents: Record<string, unknown>[] }, { agents: Record<string, unknown>[] }];
     assert.ok(one.agents.some((a) => String(a.agentId) === 'a'.repeat(16)), 'first caller got its own roster');
     assert.ok(two.agents.some((a) => String(a.agentId) === 'b'.repeat(16)), 'second caller got its own roster');
+  } finally {
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+  }
+});
+
+test('welcome warm-up: latch armed before the first user query — a broadcast cannot steal it', async () => {
+  const hub = await new FakeHub().start();
+  const fc = fakeCtx();
+  try {
+    applyTo(hub, tmpKeyPath(), fc);
+    await hub.waitFor((f) => f.op === 'flush');
+    // The welcome warm-up fires first; wait for it on the wire (its echo is
+    // already answered by then, arming the latch). RED (warm-up disabled):
+    // this gate never opens, the gate is skipped, and the broadcast below
+    // steals the user query — the roster assert fails with the ghost roster.
+    await until(() => hub.frames.some((f) => f.op === 'presence_query')).catch(() => {});
+    hub.holdPresence = true; // park the real answer: only the echo may complete the query
+    const pending = tool(fc, 'dap_peers').execute({}) as Promise<{ agents: Record<string, unknown>[] }>;
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    // The 0.2.1 join self-echo shape: unsolicited id-less one-agent roster.
+    hub.send({ op: 'presence', agents: [{ agentId: 'f'.repeat(16), name: 'ghost', online: true, lastSeen: Date.now() }] });
+    hub.releasePresence(); // the real ANSWER roster, echoing the query id
+    const out = await pending;
+    const ids = out.agents.map((a) => String(a.agentId));
+    assert.ok(ids.includes(hub.pluginAgentId) && ids.includes(hub.peerId), 'full ANSWER roster — the broadcast never stole the first user query');
+    assert.ok(!ids.includes('f'.repeat(16)), 'ghost roster never surfaces');
   } finally {
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
@@ -1101,8 +1132,9 @@ test('pending invites survive a restart: welcome-time check delivers without wai
   try {
     await hub.waitFor((f) => f.op === 'flush');
     await tool(a1, 'dap_invite').execute({ to: 'carol' });
-    // The arm-time delivery check settles (its presence pass finds no carol).
-    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 2);
+    // The arm-time delivery check settles (its presence pass finds no carol);
+    // count includes the welcome warm-up query.
+    await until(() => hub.frames.filter((f) => f.op === 'presence_query').length >= 3);
     for (const cb of a1.disposeCbs.splice(0)) cb(); // inviter goes away entirely
 
     delete process.env.DAP_CONFIG_FILE; // the invitee never loads the inviter's pendings

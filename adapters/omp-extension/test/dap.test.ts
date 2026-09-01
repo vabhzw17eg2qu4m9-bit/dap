@@ -433,6 +433,158 @@ test('auto-enroll: master dial -> {"t":"enroll"} -> issued secret persisted and 
   }
 });
 
+test('stale config clientSecret: 401 wipes the cache, ONE enroll-mode retry re-persists (identity unchanged)', async () => {
+  const hub = await new FakeHub({ masterSecret: 'master-stale-1' }).listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-stale-' + ++keySeq + '.json');
+  // The stale cache carries other fields too — the wipe must keep them.
+  fs.writeFileSync(cfgFile, JSON.stringify({ url: 'ws://keep:9/ws', clientSecret: 'stale-cfg-secret' }));
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_MASTER_SECRET = 'master-stale-1';
+  const clock = new ManualTimers();
+  const c = new DapClient({
+    url: hub.url,
+    keys: loadOrCreateKeys(nextKeyPath()),
+    clientSecret: 'stale-cfg-secret',
+    clientSecretSource: 'config',
+    timers: clock.timers,
+  });
+  try {
+    const agentId = c.agentId;
+    const closed1 = nextEvent(c, 'close');
+    const enrolled = nextEvent<{ secret: string }>(c, 'enrolled');
+    const welcome = nextEvent<{ agentId: string }>(c, 'welcome');
+    c.connect();
+    await closed1; // dial 1: stale bearer 401'd, escalation armed (no 'denied' yet)
+    clock.fireAll(); // dial 2: master bearer in enroll-mode
+    await welcome;
+    const { secret } = await enrolled; // hub processed the enroll frame
+    assert.equal(c.agentId, agentId, 'identity unchanged across re-enroll');
+    assert.deepEqual(hub.upgrades, ['stale-cfg-secret', 'master-stale-1'], 'stale bearer rejected, exactly one master retry');
+    assert.deepEqual(hub.enrollRequests, [agentId], 'retry enrolled the SAME identity');
+    const saved = JSON.parse(fs.readFileSync(cfgFile, 'utf8')) as { url?: string; clientSecret?: string };
+    assert.equal(saved.url, 'ws://keep:9/ws', 'other config fields survive the wipe');
+    const reissued = saved.clientSecret;
+    assert.equal(reissued, secret, 'fresh secret persisted, stale one gone');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    c.stop();
+    await hub.close();
+  }
+});
+
+test('env-sourced clientSecret: 401 is fatal, config untouched', async () => {
+  const hub = await deniedHub();
+  const cfgFile = path.join(KEYDIR, 'cfg-env401-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ url: 'ws://keep:9/ws', clientSecret: 'from-config' }));
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevEnv = process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_CLIENT_SECRET = 'from-env';
+  const clock = new ManualTimers();
+  const c = new DapClient({
+    url: hub.url,
+    keys: loadOrCreateKeys(nextKeyPath()),
+    clientSecret: 'from-env',
+    clientSecretSource: 'env',
+    timers: clock.timers,
+  });
+  try {
+    const denied = nextEvent(c, 'denied');
+    const closed1 = nextEvent(c, 'close');
+    c.connect();
+    await denied; // hard fail on the FIRST 401: env secret is explicit user intent
+    await closed1;
+    clock.fireAll();
+    await nextEvent(c, 'close'); // dial 2 retries the env token, still no recovery
+    assert.deepEqual(hub.seen, ['Bearer from-env', 'Bearer from-env'], 'no escalation: env secret never swapped for master');
+    assert.equal(c.eventCount('denied'), 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfgFile, 'utf8')), { url: 'ws://keep:9/ws', clientSecret: 'from-config' }, 'config cache untouched');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevEnv === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevEnv;
+    c.stop();
+    await hub.close();
+  }
+});
+
+test('config-sourced clientSecret, no master: 401 hard-fails, cache kept', async () => {
+  const hub = await deniedHub();
+  const cfgFile = path.join(KEYDIR, 'cfg-nomaster-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'from-config' }));
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile; // no DAP_MASTER_SECRET anywhere
+  const clock = new ManualTimers();
+  const c = new DapClient({
+    url: hub.url,
+    keys: loadOrCreateKeys(nextKeyPath()),
+    clientSecret: 'from-config',
+    clientSecretSource: 'config',
+    timers: clock.timers,
+  });
+  try {
+    const denied = nextEvent(c, 'denied');
+    const closed1 = nextEvent(c, 'close');
+    c.connect();
+    await denied; // nothing to escalate to: today's fatal verdict
+    await closed1;
+    clock.fireAll();
+    await nextEvent(c, 'close');
+    assert.deepEqual(hub.seen, ['Bearer from-config', 'Bearer from-config'], 'cache secret not wiped without a master to re-enroll with');
+    assert.equal(c.eventCount('denied'), 1);
+    assert.equal(readDapConfig(cfgFile).clientSecret, 'from-config', 'stale cache kept (may still be valid elsewhere)');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    c.stop();
+    await hub.close();
+  }
+});
+
+test('stale config clientSecret: enroll retry also 401s -> fatal once, no loop', async () => {
+  const hub = await deniedHub(); // rejects EVERY bearer, records each header
+  const cfgFile = path.join(KEYDIR, 'cfg-stale2-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'stale-cfg-secret' }));
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.DAP_MASTER_SECRET = 'master-stale-2';
+  const clock = new ManualTimers();
+  const c = new DapClient({
+    url: hub.url,
+    keys: loadOrCreateKeys(nextKeyPath()),
+    clientSecret: 'stale-cfg-secret',
+    clientSecretSource: 'config',
+    timers: clock.timers,
+  });
+  try {
+    const denied = nextEvent(c, 'denied');
+    const closed1 = nextEvent(c, 'close');
+    c.connect();
+    await closed1; // dial 1: stale bearer 401'd, escalation armed silently
+    clock.fireAll(); // dial 2: master bearer -> 401 again -> fatal
+    await denied;
+    clock.fireAll(); // dial 3: still enroll-mode, no second escalation
+    await nextEvent(c, 'close');
+    assert.deepEqual(hub.seen, ['Bearer stale-cfg-secret', 'Bearer master-stale-2', 'Bearer master-stale-2'], 'exactly one escalation; loop stays enroll-mode');
+    assert.equal(c.eventCount('denied'), 1, 'fatal verdict surfaces once');
+    assert.deepEqual(readDapConfig(cfgFile), { invites: [] }, 'stale cache stays wiped');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    c.stop();
+    await hub.close();
+  }
+});
+
 test('retarget does not self-evict: stale socket close is inert (the /dap host name bug)', async () => {
   const hub = await new FakeHub().listen();
   // Reconnect-interval capture: after retarget settles, NOTHING may be scheduled
@@ -553,19 +705,23 @@ test('settings precedence: override > env > ~/.dap/config.json > defaults; chann
     assert.equal(s.keyPath, path.join(home, '.dap', 'keys', `${os.hostname()}.key`));
     assert.equal(s.channelsFile, path.join(home, '.dap', 'channels.json'));
     assert.equal(s.name, undefined);
+    assert.equal(s.clientSecret, undefined);
+    assert.equal(s.clientSecretSource, undefined, 'no secret anywhere: master-only/tokenless dial');
 
     // Config file fills every unset field.
     fs.mkdirSync(path.join(home, '.dap'), { recursive: true });
     const cfgFile = path.join(home, '.dap', 'config.json');
     fs.writeFileSync(
       cfgFile,
-      JSON.stringify({ url: 'ws://cfg:1/ws', name: 'cfg-agent', keyPath: '/cfg/key.json', channelsFile: '/cfg/channels.json' }),
+      JSON.stringify({ url: 'ws://cfg:1/ws', name: 'cfg-agent', keyPath: '/cfg/key.json', channelsFile: '/cfg/channels.json', clientSecret: 'cfg-secret' }),
     );
     s = resolveDapSettings();
     assert.equal(s.url, 'ws://cfg:1/ws');
     assert.equal(s.name, 'cfg-agent');
     assert.equal(s.keyPath, '/cfg/key.json');
     assert.equal(s.channelsFile, '/cfg/channels.json');
+    assert.equal(s.clientSecret, 'cfg-secret');
+    assert.equal(s.clientSecretSource, 'config', 'persisted cache is recoverable on 401');
 
     // Env beats the file; the file still beats the defaults.
     process.env.DAP_HUB_URL = 'ws://env:2/ws';
@@ -574,6 +730,15 @@ test('settings precedence: override > env > ~/.dap/config.json > defaults; chann
     assert.equal(s.url, 'ws://env:2/ws');
     assert.equal(s.channelsFile, '/env/channels.json');
     assert.equal(s.keyPath, '/cfg/key.json', 'file beats default when env is silent');
+
+    // Secret source follows the same precedence: env-cached secret is
+    // explicit intent ('env'), the persisted cache is recoverable ('config').
+    process.env.DAP_CLIENT_SECRET = 'env-secret';
+    s = resolveDapSettings();
+    assert.equal(s.clientSecret, 'env-secret');
+    assert.equal(s.clientSecretSource, 'env', 'env beats the config cache');
+    assert.equal(resolveDapSettings({ clientSecret: 'ov-secret' }).clientSecretSource, 'env', 'explicit override is user intent too');
+    delete process.env.DAP_CLIENT_SECRET;
 
     // Explicit override beats env.
     assert.equal(resolveDapSettings({ url: 'ws://ov:3/ws' }).url, 'ws://ov:3/ws');
@@ -1146,6 +1311,10 @@ test('dap_peers: an unsolicited stale presence frame never satisfies a pending q
   try {
     await nextEvent(extA.client, 'welcome');
     await nextEvent(extB.client, 'welcome');
+    // Connect-time warm-up queries: each client fires one before any user
+    // query; drain both so the capture below sees only the user's query.
+    await hub.waitPresenceQuery();
+    await hub.waitPresenceQuery();
     hub.holdPresence = true; // keep the real answer back until the frame is injected
     const pending = run<{ agents: Array<{ agentId: string; self: boolean }> }>(a, 'dap_peers');
     await hub.waitPresenceQuery(); // query is out; its answer is held
@@ -1170,10 +1339,14 @@ test('dap_peers: an unsolicited stale presence frame never satisfies a pending q
 
 test('presence: legacy id-less answer still completes (back-compat)', async () => {
   const hub = await new FakeHub().listen();
+  hub.legacyAnswers = true; // pre-replyTo hub: never echoes, latch never arms
   const a = fakeCtx();
   const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'solo' });
   try {
     await nextEvent(extA.client, 'welcome');
+    // The welcome-time warm-up fires 1 try + 2 retries against a legacy hub
+    // (never arms) — drain them, then hold the USER query's answer.
+    for (let i = 0; i < 3; i++) await hub.waitPresenceQuery();
     hub.holdPresence = true;
     const pending = extA.client.presence();
     await hub.waitPresenceQuery(); // query out, answer held
@@ -1196,6 +1369,7 @@ test('presence: echo latch — an id-less broadcast never completes a query on a
   const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'watcher' });
   try {
     await nextEvent(extA.client, 'welcome');
+    await hub.waitPresenceQuery(); // connect-time warm-up query (its echo arms the latch)
     // Query A: the hub's real answer echoes replyTo — this arms the latch.
     hub.holdPresence = true;
     const qA = extA.client.presence();
@@ -1234,6 +1408,7 @@ test('presence: concurrent callers each get their own answer', async () => {
   const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'caller' });
   try {
     await nextEvent(extA.client, 'welcome');
+    await hub.waitPresenceQuery(); // connect-time warm-up query
     hub.holdPresence = true;
     const p1 = extA.client.presence();
     const p2 = extA.client.presence();
@@ -1257,6 +1432,57 @@ test('presence: concurrent callers each get their own answer', async () => {
     assert.ok(two.some((x) => x.agentId === 'b'.repeat(16)), 'second caller got its own roster');
   } finally {
     extA.dispose();
+    await hub.close();
+  }
+});
+
+test('welcome warm-up: join echo / broadcast cannot steal the first user query', { timeout: 5000 }, async () => {
+  // The per-test timeout guards the RED run only (warm-up disabled parks the
+  // first waitPresenceQuery forever); GREEN never approaches it — every
+  // wait below is a deterministic signal, no wall-clock sleeps.
+  const hub = await new FakeHub().listen();
+  hub.holdPresence = true; // warm-up answers held until the test releases them
+  const a = fakeCtx();
+  const ghost = 'd'.repeat(16);
+  let extB: DapExtension | undefined;
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'alice' });
+  const b = fakeCtx();
+  try {
+    await nextEvent(extA.client, 'welcome');
+    // The warm-up query went out before 'welcome' was even emitted.
+    const warm = await hub.waitPresenceQuery();
+    assert.notEqual(warm.id, undefined, 'warm-up query is id-carrying');
+    // The steal-window frame: alice's own one-agent join echo, id-less,
+    // landing while the latch is still unarmed. The warm-up absorbs it
+    // (the broadcast consumes its waiter), so the chain re-fires once.
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      agents: [{ agentId: extA.client.agentId, name: 'alice', online: true }],
+    });
+    await hub.waitPresenceQuery(); // the retry query
+    hub.releasePresence(); // warm-up echoes (replyTo) -> latch armed, chain stops
+    await eventCountAtLeast(extA.client, 'presence', 3); // join echo + 2 echoes
+    // Bob joins after the latch armed: the ANSWER roster is the full
+    // registry {alice, bob} — distinguishable from any broadcast roster.
+    extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'bob' });
+    await nextEvent(extB.client, 'welcome');
+    await hub.waitPresenceQuery(); // bob's own warm-up query
+    // First USER query pends; an unsolicited one-agent broadcast (no
+    // replyTo) lands while it waits: it must never complete it.
+    const pending = run<{ agents: Array<{ agentId: string; self: boolean }> }>(a, 'dap_peers');
+    await hub.waitPresenceQuery(); // the user query is out; its answer is held
+    hub.sendTo(extA.client.agentId, {
+      op: 'presence',
+      agents: [{ agentId: ghost, name: 'ghost', online: true }],
+    });
+    hub.releasePresence(); // the real answer (replyTo echo, full roster) lands last
+    const r = await pending;
+    assert.ok(r.agents.some((x) => x.agentId === extA.client.agentId && x.self), 'own entry present');
+    assert.ok(r.agents.some((x) => x.agentId === extB?.client.agentId), 'full ANSWER roster: bob present');
+    assert.ok(!r.agents.some((x) => x.agentId === ghost), 'broadcast roster never satisfied the query');
+  } finally {
+    extA.dispose();
+    extB?.dispose();
     await hub.close();
   }
 });
