@@ -12,8 +12,7 @@ import (
 
 func TestAdminEvictOffline(t *testing.T) {
 	h, srv, _ := newTestHub(t)
-	a, b := newAgent(t, "a"), newAgent(t, "b")
-	ca, cb := connect(t, srv, a), connect(t, srv, b)
+	ca, cb, a, _ := connectPair(t, srv)
 
 	// a disconnects; the identity and a queued mailbox frame remain.
 	ca.CloseNow()
@@ -84,13 +83,7 @@ func TestAdminEvictUnauthorized(t *testing.T) {
 // rewrite the persisted secrets file without it.
 func TestAdminEvictPurgesIssuedSecret(t *testing.T) {
 	h, srv, _ := newTestHub(t)
-	c := dial(t, srv)
-	a := newAgent(t, "alice")
-	writeSigned(t, c, a.priv, helloMap(a))
-	readUntil(t, c, "welcome")
-	writeJSONFrame(t, c, map[string]any{"t": "enroll"})
-	secret := readRawT(t, c)["secret"].(string)
-
+	c, a, secret := dialAndEnroll(t, srv)
 	peer := newAgent(t, "b")
 	cp := connect(t, srv, peer)
 	c.CloseNow()

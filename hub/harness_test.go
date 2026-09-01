@@ -253,6 +253,28 @@ func connect(t *testing.T, srv *httptest.Server, a *testAgent) *websocket.Conn {
 	return c
 }
 
+// connectPair connects two fresh agents ("a", "b") — the standard
+// two-party bootstrap for pairwise tests.
+func connectPair(t *testing.T, srv *httptest.Server) (ca, cb *websocket.Conn, a, b *testAgent) {
+	t.Helper()
+	a, b = newAgent(t, "a"), newAgent(t, "b")
+	return connect(t, srv, a), connect(t, srv, b), a, b
+}
+
+// dialAndEnroll dials /ws, performs hello as a fresh agent, completes
+// the enroll handshake, and returns the connection, agent, and the
+// issued plaintext secret.
+func dialAndEnroll(t *testing.T, srv *httptest.Server) (*websocket.Conn, *testAgent, string) {
+	t.Helper()
+	c := dial(t, srv)
+	a := newAgent(t, "alice")
+	writeSigned(t, c, a.priv, helloMap(a))
+	readUntil(t, c, "welcome")
+	writeJSONFrame(t, c, map[string]any{"t": "enroll"})
+	secret, _ := readRawT(t, c)["secret"].(string)
+	return c, a, secret
+}
+
 func joinChan(t *testing.T, c *websocket.Conn, a *testAgent, name, chanPub string) {
 	t.Helper()
 	writeSigned(t, c, a.priv, map[string]any{"op": "join", "channel": name, "chanPubkey": chanPub, "ts": time.Now().UnixMilli()})

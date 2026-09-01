@@ -86,8 +86,7 @@ func TestAdminEndpoints(t *testing.T) {
 
 func TestStoreRoundTrip(t *testing.T) {
 	h, srv, _ := newTestHub(t)
-	a, b := newAgent(t, "a"), newAgent(t, "b")
-	ca, cb := connect(t, srv, a), connect(t, srv, b)
+	ca, cb, a, b := connectPair(t, srv)
 	joinChan(t, ca, a, "general", "cpub")
 	joinChan(t, cb, b, "general", "cpub")
 	adminReq(t, srv.URL, http.MethodPut, "/api/channels/general/acl", adminTestToken, map[string]any{"allowed": []string{a.pubB64}})

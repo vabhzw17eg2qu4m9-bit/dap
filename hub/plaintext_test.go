@@ -72,13 +72,7 @@ func TestNoPlaintextInHubState(t *testing.T) {
 // never reach the secrets file (hash only) or the logs.
 func TestNoPlaintextIssuedSecret(t *testing.T) {
 	h, srv, logbuf := newTestHub(t)
-	c := dial(t, srv)
-	a := newAgent(t, "alice")
-	writeSigned(t, c, a.priv, helloMap(a))
-	readUntil(t, c, "welcome")
-	writeJSONFrame(t, c, map[string]any{"t": "enroll"})
-	reply := readRawT(t, c)
-	secret, _ := reply["secret"].(string)
+	c, _, secret := dialAndEnroll(t, srv)
 	if secret == "" {
 		t.Fatal("no issued secret in reply")
 	}
