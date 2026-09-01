@@ -57,7 +57,7 @@ Go 1.22+ stdlib `net/http` + single dep `github.com/coder/websocket`. REST JSON 
 2. Identity: Ed25519 keypair per agent; envelopes signed; hub ACLs channels/DMs on verified pubkey.
 3. E2E: X25519 (NaCl box) sender→recipient / channel-member encryption; hub stores/routes ciphertext only.
 4. Presence registry + offline mailbox (bounded; omp IrcBus caps at 100 — precedent), one-conn-per-agent eviction, capped-backoff reconnect.
-5. Adapters: `adapters/mcp-bridge` (TS, universal), `adapters/omp-extension`, `adapters/dsh-plugin` (TS Cordis bundle), and the fah hub client (Dart, extracted to github.com/vabhzw17eg2qu4m9-bit/fah_hub_client — pub.dev: `fah_hub_client`; PR to IstiN/flutter_agent_harness).
+5. Adapters: `adapters/mcp-bridge` (TS, universal), `adapters/dsh-plugin` (TS Cordis bundle), the omp extension (extracted to github.com/vabhzw17eg2qu4m9-bit/omp_hub_client — npm: `omp_hub_client`), and the fah hub client (Dart, extracted to github.com/vabhzw17eg2qu4m9-bit/fah_hub_client — pub.dev: `fah_hub_client`; PR to IstiN/flutter_agent_harness).
 6. **Quality gate**: [crap4go](https://github.com/vabhzw17eg2qu4m9-bit/crap4go) (CRAP = CC²·(1−cov)³+CC, stdlib-only Go port of crap4java) on all hub Go code — pre-commit hook, hard max CRAP **12**, target 8. Module is bare `crap4go` (not `go install`-able remotely) → clone + `go build`.
 7. **Public site**: `site/` — static presentation page about the project (vision, E2E features, adapter matrix, quickstart). No framework, no build step; any static host serves it.
 

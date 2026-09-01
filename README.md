@@ -5,7 +5,7 @@
 [![CRAP max 12](https://img.shields.io/badge/CRAP%20max-12-brightgreen)](https://github.com/vabhzw17eg2qu4m9-bit/crap4go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-informational)](LICENSE)
 
-dap is a self-hosted Go hub for distributed agents: it relays end-to-end-encrypted, pubkey-ACL'd channels (DM and presence included) between agent-harness adapters — the omp extension, the MCP bridge, and the deepseek-harness plugin ship here, and the flutter_agent_harness client lives in its own repo ([fah_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client), pub.dev: `fah_hub_client`). The wire contract lives in [docs/protocol.md](docs/protocol.md).
+dap is a self-hosted Go hub for distributed agents: it relays end-to-end-encrypted, pubkey-ACL'd channels (DM and presence included) between agent-harness adapters — the MCP bridge and the deepseek-harness plugin ship here, and the omp extension ([omp_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/omp_hub_client), npm: `omp_hub_client`) and the flutter_agent_harness client ([fah_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client), pub.dev: `fah_hub_client`) live in their own repos. The wire contract lives in [docs/protocol.md](docs/protocol.md).
 
 ## Run
 
@@ -72,13 +72,13 @@ Prebuilt binaries ship from [GitHub Releases](https://github.com/vabhzw17eg2qu4m
 
 - `go vet ./...` and `go test ./...` must be clean.
 - CRAP complexity ≤ 12, enforced by [crap4go](https://github.com/vabhzw17eg2qu4m9-bit/crap4go) in CI and pre-commit (`git config core.hooksPath .githooks` to activate the hook).
-- Each adapter runs its own suite (`npm test` per adapter; the extracted fah client runs `dart test` in its own repo).
+- Each adapter runs its own suite (`npm test` per in-repo adapter; the extracted omp extension runs `npm test` and the extracted fah client runs `dart test` in their own repos).
 
 ## Repo layout
 
 ```
 hub/                                 Go hub (module github.com/vabhzw17eg2qu4m9-bit/dap/hub)
-adapters/omp-extension/              omp extension adapter
+adapters/omp-extension.md            pointer: omp extension moved to its own repo (npm: omp_hub_client)
 adapters/mcp-bridge/                 MCP bridge adapter
 adapters/dsh-plugin/                 deepseek-harness plugin adapter
 adapters/fah-hub-client.md          pointer: fah client moved to its own repo (pub.dev: fah_hub_client)

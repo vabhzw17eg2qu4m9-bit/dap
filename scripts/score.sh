@@ -17,7 +17,7 @@ hub_build_rc=1
 hub_test_rc=1
 hub_filter_rc=1
 crap_rc=1
-mcp_rc=1; omp_rc=1; dsh_rc=1; mcp_tsc_rc=1; omp_tsc_rc=1; dsh_tsc_rc=1
+mcp_rc=1; dsh_rc=1; mcp_tsc_rc=1; dsh_tsc_rc=1
 
 if [ "$GO_OK" = 1 ] && [ -d hub ] && ls hub/*.go >/dev/null 2>&1; then
   (cd hub && timeout 60 go build ./... >/dev/null 2>&1); hub_build_rc=$?
@@ -37,7 +37,6 @@ npm_dir_test() { # dir -> rc via npm test
     && (cd "$1" && timeout 180 npm test --silent >/dev/null 2>&1)
 }
 npm_dir_test adapters/mcp-bridge; mcp_rc=$?
-npm_dir_test adapters/omp-extension; omp_rc=$?
 npm_dir_test adapters/dsh-plugin;     dsh_rc=$?
 [ "$NPM_OK" = 0 ] && NOTES+=("npm toolchain missing")
 tsc_check() { # dir -> rc via npx tsc --noEmit
@@ -45,7 +44,6 @@ tsc_check() { # dir -> rc via npx tsc --noEmit
     && (cd "$1" && timeout 60 npx tsc --noEmit >/dev/null 2>&1)
 }
 tsc_check adapters/mcp-bridge;    mcp_tsc_rc=$?
-tsc_check adapters/omp-extension; omp_tsc_rc=$?
 tsc_check adapters/dsh-plugin;    dsh_tsc_rc=$?
 
 # site link integrity: every local href/src in site/**/*.html resolves to a file
@@ -93,13 +91,14 @@ if [ "$mcp_rc" = 0 ] && grep -rqi 'tools/list' adapters/mcp-bridge/tests 2>/dev/
   && grep -rqiE 'round.?trip|spawn.*hub|live.?hub' adapters/mcp-bridge/tests 2>/dev/null; then
   R[c8_mcp_conformance]=pass; else R[c8_mcp_conformance]=fail; fi
 
-# c9: omp extension — suite green + registers tools + reconnect loop
-if [ "$omp_rc" = 0 ] && grep -rq 'registerTool' adapters/omp-extension/src 2>/dev/null \
-  && grep -rq 'setInterval' adapters/omp-extension/src 2>/dev/null; then
+# c9: omp extension extracted — pointer file names its repo (omp_hub_client) + npm package
+if [ -f adapters/omp-extension.md ] \
+  && grep -q 'github.com/vabhzw17eg2qu4m9-bit/omp_hub_client' adapters/omp-extension.md \
+  && grep -qE 'npm: .?omp_hub_client' adapters/omp-extension.md; then
   R[c9_omp_extension]=pass; else R[c9_omp_extension]=fail; fi
 
-# c10: TS adapters typecheck — npx tsc --noEmit clean in mcp-bridge, omp-extension, dsh-plugin
-if [ "$mcp_tsc_rc" = 0 ] && [ "$omp_tsc_rc" = 0 ] && [ "$dsh_tsc_rc" = 0 ]; then
+# c10: TS adapters typecheck — npx tsc --noEmit clean in mcp-bridge, dsh-plugin
+if [ "$mcp_tsc_rc" = 0 ] && [ "$dsh_tsc_rc" = 0 ]; then
   R[c10_ts_typecheck]=pass; else R[c10_ts_typecheck]=fail; fi
 
 # c11: deepseek-harness plugin — suite green + uses ctx.tools.register
@@ -140,9 +139,9 @@ if [ "$mcp_rc" = 0 ] && grep -qi 'glossary' docs/protocol.md 2>/dev/null \
   && ! grep -rqi 'DICTIONARY *=' adapters/mcp-bridge/src 2>/dev/null; then
   R[c17_min_token_protocol]=pass; else R[c17_min_token_protocol]=fail; fi
 
-# c18: zero-config onboarding — EVERY adapter self-configures (identity from agent
+# c18: zero-config onboarding — EVERY in-repo TS adapter self-configures (identity from agent
 # name under ~/.dap/keys/<adapter>/, channel auto-keygen + persistence, channel
-# keys distributed via E2E-DM invites); an agent needs at most DAP_AGENT_NAME
+# keys distributed via E2E-DM invites); an agent needs at most DAP_AGENT_NAME (omp/fah cross-repo by contract)
 zero_config_ok() { # <src-dir> <test-dir> <suite-rc>
   [ "$3" = 0 ] || return 1
   grep -rqE 'dap_invite|inviteTo' "$1" 2>/dev/null || return 1
@@ -150,8 +149,7 @@ zero_config_ok() { # <src-dir> <test-dir> <suite-rc>
   grep -rqE 'newChannelKeypair|ChannelStore' "$1" 2>/dev/null || return 1
   grep -rqE 'invite|zero.?config|auto.?keygen' "$2" 2>/dev/null || return 1
 }
-if zero_config_ok adapters/omp-extension/src adapters/omp-extension/test "$omp_rc" \
-  && zero_config_ok adapters/mcp-bridge/src adapters/mcp-bridge/tests "$mcp_rc" \
+if zero_config_ok adapters/mcp-bridge/src adapters/mcp-bridge/tests "$mcp_rc" \
   && zero_config_ok adapters/dsh-plugin/src adapters/dsh-plugin/tests "$dsh_rc"; then
   R[c18_zero_config]=pass; else R[c18_zero_config]=fail; fi
 

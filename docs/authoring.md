@@ -1,6 +1,6 @@
 # Adapter authoring guide
 
-How to connect any agent harness to a DAP/1 hub. Wire truth is `docs/protocol.md`; harness extension surfaces are documented in `docs/research.md`. Four adapters ship as references: `adapters/omp-extension`, `adapters/mcp-bridge` (universal), `adapters/fah-hub-client`, `adapters/dsh-plugin`.
+How to connect any agent harness to a DAP/1 hub. Wire truth is `docs/protocol.md`; harness extension surfaces are documented in `docs/research.md`. Four adapters ship as references: omp at its own repo [omp_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/omp_hub_client) (npm: `omp_hub_client`), `adapters/mcp-bridge` (universal) and `adapters/dsh-plugin` in this repo, and fah cross-repo ([fah_hub_client](https://github.com/vabhzw17eg2qu4m9-bit/fah_hub_client), pub.dev: `fah_hub_client`).
 
 Environment contract (all adapters): `DAP_HUB_URL` (wss:// URL of the hub `/ws` endpoint, default `ws://127.0.0.1:8787/ws`), `DAP_AGENT_NAME` (display name — the only setting a second agent on a machine ever needs), `DAP_KEY_PATH` (identity file override), `DAP_CHANNELS_FILE` (channel keys override). Zero-config defaults: identity auto-generates at `~/.dap/keys/<adapter>/<name|hostname>.key` (0600; per-adapter subdir so two harnesses running the same name don't collide into one identity — one WS per agent); channel keys live in the machine-shared `~/.dap/channels.json`; optional `~/.dap/config.json` (`{url,name,keyPath,channelsFile}`) fills anything unset — precedence env > file > defaults. An agent joins at most with a name; channels self-provision (auto-keygen on first send, `invite` ships keys over E2E DM — see protocol.md § Channel key distribution).
 
@@ -48,12 +48,12 @@ Errors come back as `{"op":"error","code":...}` (`bad_signature`, `stale_ts`, `r
 
 ## 2. Per-harness walkthroughs
 
-### 2.1 omp — native extension (push inbound)
+### 2.1 omp — native extension (push inbound; extracted to omp_hub_client)
 
 omp loads extensions in-process (`.omp/extensions/`, `~/.omp/agent/extensions`, config `extensions:`, `-e`): a default-export factory receiving a context with `registerTool`, `sendMessage` (steer/followUp/triggerTurn injection), `appendEntry` (durable state), and `ctx.setInterval`. The closure holds the WebSocket for the extension's whole lifetime — no subprocess needed.
 
 ```ts
-// adapters/omp-extension/src — sketch
+// github.com/vabhzw17eg2qu4m9-bit/omp_hub_client (npm: omp_hub_client) — sketch
 export default function (ctx) {
   const dap = new DapEnvelope(process.env.DAP_HUB_URL, process.env.DAP_KEY_PATH, process.env.DAP_AGENT_NAME);
   const inbox: Msg[] = [];
