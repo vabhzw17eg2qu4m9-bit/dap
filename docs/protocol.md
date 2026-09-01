@@ -98,6 +98,7 @@ Same frame with `"to":"a_y"` instead of `channel`. Delivered to that agent only 
 - `GET /api/channels` → `[{"name","members":N,"aclSize":N}]`
 - `PUT /api/channels/{name}/acl` body `{"allowed":["<pubkey b64>",...]}` (empty list = any authenticated agent)
 - `GET /api/agents` → presence list
+- `DELETE /api/agents/{agentId}` → evict one identity from the registry (explicit admin action only — never automatic; refused with `409` while the agent is connected)
 - Unauthorized → `401`.
 
 ## Client reconnect

@@ -86,3 +86,32 @@ func (h *hub) adminAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, agents)
 	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "agents", len(agents))
 }
+
+// adminEvict removes one agent's identity from the registry: an explicit
+// owner action (the registry is never pruned by TTL — see lookupAgent).
+// Online agents are refused; they must disconnect first. The agent's
+// queued mailbox frames go with the identity — they are undeliverable
+// once it is gone.
+func (h *hub) adminEvict(w http.ResponseWriter, r *http.Request) {
+	if !h.adminOK(w, r) {
+		return
+	}
+	id := r.PathValue("agentId")
+	h.mu.Lock()
+	switch {
+	case h.agents[id] == nil:
+		h.mu.Unlock()
+		http.Error(w, "no such agent", http.StatusNotFound)
+		return
+	case h.clients[id] != nil:
+		h.mu.Unlock()
+		http.Error(w, "agent is online", http.StatusConflict)
+		return
+	}
+	delete(h.agents, id)
+	delete(h.mailbox, id)
+	delete(h.mailboxDropped, id)
+	h.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+	h.logf("admin", "method", r.Method, "path", r.URL.Path, "result", "ok", "action", "evict", "agent", id)
+}

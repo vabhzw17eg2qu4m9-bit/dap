@@ -36,6 +36,7 @@ func buildMux(h *hub) *http.ServeMux {
 	mux.HandleFunc("GET /api/channels", h.adminChannels)
 	mux.HandleFunc("PUT /api/channels/{name}/acl", h.adminSetACL)
 	mux.HandleFunc("GET /api/agents", h.adminAgents)
+	mux.HandleFunc("DELETE /api/agents/{agentId}", h.adminEvict)
 	return mux
 }
 
