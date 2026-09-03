@@ -10,3 +10,4 @@ profile-reports/
 hub/dap-hub
 dist/
 codebase/
+.idea/
