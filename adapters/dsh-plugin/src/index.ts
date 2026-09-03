@@ -47,9 +47,97 @@ const S = (v: unknown): string => String(v);
 /** Frozen adapter-contract enrollment notice (never carries the secret). */
 const ENROLL_NOTICE = 'enrolled: client secret persisted';
 
+/** Frozen inactive notice (master-secret gate): the ONE answer every tool
+ *  gives while DAP_MASTER_SECRET is unset or empty. */
+const DISABLED_ERROR = 'DAP_MASTER_SECRET is not set — DAP disabled';
+
+/** Tool contracts (name/description/schema) — the single source of truth for
+ *  the dap_* surface, registered identically whether the plugin is active or
+ *  gated off; only the execute differs. */
+const TOOL_SHELLS: Record<string, Omit<DapToolDef, 'execute'>> = {
+  dap_send: {
+    name: 'dap_send',
+    description: 'Send an end-to-end-encrypted message to a DAP channel',
+    inputSchema: {
+      type: 'object',
+      properties: { channel: { type: 'string' }, text: { type: 'string' } },
+      required: ['channel', 'text'],
+    },
+  },
+  dap_dm: {
+    name: 'dap_dm',
+    description: 'Send an end-to-end-encrypted direct message to another agent',
+    inputSchema: {
+      type: 'object',
+      properties: { to: { type: 'string' }, text: { type: 'string' } },
+      required: ['to', 'text'],
+    },
+  },
+  dap_invite: {
+    name: 'dap_invite',
+    description:
+      'Invite another agent to a channel: DMs them the channel keypair (normal E2E DM; the payload happens to be JSON). `to` may be a 16-hex agentId or a display name — a name that is unknown or offline arms a pending invite and returns the paste-ready connect line; the chankey DM fires automatically when that name comes online.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: '16-hex agentId or display name' },
+        channel: { type: 'string', description: 'channel to invite to (default general)' },
+      },
+      required: ['to'],
+    },
+  },
+  dap_inbox: {
+    name: 'dap_inbox',
+    description: 'List the most recent decrypted DAP messages (channel + DM) plus recent hub error frames',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  dap_whois: {
+    name: 'dap_whois',
+    description: 'Look up an agent by DAP agentId — agentId is the 16-hex DAP id; discover ids via dap_peers, not names',
+    inputSchema: {
+      type: 'object',
+      properties: { agentId: { type: 'string' } },
+      required: ['agentId'],
+    },
+  },
+  dap_status: {
+    name: 'dap_status',
+    description: 'Connection state of this agent\'s DAP hub link: agentId, url, known channels, welcome/hello counters',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  dap_peers: {
+    name: 'dap_peers',
+    description: 'Online agents on the hub (agentId, name, online, lastSeen): online peers only. Your own entry is included and marked self:true; every other entry is self:false.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  dap_connect: {
+    name: 'dap_connect',
+    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        host: { type: 'string', description: 'hub host[:port] or ws(s):// URL' },
+        name: { type: 'string', description: 'agent name (new identity)' },
+        channel: { type: 'string', description: 'default room to join after connect' },
+      },
+    },
+  },
+};
+
 export default {
   name: 'dsh-dap',
   apply(ctx: DshContext, config: DapPluginConfig = {}) {
+    // Master-secret gate: with DAP_MASTER_SECRET unset or empty the plugin
+    // does nothing and shows nothing — no client, no WebSocket dial, no
+    // reconnect loop, no keepalive watchdog, no invite poller, no output.
+    // The tool shells still register so an invocation gets the one honest
+    // error instead of an unknown-tool silence.
+    if (!optStr(process.env.DAP_MASTER_SECRET)) {
+      for (const shell of Object.values(TOOL_SHELLS)) {
+        ctx.tools.register({ ...shell, execute: async () => ({ ok: false, error: DISABLED_ERROR }) });
+      }
+      return;
+    }
     const settings = resolveDapSettings(config);
     const { name } = settings;
 
@@ -131,13 +219,7 @@ export default {
     const poller = setInterval(pollPending, config.invitePollMs ?? 15_000);
 
     ctx.tools.register({
-      name: 'dap_send',
-      description: 'Send an end-to-end-encrypted message to a DAP channel',
-      inputSchema: {
-        type: 'object',
-        properties: { channel: { type: 'string' }, text: { type: 'string' } },
-        required: ['channel', 'text'],
-      },
+      ...TOOL_SHELLS.dap_send,
       execute: async (a) => {
         const down = requireConnected();
         if (down) return down;
@@ -145,13 +227,7 @@ export default {
       },
     });
     ctx.tools.register({
-      name: 'dap_dm',
-      description: 'Send an end-to-end-encrypted direct message to another agent',
-      inputSchema: {
-        type: 'object',
-        properties: { to: { type: 'string' }, text: { type: 'string' } },
-        required: ['to', 'text'],
-      },
+      ...TOOL_SHELLS.dap_dm,
       execute: async (a) => {
         const down = requireConnected();
         if (down) return down;
@@ -159,17 +235,7 @@ export default {
       },
     });
     ctx.tools.register({
-      name: 'dap_invite',
-      description:
-        'Invite another agent to a channel: DMs them the channel keypair (normal E2E DM; the payload happens to be JSON). `to` may be a 16-hex agentId or a display name — a name that is unknown or offline arms a pending invite and returns the paste-ready connect line; the chankey DM fires automatically when that name comes online.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: '16-hex agentId or display name' },
-          channel: { type: 'string', description: 'channel to invite to (default general)' },
-        },
-        required: ['to'],
-      },
+      ...TOOL_SHELLS.dap_invite,
       execute: async (a) => {
         const down = requireConnected();
         if (down) return down;
@@ -203,31 +269,19 @@ export default {
       },
     });
     ctx.tools.register({
-      name: 'dap_inbox',
-      description: 'List the most recent decrypted DAP messages (channel + DM) plus recent hub error frames',
-      inputSchema: { type: 'object', properties: {} },
+      ...TOOL_SHELLS.dap_inbox,
       execute: async () => ({ messages: client.inbox(), errors: client.drainErrors() }),
     });
     ctx.tools.register({
-      name: 'dap_whois',
-      description: 'Look up an agent by DAP agentId — agentId is the 16-hex DAP id; discover ids via dap_peers, not names',
-      inputSchema: {
-        type: 'object',
-        properties: { agentId: { type: 'string' } },
-        required: ['agentId'],
-      },
+      ...TOOL_SHELLS.dap_whois,
       execute: (a) => client.whois(S(a.agentId)),
     });
     ctx.tools.register({
-      name: 'dap_status',
-      description: 'Connection state of this agent\'s DAP hub link: agentId, url, known channels, welcome/hello counters',
-      inputSchema: { type: 'object', properties: {} },
+      ...TOOL_SHELLS.dap_status,
       execute: async () => client.status(),
     });
     ctx.tools.register({
-      name: 'dap_peers',
-      description: 'Online agents on the hub (agentId, name, online, lastSeen): online peers only. Your own entry is included and marked self:true; every other entry is self:false.',
-      inputSchema: { type: 'object', properties: {} },
+      ...TOOL_SHELLS.dap_peers,
       execute: async () => {
         const down = requireConnected();
         if (down) return down;
@@ -260,16 +314,7 @@ export default {
     };
   };
   ctx.tools.register({
-    name: 'dap_connect',
-    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        host: { type: 'string', description: 'hub host[:port] or ws(s):// URL' },
-        name: { type: 'string', description: 'agent name (new identity)' },
-        channel: { type: 'string', description: 'default room to join after connect' },
-      },
-    },
+    ...TOOL_SHELLS.dap_connect,
     execute: async (a) => {
       const host = optStr(a.host);
       const name = optStr(a.name);

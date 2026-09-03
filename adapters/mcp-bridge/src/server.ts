@@ -17,11 +17,17 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { DapClient, loadIdentity, type ChannelKey, type MsgEvent } from './client.js';
-import { defaultKeyPath, persistDapConfig, resolveDapSettings } from './config.js';
+import { defaultKeyPath, optStr, persistDapConfig, resolveDapSettings } from './config.js';
 
 interface TextResult extends CallToolResult {
   content: Array<{ type: 'text'; text: string }>;
 }
+
+/** Master-secret gate (shared DAP contract): DAP_MASTER_SECRET unset or
+ *  empty → the whole plugin is inert — no hub dial, no reconnect loop, no
+ *  keepalive watchdog, zero output. The eight tools stay registered and
+ *  each answers with this one honest error (see run()). */
+export const DAP_DISABLED_MSG = 'DAP_MASTER_SECRET is not set — DAP disabled';
 
 const json = (value: unknown): TextResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
 const failure = (err: unknown): TextResult => ({
@@ -29,8 +35,11 @@ const failure = (err: unknown): TextResult => ({
   content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
 });
 
-/** Wrap a tool body: JSON result on success, isError + message on failure. */
+/** Wrap a tool body: the master-secret gate first (one honest error while
+ *  disabled — before any handler side effect), then JSON on success,
+ *  isError + message on failure. */
 async function run(body: () => Promise<unknown>): Promise<TextResult> {
+  if (!optStr(env.DAP_MASTER_SECRET)) return failure(new Error(DAP_DISABLED_MSG));
   try {
     return json(await body());
   } catch (err) {
@@ -134,7 +143,11 @@ async function main(): Promise<void> {
   // Identity bootstrap happens in the DapClient constructor: the key file is
   // generated 0600 (parents on demand) under the resolved default path.
   const settings = resolveDapSettings();
-  const dap = new DapClient({
+  // Master-secret gate BEFORE any side effect: DAP_MASTER_SECRET unset or
+  // empty → no client at all (its constructor writes the identity key file),
+  // no dial, no reconnect loop, no output. Tools stay registered; each
+  // answers the one honest error via the run() gate — dap stays null.
+  const dap: DapClient | null = !optStr(env.DAP_MASTER_SECRET) ? null : new DapClient({
     url: settings.url,
     keyPath: settings.keyPath,
     name: settings.name,
@@ -143,13 +156,13 @@ async function main(): Promise<void> {
     invites: true, // long-lived bridge process: deliver pending by-name invites
     onHubError: (e) => console.error(`[dap] hub rejected a frame — ${e.code}: ${e.msg}`),
   });
-  dap.start(); // zero-config: defaults point at the local hub; backoff covers a down hub
+  dap?.start(); // zero-config: defaults point at the local hub; backoff covers a down hub
 
-  const server = buildServer(dap);
+  const server = buildServer(dap as DapClient); // null never reaches a handler: run() gates first
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdio closed (MCP client went away) → drop the hub connection and exit.
-  transport.onclose = () => dap.stop();
+  transport.onclose = () => dap?.stop();
 }
 
 // Run only as the entrypoint (`node dist/server.js`); importing for tests skips main.

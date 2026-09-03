@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import plugin, { type DapToolDef, type DshContext } from '../src/index.js';
+import plugin, { type DapToolDef, type DshContext, type DapPluginConfig } from '../src/index.js';
 import type { DapClient } from '../src/client.js';
 import * as dap from '../src/crypto.js';
 import { resolveDapSettings, defaultKeyPath, DEFAULT_URL, readDapConfig, persistDapConfig } from '../src/config.js';
@@ -24,6 +24,17 @@ process.env.HOME = HOME;
 const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CONFIG_FILE', 'DAP_MASTER_SECRET', 'DAP_CLIENT_SECRET'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
+// Master-secret gate: the suite exercises the ACTIVE plugin, so the gate
+// stays OPEN suite-wide. DAP_CLIENT_SECRET outranks DAP_MASTER_SECRET at
+// dial time (client.ts dialAuth), keeping connect-path tests on today's
+// client-mode wire behavior (bearer header only — the default FakeHub
+// ignores it; no enroll frames, no notices). Tests overriding these
+// credentials RESTORE the defaults in finally — deleting them would leave
+// every later test gated off.
+const SUITE_MASTER = 'suite-master';
+const SUITE_CLIENT = 'suite-client';
+process.env.DAP_MASTER_SECRET = SUITE_MASTER;
+process.env.DAP_CLIENT_SECRET = SUITE_CLIENT;
 
 test.after(() => {
   for (const [k, v] of Object.entries(savedEnv)) {
@@ -80,6 +91,14 @@ const tool = (fc: { tools: DapToolDef[] }, name: string): DapToolDef => {
   return t;
 };
 
+/** apply() with the active-plugin contract: the client, or a throw naming
+ *  the gate — connect-path tests need DAP_MASTER_SECRET set (suite default). */
+function applyClient(ctx: DshContext, config: DapPluginConfig): DapClient {
+  const c = plugin.apply(ctx, config);
+  if (!c) throw new Error('plugin inert: DAP_MASTER_SECRET must be set for connect-path tests');
+  return c;
+}
+
 test('apply() registers dap tools on the Cordis context', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
@@ -130,7 +149,7 @@ test('dap_peers: online only, no flags, own entry marked self', async () => {
 
     // Second client handshakes, then goes away for good: the hub keeps it in
     // the presence registry, marked offline (the ghost peers must never list).
-    const clientOther = plugin.apply(other.ctx, {
+    const clientOther = applyClient(other.ctx, {
       url: hub.url,
       keyPath: tmpKeyPath(),
       name: 'dsh-other',
@@ -581,7 +600,7 @@ test('auto-keygen: first send to an unknown channel keygens + persists (RMW) + j
   const channelsFile = join(dir, 'channels.json'); // absent: pure zero-config
   const a = fakeCtx();
   const b = fakeCtx();
-  const clientA = plugin.apply(a.ctx, {
+  const clientA = applyClient(a.ctx, {
     url: hub.url, keyPath: join(dir, 'a.key'), channelsFile, backoff: { initialMs: 10, maxMs: 40 },
   });
   try {
@@ -603,7 +622,7 @@ test('auto-keygen: first send to an unknown channel keygens + persists (RMW) + j
 
     // Fresh instance, same channels file: picks the keys up with zero config
     // and auto-joins both channels after its welcome.
-    const clientB = plugin.apply(b.ctx, {
+    const clientB = applyClient(b.ctx, {
       url: hub.url, keyPath: join(dir, 'b.key'), channelsFile, backoff: { initialMs: 10, maxMs: 40 },
     });
     await until(
@@ -633,10 +652,10 @@ test('invite: A dap_invites B over E2E DM; B persists + joins + notice (not inbo
   writeFileSync(fileB, '{}'); // B literally starts with an empty channels file
   const a = fakeCtx();
   const b = fakeCtx();
-  const clientA = plugin.apply(a.ctx, {
+  const clientA = applyClient(a.ctx, {
     url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'alice', backoff: { initialMs: 10, maxMs: 40 },
   });
-  const clientB = plugin.apply(b.ctx, {
+  const clientB = applyClient(b.ctx, {
     url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'bob', backoff: { initialMs: 10, maxMs: 40 },
   });
   try {
@@ -858,7 +877,7 @@ test('url-only retarget clears cached peer keys: the hub-A entry never decrypts 
   const hub2 = await new FakeHub().start();
   const dir = tmpDir('dsh-stale');
   const fc = fakeCtx();
-  const client = plugin.apply(fc.ctx, {
+  const client = applyClient(fc.ctx, {
     url: hub1.url,
     keyPath: join(dir, 'a.key'),
     channelsFile: join(dir, 'channels.json'),
@@ -893,7 +912,7 @@ test('url-only retarget clears cached peer keys: the hub-A entry never decrypts 
 test('whois/agentInfo fails bounded when the hub never answers (dm/whois cannot hang forever)', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
-  const client = plugin.apply(fc.ctx, {
+  const client = applyClient(fc.ctx, {
     url: hub.url,
     keyPath: tmpKeyPath(),
     channels: channelConfig(hub),
@@ -925,7 +944,7 @@ test('dap_connect: retargets to a second hub (bare host), new identity, default 
   const cfgFile = join(dir, 'config.json');
   const fc = fakeCtx();
   process.env.DAP_CONFIG_FILE = cfgFile;
-  const client = plugin.apply(fc.ctx, {
+  const client = applyClient(fc.ctx, {
     url: hub1.url,
     keyPath: join(dir, 'a.key'),
     channelsFile: join(dir, 'channels.json'),
@@ -990,7 +1009,7 @@ test('dap_invite <unknown name>: arms a pending invite (default channel, connect
   const chFile = join(dir, 'a-channels.json');
   process.env.DAP_CONFIG_FILE = cfgFile;
   const fc = fakeCtx();
-  const client = plugin.apply(fc.ctx, {
+  const client = applyClient(fc.ctx, {
     url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: chFile, name: 'inviter',
     invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 }, // the tick never fires here
   });
@@ -1044,7 +1063,7 @@ test('pending invite: invitee connects later under the armed name -> poller tick
   process.env.DAP_CONFIG_FILE = cfgFile;
   const a = fakeCtx();
   const b = fakeCtx();
-  const clientA = plugin.apply(a.ctx, {
+  const clientA = applyClient(a.ctx, {
     url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'inviter',
     invitePollMs: 25, backoff: { initialMs: 10, maxMs: 40 },
   });
@@ -1056,7 +1075,7 @@ test('pending invite: invitee connects later under the armed name -> poller tick
 
     // The invitee is a different user: she must not load the inviter's config.
     delete process.env.DAP_CONFIG_FILE;
-    clientB = plugin.apply(b.ctx, {
+    clientB = applyClient(b.ctx, {
       url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'carol',
       invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
     });
@@ -1088,11 +1107,11 @@ test('dap_invite <online name>: immediate chankey DM, nothing armed in config', 
   process.env.DAP_CONFIG_FILE = cfgFile;
   const a = fakeCtx();
   const b = fakeCtx();
-  const clientA = plugin.apply(a.ctx, {
+  const clientA = applyClient(a.ctx, {
     url: hub.url, keyPath: join(dir, 'a.key'), channelsFile: fileA, name: 'alice',
     invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
   });
-  const clientB = plugin.apply(b.ctx, {
+  const clientB = applyClient(b.ctx, {
     url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'bob',
     invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
   });
@@ -1138,7 +1157,7 @@ test('pending invites survive a restart: welcome-time check delivers without wai
     for (const cb of a1.disposeCbs.splice(0)) cb(); // inviter goes away entirely
 
     delete process.env.DAP_CONFIG_FILE; // the invitee never loads the inviter's pendings
-    clientB = plugin.apply(b.ctx, {
+    clientB = applyClient(b.ctx, {
       url: hub.url, keyPath: join(dir, 'b.key'), channelsFile: fileB, name: 'carol',
       invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
     });
@@ -1147,7 +1166,7 @@ test('pending invites survive a restart: welcome-time check delivers without wai
 
     // Fresh inviter instance, same config + channels file: the welcome-time
     // check delivers carol's invite without waiting for a poller tick.
-    clientA2 = plugin.apply(a2.ctx, {
+    clientA2 = applyClient(a2.ctx, {
       url: hub.url, keyPath: join(dir, 'a2.key'), channelsFile: fileA, name: 'inviter2',
       invitePollMs: 3_600_000, backoff: { initialMs: 10, maxMs: 40 },
     });
@@ -1213,8 +1232,8 @@ test('bearer auth: dial sends Authorization, DAP_CLIENT_SECRET > config clientSe
     await until(() => hub.hellos >= 3, 5000);
     assert.equal(hub.upgradeAuths.at(-1), 'Bearer master-tok', 'master secret marks the dial (enroll-mode)');
   } finally {
-    delete process.env.DAP_CLIENT_SECRET;
-    delete process.env.DAP_MASTER_SECRET;
+    process.env.DAP_CLIENT_SECRET = SUITE_CLIENT; // restore suite defaults — later tests must stay active
+    process.env.DAP_MASTER_SECRET = SUITE_MASTER;
     delete process.env.DAP_CONFIG_FILE;
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
@@ -1257,6 +1276,7 @@ test('auto-enroll: master dial -> enroll -> issued clientSecret persisted; recon
   const cfgFile = join(dir, 'config.json');
   process.env.DAP_CONFIG_FILE = cfgFile;
   process.env.DAP_MASTER_SECRET = 'master-enroll';
+  delete process.env.DAP_CLIENT_SECRET; // master must own the dial — the suite client secret outranks it
   const fc = fakeCtx();
   try {
     plugin.apply(fc.ctx, {
@@ -1274,8 +1294,94 @@ test('auto-enroll: master dial -> enroll -> issued clientSecret persisted; recon
     await until(() => hub.hellos >= 2, 5000);
     assert.equal(hub.frames.filter((f) => f.t === 'enroll').length, 1, 'no re-enroll once the client secret is held');
   } finally {
-    delete process.env.DAP_MASTER_SECRET;
+    process.env.DAP_MASTER_SECRET = SUITE_MASTER; // restore suite defaults
+    process.env.DAP_CLIENT_SECRET = SUITE_CLIENT;
     delete process.env.DAP_CONFIG_FILE;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+// ---- master-secret gate: unset/empty DAP_MASTER_SECRET → fully inert ----
+
+test('gate: no DAP_MASTER_SECRET → zero side effects (no dial, no timers, no keygen) and honest tool errors', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-gate-off');
+  const fc = fakeCtx();
+  const keyPath = join(dir, 'identity.json');
+  const saved = { master: process.env.DAP_MASTER_SECRET, client: process.env.DAP_CLIENT_SECRET };
+  delete process.env.DAP_MASTER_SECRET; // the gate must decide, not the suite default
+  delete process.env.DAP_CLIENT_SECRET;
+  // Timer spy: the plugin must not even arm the invite poller.
+  type SetInterval = typeof globalThis.setInterval;
+  const realSetInterval: SetInterval = globalThis.setInterval.bind(globalThis);
+  let intervals = 0;
+  const spySetInterval = ((...a: Parameters<SetInterval>) => {
+    intervals += 1;
+    return realSetInterval(...a);
+  }) as SetInterval;
+  globalThis.setInterval = spySetInterval;
+  try {
+    intervals = 0;
+    plugin.apply(fc.ctx, { url: hub.url, keyPath, name: 'gated-off', channels: channelConfig(hub) });
+    // Zero startup side effects: no WebSocket attempt, no timers, no output,
+    // no identity keygen, nothing to dispose.
+    assert.equal(hub.upgradeAuths.length, 0, 'no WebSocket connect attempt');
+    assert.equal(hub.hellos, 0, 'no hello');
+    assert.equal(intervals, 0, 'no invite poller armed');
+    assert.deepEqual(fc.followups, [], 'no output of any kind');
+    assert.equal(fc.disposeCbs.length, 0, 'nothing registered to dispose');
+    assert.equal(existsSync(keyPath), false, 'no identity keygen');
+    // Tool surface unchanged; every invocation answers exactly the frozen error.
+    assert.deepEqual(
+      fc.tools.map((t) => t.name).sort(),
+      ['dap_connect', 'dap_dm', 'dap_inbox', 'dap_invite', 'dap_peers', 'dap_send', 'dap_status', 'dap_whois'],
+    );
+    for (const t of fc.tools) {
+      assert.deepEqual(await t.execute({ channel: 'general', text: 'x', to: 'x', agentId: 'x', host: 'hub:1' }), {
+        ok: false,
+        error: 'DAP_MASTER_SECRET is not set — DAP disabled',
+      });
+    }
+    // No reconnect loop either: the stub peer stays silent over an observation
+    // window several reconnect backoffs wide.
+    await assert.rejects(until(() => hub.hellos > 0, 150), /timed out/);
+    assert.equal(hub.upgradeAuths.length, 0, 'still no connection attempt after the window');
+    assert.deepEqual(fc.followups, []);
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    if (saved.master === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = saved.master;
+    if (saved.client === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = saved.client;
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gate: DAP_MASTER_SECRET set → plugin active exactly as before (dial + tools work)', async () => {
+  const hub = await new FakeHub().start();
+  const dir = tmpDir('dsh-gate-on');
+  const fc = fakeCtx();
+  const saved = { master: process.env.DAP_MASTER_SECRET, client: process.env.DAP_CLIENT_SECRET };
+  process.env.DAP_MASTER_SECRET = 'gate-on-master'; // explicitly set: gate open
+  delete process.env.DAP_CLIENT_SECRET; // let the master secret own the dial
+  try {
+    plugin.apply(fc.ctx, {
+      url: hub.url, keyPath: join(dir, 'identity.json'), name: 'gate-on', channels: channelConfig(hub),
+      backoff: { initialMs: 10, maxMs: 40 },
+    });
+    assert.equal(fc.disposeCbs.length, 1, 'dispose registered');
+    await until(() => hub.upgradeAuths.length > 0, 5000); // upgrade completes async
+    assert.equal(hub.upgradeAuths.at(-1), 'Bearer gate-on-master', 'master secret authenticates the dial');
+    const status = (await tool(fc, 'dap_status').execute({})) as { name: string };
+    assert.equal(status.name, 'gate-on');
+    await until(() => hub.hellos >= 1, 5000);
+  } finally {
+    if (saved.master === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = saved.master;
+    if (saved.client === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = saved.client;
     for (const cb of fc.disposeCbs.splice(0)) cb();
     await hub.stop();
     rmSync(dir, { recursive: true, force: true });
