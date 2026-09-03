@@ -116,6 +116,9 @@ test('dap_peers tool: online-only roster, own entry marked self, offline ghost a
     await pollUntil(async () => (await survivor.c.presence()).length === 2);
 
     // Drive the real dap_peers tool through an in-memory MCP transport.
+    // The tool layer is gated on DAP_MASTER_SECRET — dial() unpins after
+    // each enrollment, so pin it again for the tool call.
+    const unpinTool = pinMasterAuth(rosterHub, survivor.cfg);
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     const mcp = new Client({ name: 'dap-peers-test', version: '0.1.0' });
     await buildServer(survivor.c).connect(serverSide);
@@ -133,6 +136,7 @@ test('dap_peers tool: online-only roster, own entry marked self, offline ghost a
     assert.equal(peers.agents.find((a) => a.agentId === bystander.c.agentId)?.self, false, 'peer entry marked self:false');
 
     await mcp.close();
+    unpinTool();
   } finally {
     survivor.c.stop();
     bystander.c.stop();
