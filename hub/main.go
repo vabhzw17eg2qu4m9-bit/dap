@@ -47,6 +47,11 @@ func run(cfg hubConfig) error {
 	h := newHub(cfg, os.Stderr)
 	h.loadChannels()
 	h.loadSecrets()
+	if soft, hard, raised, err := raiseFileLimit(); err != nil {
+		log.Printf("dap-hub fd limit: %v (continuing with current limits)", err)
+	} else {
+		log.Printf("dap-hub fd limit soft=%d hard=%d raised=%v", soft, hard, raised)
+	}
 	srv := &http.Server{Addr: cfg.Addr, Handler: buildMux(h)}
 	log.Printf("dap-hub listening on %s", cfg.Addr)
 	return srv.ListenAndServe()

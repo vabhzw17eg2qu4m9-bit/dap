@@ -22,6 +22,7 @@ The hub is a single binary (`dap-hub`). Configuration via env vars (flags of the
 Client connections use the same bearer scheme. Adapters resolve `DAP_CLIENT_SECRET` > the persisted `clientSecret` in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`) > `DAP_MASTER_SECRET` (enroll mode: after `welcome` the client sends `enroll`, persists the returned `clientSecret`, and never stores the master secret).
 
 Liveness probe: `GET /healthz`.
+The hub lifts its own soft `RLIMIT_NOFILE` to the hard limit at startup (best-effort, one log line); each connection holds two file descriptors, so for very large fleets also raise the hard limit (`LimitNOFILE=1048576` under systemd, `--ulimit nofile=1048576` for docker) — see the [1m-go-websockets](https://github.com/eranyanay/1m-go-websockets) case study for million-connection tuning.
 
 ### Binary
 
