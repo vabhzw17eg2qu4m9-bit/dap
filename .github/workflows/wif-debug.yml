@@ -21,4 +21,4 @@ jobs:
           [ -z "$STSTOK" ] && { echo "STS failed"; exit 1; }
           echo "STS OK"
           curl -s -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SA:generateAccessToken" -H "Authorization: Bearer $STSTOK" -H 'Content-Type: application/json' -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}' > /tmp/imp.json
-          python3 -c "import json,re,base64; d=json.load(open('/tmp/imp.json')); msg=d.get('error',{}).get('message','SUCCESS'); print('RESULT:', msg[:100]); m=re.search(r'errorId=([A-Za-z0-9+/_=-]+)', msg); b=m.group(1) if m else ''; print('DECODED:', base64.urlsafe_b64decode(b+'='*(-len(b)%4)).decode(errors='replace') if b else '-')"
+          python3 -c "import json,re,base64; d=json.load(open('/tmp/imp.json')); msg=d.get('error',{}).get('message','SUCCESS'); m=re.search(r'errorId=([A-Za-z0-9+/_=-]+)', msg); b=m.group(1) if m else ''; print('RESULT:', msg[:80]); print('B64:', base64.b64encode(base64.urlsafe_b64decode(b+'='*(-len(b)%4)) if b else b'').decode())"
