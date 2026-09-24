@@ -11,31 +11,14 @@ jobs:
   debug:
     runs-on: ubuntu-latest
     steps:
-      - name: Secret shape check
+      - name: Impersonation verbatim
         env:
           SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          WIF: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-        run: |
-          python3 -c "import os; [print(k, 'len=', len(v), 'tail=', repr(v[-8:])) for k,v in [('SA',os.environ['SA']),('WIF',os.environ['WIF'])]]"
-      - name: Full impersonation via curl (correct aud)
-        env:
-          SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          WIF: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
           OIDC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=//iam.googleapis.com/projects/80693608388/locations/global/workloadIdentityPools/github/providers/github-oidc" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
           STS=$(curl -s -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' -d "{\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"audience\":\"//iam.googleapis.com/projects/80693608388/locations/global/workloadIdentityPools/github/providers/github-oidc\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"$OIDC\"}")
           STSTOK=$(echo "$STS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
-          [ -z "$STSTOK" ] && { echo "STS failed: $(echo "$STS" | head -c 300)"; exit 1; }
+          [ -z "$STSTOK" ] && { echo "STS failed"; exit 1; }
           echo "STS OK"
           curl -s -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SA:generateAccessToken" -H "Authorization: Bearer $STSTOK" -H 'Content-Type: application/json' -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}' > /tmp/imp.json
-          python3 -c "
-import json
-d=json.load(open('/tmp/imp.json'))
-msg=d.get('error',{}).get('message','')
-print('ERROR:', msg[:120])
-import re,base64
-m=re.search(r'errorId=([A-Za-z0-9+/_=-]+)', msg)
-if m:
-    b=m.group(1)
-    print('DECODED:', base64.urlsafe_b64decode(b + '='*(-len(b)%4)).decode(errors='replace'))
-"
+          python3 -c "import json,re,base64; d=json.load(open('/tmp/imp.json')); msg=d.get('error',{}).get('message','SUCCESS'); print('RESULT:', msg[:100]); m=re.search(r'errorId=([A-Za-z0-9+/_=-]+)', msg); b=m.group(1) if m else ''; print('DECODED:', base64.urlsafe_b64decode(b+'='*(-len(b)%4)).decode(errors='replace') if b else '-')"
