@@ -1,0 +1,85 @@
+# Deploys the dap hub to Google Cloud Run (hub.fa1.dev).
+# Same principles as fa_network: quality gates first, keyless WIF deploy,
+# every secret from GCP Secret Manager, zero credentials in the repo.
+#
+# One-time repo setup (Settings → Secrets and variables → Actions):
+#   Variables: GCP_PROJECT_ID, GCP_REGION, CLOUD_RUN_SERVICE
+#   Secrets:   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+name: deploy-cloudrun
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hub/**'
+      - '.github/workflows/deploy-cloudrun.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudrun-prod
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Quality gates (deploy blocker)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: hub/go.mod
+          cache: true
+          cache-dependency-path: hub/go.sum
+      - name: File size guard (no hub/*.go over 500 lines)
+        run: |
+          violations=$(find hub -name '*.go' \
+            -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$1: $lines lines"; fi' _ {} \;)
+          if [ -n "$violations" ]; then echo "$violations"; exit 1; fi
+      - name: go vet + test (hub only)
+        working-directory: hub
+        run: go vet ./... && go test ./...
+
+  deploy:
+    name: Cloud Run (dap hub)
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Cheap profile, single instance (in-memory fanout is single-process by
+      # design): /data is a GCS fuse volume so channels.json + issued client
+      # secret hashes survive restarts and redeploys.
+      - name: Deploy
+        run: |
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --source hub \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --port 8080 \
+            --cpu 1 --memory 256Mi \
+            --min-instances 0 --max-instances 1 \
+            --concurrency 250 \
+            --add-volume name=data,type=cloud-storage,bucket=dap-hub-data \
+            --add-volume-mount volume=data,mount-path=/data \
+            --allow-unauthenticated \
+            --set-secrets [REDACTED:High Entropy String]:latest,[REDACTED:Sensitive Value]:latest
+
+      - name: Service URL
+        run: |
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format 'value(status.url)'
