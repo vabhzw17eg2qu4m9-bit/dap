@@ -75,7 +75,7 @@ jobs:
             --add-volume name=data,type=cloud-storage,bucket=dap-hub-data \
             --add-volume-mount volume=data,mount-path=/data \
             --allow-unauthenticated \
-            --set-secrets [REDACTED:High Entropy String]:latest,[REDACTED:Sensitive Value]:latest
+            --set-secrets HUB_MASTER_SECRET=dap-hub-master-secret:latest,HUB_ADMIN_TOKEN=dap-hub-admin-token:latest
 
       - name: Service URL
         run: |
