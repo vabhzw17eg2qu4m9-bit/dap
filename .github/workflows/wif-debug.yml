@@ -11,14 +11,21 @@ jobs:
   debug:
     runs-on: ubuntu-latest
     steps:
-      - name: OIDC claims + WIF exchange + impersonation
+      - name: Secret shape check
+        env:
+          SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          WIF: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
-          set -x
-          OIDC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=iam.googleapis.com/projects/80693608388/locations/global/workloadIdentityPools/github/providers/github-oidc" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
-          echo "$OIDC" | cut -d. -f2 | python3 -c "import json,sys,base64; c=json.loads(base64.urlsafe_b64decode(sys.stdin.read()+'==')); [print(k,'=',c.get(k)) for k in ('sub','repository','repository_owner','ref','aud','iss')]"
+          python3 -c "import os; [print(k, 'len=', len(v), 'tail=', repr(v[-8:])) for k,v in [('SA',os.environ['SA']),('WIF',os.environ['WIF'])]]"
+      - name: Full impersonation via curl (correct aud)
+        env:
+          SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          WIF: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        run: |
+          OIDC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=//iam.googleapis.com/projects/80693608388/locations/global/workloadIdentityPools/github/providers/github-oidc" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
           STS=$(curl -s -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' -d "{\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"audience\":\"//iam.googleapis.com/projects/80693608388/locations/global/workloadIdentityPools/github/providers/github-oidc\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"$OIDC\"}")
-          echo "STS response: $(echo "$STS" | head -c 300)"
           STSTOK=$(echo "$STS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
-          if [ -n "$STSTOK" ]; then
-            curl -s -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/fa-network-deploy@ai-native-478811.iam.gserviceaccount.com:generateAccessToken" -H "Authorization: Bearer $STSTOK" -H 'Content-Type: application/json' -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}' | head -c 400
-          fi
+          [ -z "$STSTOK" ] && { echo "STS failed: $(echo "$STS" | head -c 300)"; exit 1; }
+          echo "STS OK"
+          RESP=$(curl -s -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SA:generateAccessToken" -H "Authorization: Bearer $STSTOK" -H 'Content-Type: application/json' -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}')
+          echo "impersonation: $(echo "$RESP" | head -c 300)"
