@@ -1,0 +1,34 @@
+# dap hub on a single GCE VM (Container-Optimized OS): caddy terminates TLS
+# for hub.fa1.dev (Let's Encrypt) and proxies to the hub container. State
+# (channels.json, secrets.json) lives in /data, bind-mounted from the
+# persistent boot disk — it survives container restarts and VM stop/start.
+# HUB_MASTER_SECRET / HUB_ADMIN_TOKEN come from /etc/dap/hub.env (0600,
+# root-owned; never in the repo, never on a command line).
+services:
+  hub:
+    image: ghcr.io/vabhzw17eg2qu4m9-bit/dap:latest
+    restart: unless-stopped
+    env_file: /etc/dap/hub.env
+    environment:
+      HUB_ADDR: ":8080"
+      HUB_CHANNELS_FILE: /data/channels.json
+      HUB_SECRETS_FILE: /data/secrets.json
+    volumes:
+      - /var/lib/dap:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80" # ACME HTTP-01 challenge + redirect to https
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # certificates
+      - caddy-config:/config
+    depends_on:
+      - hub
+
+volumes:
+  caddy-data:
+  caddy-config:
