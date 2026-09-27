@@ -791,8 +791,13 @@ export class DapClient {
     this.ringError({ code: String(frame.code), msg: String(frame.msg), ts: Date.now() });
     if (frame.code === 'unknown_channel' || frame.code === 'access_denied') {
       const err = new Error(this.lastError);
-      for (const done of this.joinWaiters.get(String(frame.channel)) ?? []) done(err);
-      this.joinWaiters.delete(String(frame.channel));
+      // The hub's error frame carries no channel — the denial fails every
+      // pending join with the hub error (never a silent ok or a timeout).
+      const ch = typeof frame.channel === 'string' ? frame.channel : '';
+      const waiters = ch ? this.joinWaiters.get(ch) : [...this.joinWaiters.values()].flat();
+      for (const done of waiters ?? []) done(err);
+      if (ch) this.joinWaiters.delete(ch);
+      else this.joinWaiters.clear();
     }
     if (frame.code === 'unknown_agent') {
       for (const [agentId, resolves] of this.whoisWaiters) for (const done of resolves) {

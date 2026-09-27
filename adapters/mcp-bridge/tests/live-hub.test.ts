@@ -117,3 +117,69 @@ test('live enrollment: master dial enrolls + persists the clientSecret, reconnec
     assert.ok(exit.signal === 'SIGTERM' || exit.code !== null, 'hub process reaped on teardown');
   }
 });
+
+test('client-secret join of an unknown channel: hub access_denied, channel not created (issue #4 IT)', async () => {
+  // Own hub name: the 'main' hub is stopped by the previous test (its Map
+  // entry stays settled), so this test boots a fresh one.
+  const hub = await startHub('denied');
+  const dir = mkdtempSync(join(tmpdir(), 'dap-live-denied-'));
+  const configFile = join(dir, 'config.json');
+
+  // Phase 1: the owner enrolls with the master secret; the hub issues a
+  // client secret bound to the enrolled name (in production fa_network
+  // hands that secret to the agent out of band).
+  const M = new DapClient({ url: hub.url, keyPath: join(dir, 'm.key'), name: 'creator' });
+  const unM = pinMasterAuth(hub, configFile);
+  try {
+    M.start();
+    await M.ready();
+    await pollUntil(() => existsSync(configFile) && readFileSync(configFile, 'utf8').includes('clientSecret'));
+  } finally {
+    unM();
+    M.stop();
+  }
+  // The issued secret from the enrollment file this test wrote (phase 1).
+  const issued = JSON.parse(readFileSync(configFile, 'utf8')) as { clientSecret?: string };
+  const secret = issued.clientSecret;
+  assert.match(secret ?? '', /^[A-Za-z0-9_-]{43}$/);
+
+  // Phase 2: the enrolled agent reconnects via the DAP_CLIENT_SECRET path
+  // (same name — the secret is bound to it) and joins an unknown channel:
+  // the hub denies creation to client-secret connections, and the client
+  // must surface exactly that failure.
+  const saved = process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_CLIENT_SECRET = secret;
+  try {
+    M.start();
+    await M.ready();
+    await assert.rejects(
+      M.ensureChannel('ghost-room'),
+      /hub error access_denied: channel creation requires the master secret/,
+    );
+    assert.ok(
+      M.drainErrors().some((e) => e.code === 'access_denied' && e.msg === 'channel creation requires the master secret'),
+    );
+    // A send to the same room rides the same join — it fails the same way.
+    await assert.rejects(M.send('ghost-room', 'anyone?'), /access_denied/);
+  } finally {
+    if (saved === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = saved;
+    M.stop();
+  }
+
+  // Phase 3: hub-side proof the denial was not a silent ok — a FRESH master
+  // connection mints the channel (created:true), so it never existed before.
+  const unM2 = pinMasterAuth(hub, join(dir, 'master2.json'));
+  const M2 = new DapClient({ url: hub.url, keyPath: join(dir, 'm2.key'), name: 'master-2' });
+  try {
+    M2.start();
+    await M2.ready();
+    const chan = await M2.ensureChannel('ghost-room');
+    assert.equal(chan.created, true, 'the channel only comes into being through a master connection');
+  } finally {
+    unM2();
+    M2.stop();
+    const exit = await hub.stop();
+    assert.ok(exit.signal === 'SIGTERM' || exit.code !== null, 'hub process reaped on teardown');
+  }
+});
