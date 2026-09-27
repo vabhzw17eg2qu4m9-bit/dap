@@ -112,7 +112,7 @@ const TOOL_SHELLS: Record<string, Omit<DapToolDef, 'execute'>> = {
   },
   dap_connect: {
     name: 'dap_connect',
-    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
+    description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). First connect to a hub that requires auth: set DAP_MASTER_SECRET to enroll once — the issued client secret is persisted to the config file and reused automatically — or set DAP_CLIENT_SECRET / a config clientSecret to connect without enrolling (a client secret is bound to its enrolled name). Never feed a client secret to DAP_MASTER_SECRET: that dials in enroll mode and the hub refuses enroll on a non-master connection. A stale secret (the name was re-enrolled) 401s the dial: a config-cached secret is wiped once and the next master-authed start re-enrolls; an env-sourced secret fails hard — rotate it and set the new one. NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
     inputSchema: {
       type: 'object',
       properties: {

@@ -1,0 +1,6 @@
+# TLS for hub.fa1.dev via Let's Encrypt (automatic; Caddy retries ACME
+# while DNS propagates — the service counts as live only after the E2E
+# probe in README step 5 passes).
+hub.fa1.dev {
+	reverse_proxy hub:8080
+}

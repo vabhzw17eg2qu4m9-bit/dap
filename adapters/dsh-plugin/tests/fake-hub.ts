@@ -25,8 +25,9 @@ export class FakeHub {
   readonly channel = dap.newX25519Keypair();
   /** channel -> member agentIds (join tracking, spec § join). */
   readonly channelMembers = new Map<string, Set<string>>();
-  /** channel -> registered chanPubkey (b64); first joiner creates (hub law). */
-  readonly chanPubkeys = new Map<string, string>();
+  /** channel -> registered chanPubkey (b64); first joiner creates (hub law).
+   *  The default room pre-exists: channelConfig() hands out this keypair. */
+  readonly chanPubkeys = new Map<string, string>([['general', dap.b64e(this.channel.pub)]]);
   hellos = 0;
   /** Test switch: drop whois queries on the floor (bounded-wait tests). */
   answerWhois = true;
@@ -115,7 +116,7 @@ export class FakeHub {
     if (frame.op === 'flush') ws.send(JSON.stringify({ op: 'flushed', count: 0 }));
     else if (frame.op === 'whois') this.onWhois(frame, ws);
     else if (frame.op === 'presence_query') this.onPresenceQuery(frame, ws);
-    else if (frame.op === 'join') this.onJoin(frame, ws, agentId);
+    else if (frame.op === 'join') this.onJoin(frame, ws, agentId, auth);
     else if (frame.op === 'send') this.onSend(frame, ws, agentId);
     return undefined;
   }
@@ -186,11 +187,18 @@ export class FakeHub {
   }
 
   /** Spec § join: first join creates the channel and registers chanPubkey;
-   *  re-join is idempotent. */
-  private onJoin(frame: dap.Frame, ws: WebSocket, agentId: string): void {
+   *  re-join is idempotent. Hub law (issue #4, gate at bd8950f): channel
+   *  CREATION is master-only — a client-secret connection joins existing
+   *  channels and gets the real hub's access_denied on unknown ones. Hubs
+   *  without a masterSecret keep the legacy open behavior. */
+  private onJoin(frame: dap.Frame, ws: WebSocket, agentId: string, auth: string): void {
     const name = String(frame.channel);
     if (!name) {
       ws.send(JSON.stringify({ op: 'error', code: 'bad_frame', msg: 'join requires channel' }));
+      return;
+    }
+    if (this.masterSecret !== undefined && !this.chanPubkeys.has(name) && auth !== `Bearer ${this.masterSecret}`) {
+      ws.send(JSON.stringify({ op: 'error', code: 'access_denied', msg: 'channel creation requires the master secret' }));
       return;
     }
     const members = this.channelMembers.get(name) ?? new Set<string>();
