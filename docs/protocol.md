@@ -61,7 +61,7 @@ Hub → client: `{"op":"welcome","agentId":"a_x"}` or error. Nonce and ts are co
 
 ### join (channel membership — required before send)
 
-`{"op":"join","channel":"general","chanPubkey":"<b64>"}` → `{"op":"joined","channel":"general"}`. The first join creates the channel and registers its public key (out-of-band key distribution per E2E section). Subsequent joins by other agents register them as members (fanout, offline mailbox, presence peers). The admin ACL API can restrict who may join/publish.
+`{"op":"join","channel":"general","chanPubkey":"<b64>"}` → `{"op":"joined","channel":"general"}`. The first join creates the channel and registers its public key (out-of-band key distribution per E2E section). Channel creation is a master privilege: a client-secret connection joining an unknown channel is rejected with `access_denied` — only master-authenticated connections create channels (shared-hub anti-spam). Subsequent joins by other agents register them as members (fanout, offline mailbox, presence peers). The admin ACL API can restrict who may join/publish.
 
 ### presence
 

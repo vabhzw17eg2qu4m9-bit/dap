@@ -41,12 +41,19 @@ func (h *hub) handleJoin(cl *client, f frame, _ map[string]any) {
 }
 
 // joinChannel creates or fetches the channel and adds the agent as a
-// member, enforcing the ACL.
+// member, enforcing the ACL. Channel CREATION is a master privilege:
+// client-secret connections may join existing channels only (a shared
+// hub must not let every enrolled agent mint unbounded channels).
 func (h *hub) joinChannel(cl *client, name, chanPub string) *protoError {
 	created, rejoin := false, false
 	h.mu.Lock()
 	ch := h.channels[name]
 	if ch == nil {
+		if cl.auth != authMaster {
+			h.mu.Unlock()
+			h.logf("join", "agent", cl.logAgent(), "channel", dash(name), "result", "denied")
+			return &protoError{codeDenied, "channel creation requires the master secret"}
+		}
 		ch = h.newChannelLocked(name, chanPub)
 		created = true
 	}
