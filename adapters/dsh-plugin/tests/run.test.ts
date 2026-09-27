@@ -852,6 +852,51 @@ test('error surfacing: hub error frame -> followup notice + dap_inbox errors', a
   }
 });
 
+test('client-secret join of an unknown channel: hub access_denied surfaced, channel not created (issue #4 IT)', async () => {
+  const hub = await new FakeHub().start();
+  // Real hub law (bd8950f): this fake hub now enforces it — creation is
+  // master-only, so a client-secret connection is an enrolled agent.
+  hub.masterSecret = 'it-master';
+  hub.authTokens = new Set(['Bearer it-master', `Bearer ${hub.clientSecret}`]);
+  const dir = tmpDir('dsh-it-denied');
+  const saved = { master: process.env.DAP_MASTER_SECRET, client: process.env.DAP_CLIENT_SECRET };
+  process.env.DAP_MASTER_SECRET = 'it-master'; // opens the plugin gate only
+  process.env.DAP_CLIENT_SECRET = hub.clientSecret; // the dial is a client-secret connection
+  const fc = fakeCtx();
+  try {
+    plugin.apply(fc.ctx, {
+      url: hub.url, keyPath: join(dir, 'a.key'), name: 'it-agent', channels: channelConfig(hub),
+      backoff: { initialMs: 10, maxMs: 40 },
+    });
+    await hub.waitFor((f) => f.op === 'flush'); // welcomed, default room joined
+    assert.equal(hub.upgradeAuths.at(-1), `Bearer ${hub.clientSecret}`, 'dialed with the client secret');
+    assert.ok(hub.channelMembers.get('general')?.has(hub.pluginAgentId), 'existing channels join fine on the same secret');
+
+    // Join an unknown channel (dap_send creates on first use): the hub
+    // denies creation to client secrets — the verdict must arrive honestly.
+    await tool(fc, 'dap_send').execute({ channel: 'ghost-room', text: 'must not land' });
+    await hub.waitFor((f) => f.op === 'join' && f.channel === 'ghost-room'); // the join went out…
+    await until(() => fc.followups.some((t) => t.includes('access_denied')));
+    assert.match(
+      fc.followups.find((t) => t.includes('access_denied'))!,
+      /hub rejected a frame — access_denied: channel creation requires the master secret/,
+    );
+    const inbox = (await tool(fc, 'dap_inbox').execute({})) as { errors: Array<{ code: string; msg: string }> };
+    assert.equal(inbox.errors.length, 1);
+    assert.equal(inbox.errors[0].code, 'access_denied');
+    assert.equal(inbox.errors[0].msg, 'channel creation requires the master secret');
+    // Hub-side: no creation, no membership — the denial was not a silent ok.
+    assert.equal(hub.chanPubkeys.has('ghost-room'), false, 'channel not created');
+    assert.ok(!hub.channelMembers.get('ghost-room')?.has(hub.pluginAgentId), 'agent not a member');
+  } finally {
+    process.env.DAP_MASTER_SECRET = saved.master; // restore suite defaults
+    process.env.DAP_CLIENT_SECRET = saved.client;
+    for (const cb of fc.disposeCbs.splice(0)) cb();
+    await hub.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('undecryptable inbound msg surfaces via followup + dap_inbox errors (never silent)', async () => {
   const hub = await new FakeHub().start();
   const fc = fakeCtx();
