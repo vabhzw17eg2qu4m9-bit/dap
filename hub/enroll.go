@@ -43,14 +43,24 @@ func bearerToken(r *http.Request) string {
 // wsAuth authenticates the upgrade before websocket.Accept: the master
 // secret grants authMaster (enrollment capable); a persisted secret
 // hash grants authAgent bound to its enrolled name; anything else is a
-// plain 401, logged like the admin API.
+// plain 401, logged like the admin API. Browser WebSocket clients cannot
+// set request headers, so the credential may also ride in ?token=.
 func (h *hub) wsAuth(w http.ResponseWriter, r *http.Request) (authKind, string, bool) {
-	if kind, name, ok := h.matchBearer(bearerToken(r)); ok {
+	if kind, name, ok := h.matchBearer(wsCredential(r)); ok {
 		return kind, name, true
 	}
 	h.logf("ws", "remote", r.RemoteAddr, "result", "denied")
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 	return authNone, "", false
+}
+
+// wsCredential reads the upgrade credential: Authorization: Bearer first
+// (native clients), ?token= fallback (browser WebSocket).
+func wsCredential(r *http.Request) string {
+	if t := bearerToken(r); t != "" {
+		return t
+	}
+	return r.URL.Query().Get("token")
 }
 
 // matchBearer classifies an upgrade token: master, issued agent secret,

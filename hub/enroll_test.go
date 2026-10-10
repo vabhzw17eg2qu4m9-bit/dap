@@ -5,6 +5,9 @@ package main
 // rejection paths, re-enroll replacement, secrets-file persistence.
 
 import (
+	"context"
+
+	"github.com/coder/websocket"
 	"encoding/base64"
 	"io"
 	"net/http/httptest"
@@ -38,6 +41,25 @@ func TestMasterTokenConnects(t *testing.T) {
 	writeSigned(t, c, a.priv, helloMap(a))
 	w := readUntil(t, c, "welcome")
 	if w.AgentID != a.id {
+		t.Fatalf("welcome agentId %q, want %q", w.AgentID, a.id)
+	}
+}
+
+// TestWSAuthQueryToken: browser WebSocket clients cannot set the
+// Authorization header — the credential may ride in ?token= instead.
+func TestWSAuthQueryToken(t *testing.T) {
+	_, srv, _ := newTestHub(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + testMasterSecret
+	c, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial with ?token=: %v", err)
+	}
+	defer c.CloseNow()
+	a := newAgent(t, "q")
+	writeSigned(t, c, a.priv, helloMap(a))
+	if w := readUntil(t, c, "welcome"); w.AgentID != a.id {
 		t.Fatalf("welcome agentId %q, want %q", w.AgentID, a.id)
 	}
 }
