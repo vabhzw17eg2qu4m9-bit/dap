@@ -1,9 +1,9 @@
 package main
 
 // enroll.go — bearer authentication at the WebSocket upgrade and the
-// enroll op. A connection presenting HUB_MASTER_SECRET may exchange it
-// for a per-agent client secret; only the sha256 hash is persisted, the
-// plaintext lives exclusively inside the enroll reply.
+// enroll/enroll_create ops. A connection presenting HUB_MASTER_SECRET may
+// exchange it for per-name client secrets; only sha256 hashes are persisted,
+// and plaintext lives exclusively inside the enrolled reply.
 
 import (
 	"crypto/rand"
@@ -89,31 +89,48 @@ func (h *hub) agentForSecret(token string) (string, bool) {
 	want := sha256Hex(token)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for name, hash := range h.secrets {
-		if constEq(hash, want) {
-			return name, true
+	for name, hashes := range h.secrets {
+		for _, hash := range hashes {
+			if constEq(hash, want) {
+				return name, true
+			}
 		}
 	}
 	return "", false
 }
 
-// handleEnroll issues a fresh client secret bound to the hello name and
-// persists its hash. Dispatch guarantees hello already completed; the
-// master check is the enrollment gate. Re-enroll replaces the old
-// secret, which then fails every new dial.
+// handleEnroll rotates all client secrets bound to the hello name.
 func (h *hub) handleEnroll(cl *client, _ frame, _ map[string]any) {
+	h.enroll(cl, "enroll")
+}
+
+// handleEnrollCreate adds an independent client secret bound to the hello
+// name. The distinct op is deliberate: old hubs reject it without rotation.
+func (h *hub) handleEnrollCreate(cl *client, _ frame, _ map[string]any) {
+	h.enroll(cl, "enroll_create")
+}
+
+// enroll issues a fresh client secret and persists its hash. Dispatch
+// guarantees hello already completed; the master check is the enrollment
+// gate. Legacy enroll replaces every hash for the name; enroll_create adds.
+func (h *hub) enroll(cl *client, op string) {
 	if cl.auth != authMaster {
-		h.sendErr(cl, codeDenied, "enroll requires the hub master secret")
+		h.sendErr(cl, codeDenied, op+" requires the hub master secret")
 		return
 	}
 	raw := make([]byte, secretBytes)
 	rand.Read(raw) // crypto/rand.Read never fails (Go 1.24+)
 	secret := base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256Hex(secret)
 	h.mu.Lock()
-	h.secrets[cl.name] = sha256Hex(secret)
+	if op == "enroll" {
+		h.secrets[cl.name] = []string{hash}
+	} else {
+		h.secrets[cl.name] = append(h.secrets[cl.name], hash)
+	}
 	h.persistSecrets()
 	h.mu.Unlock()
-	h.logf("enroll", "agent", cl.logAgent(), "name", cl.name)
+	h.logf(op, "agent", cl.logAgent(), "name", cl.name)
 	cl.sendFrame(enrolledReply{T: "enrolled", Secret: secret})
 }
 
@@ -127,11 +144,14 @@ type secretFile struct {
 	Secrets []secretRecord `json:"secrets"`
 }
 
-// persistSecrets writes the secrets file atomically. Caller holds h.mu.
+// persistSecrets writes the secrets file atomically. Duplicate names are
+// intentional: each array entry is one independent credential. Caller holds h.mu.
 func (h *hub) persistSecrets() {
 	records := make([]secretRecord, 0, len(h.secrets))
-	for name, hash := range h.secrets {
-		records = append(records, secretRecord{Name: name, Hash: hash})
+	for name, hashes := range h.secrets {
+		for _, hash := range hashes {
+			records = append(records, secretRecord{Name: name, Hash: hash})
+		}
 	}
 	if err := writeAtomic(h.secretsPath, secretFile{Secrets: records}); err != nil {
 		h.log.Printf("store: write %s failed: %v", h.secretsPath, err)
@@ -150,11 +170,13 @@ func (h *hub) loadSecrets() {
 		h.log.Printf("store: parse %s failed: %v", h.secretsPath, err)
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	loaded := make(map[string][]string, len(sf.Secrets))
 	for _, rec := range sf.Secrets {
-		h.secrets[rec.Name] = rec.Hash
+		loaded[rec.Name] = append(loaded[rec.Name], rec.Hash)
 	}
+	h.mu.Lock()
+	h.secrets = loaded
+	h.mu.Unlock()
 }
 
 // sha256Hex is the digest form used for every issued-secret hash.

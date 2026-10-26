@@ -59,8 +59,8 @@ type frame struct {
 }
 
 // frameOp resolves the dispatch key. Standard frames carry "op"; the
-// frozen enroll wire shape uses "t" ({"t":"enroll"}). Returns "" when
-// neither holds a string.
+// frozen enrollment wire shapes use "t" ({"t":"enroll"} or
+// {"t":"enroll_create"}). Returns "" when neither holds a string.
 func frameOp(f frame, raw map[string]any) string {
 	if f.Op != "" {
 		return f.Op

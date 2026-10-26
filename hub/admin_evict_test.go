@@ -116,7 +116,7 @@ func TestAdminEvictKeepsSharedNameSecret(t *testing.T) {
 	h.mu.Lock()
 	h.agents["id-a"] = &agentEntry{Name: "twin"}
 	h.agents["id-b"] = &agentEntry{Name: "twin"}
-	h.secrets["twin"] = "deadbeef"
+	h.secrets["twin"] = []string{"deadbeef"}
 	h.persistSecrets()
 	h.mu.Unlock()
 
@@ -125,7 +125,7 @@ func TestAdminEvictKeepsSharedNameSecret(t *testing.T) {
 		t.Fatalf("evict status %d, want 204", resp.StatusCode)
 	}
 	h.mu.RLock()
-	hash, kept := h.secrets["twin"]
+	hashes, kept := h.secrets["twin"]
 	remaining := 0
 	for _, e := range h.agents {
 		if e.Name == "twin" {
@@ -133,7 +133,7 @@ func TestAdminEvictKeepsSharedNameSecret(t *testing.T) {
 		}
 	}
 	h.mu.RUnlock()
-	if !kept || hash != "deadbeef" {
+	if !kept || len(hashes) != 1 || hashes[0] != "deadbeef" {
 		t.Fatal("secret for a shared name was purged; survivor dial-in breaks")
 	}
 	if remaining != 1 {

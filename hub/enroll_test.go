@@ -7,8 +7,8 @@ package main
 import (
 	"context"
 
-	"github.com/coder/websocket"
 	"encoding/base64"
+	"github.com/coder/websocket"
 	"io"
 	"net/http/httptest"
 	"path/filepath"
@@ -81,7 +81,7 @@ func TestEnrollRoundTrip(t *testing.T) {
 	if err != nil || len(raw) != 32 {
 		t.Fatalf("secret %q: want base64url of 32 bytes (err=%v)", secret, err)
 	}
-	if h.secrets["alice"] != sha256Hex(secret) {
+	if hashes := h.secrets["alice"]; len(hashes) != 1 || hashes[0] != sha256Hex(secret) {
 		t.Fatal("issued secret hash not bound to hello name")
 	}
 	c.CloseNow()

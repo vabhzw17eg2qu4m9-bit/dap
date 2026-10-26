@@ -21,6 +21,8 @@ The hub is a single binary (`dap-hub`). Configuration via env vars (flags of the
 
 Client connections use the same bearer scheme. Adapters resolve `DAP_CLIENT_SECRET` > the persisted `clientSecret` in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`) > `DAP_MASTER_SECRET` (enroll mode: after `welcome` the client sends `enroll`, persists the returned `clientSecret`, and never stores the master secret).
 
+Legacy `enroll` remains a rotation: it revokes every credential already bound to the hello name and replaces them with the newly issued one. To add a credential without disturbing existing same-name agents, a master-authenticated client sends `enroll_create` after `hello`; it receives the same `enrolled` reply. Old hubs reject `enroll_create` as an unknown op without mutation — do not retry an intended independent creation as legacy `enroll`, because that would rotate credentials. See [the enrollment contract](docs/protocol.md#connection-auth).
+
 Liveness probe: `GET /healthz`.
 The hub lifts its own soft `RLIMIT_NOFILE` to the hard limit at startup (best-effort, one log line); each connection holds two file descriptors, so for very large fleets also raise the hard limit (`LimitNOFILE=1048576` under systemd, `--ulimit nofile=1048576` for docker) — see the [1m-go-websockets](https://github.com/eranyanay/1m-go-websockets) case study for million-connection tuning.
 

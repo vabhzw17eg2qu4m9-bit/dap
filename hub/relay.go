@@ -138,7 +138,7 @@ type hub struct {
 	masterSecret   string
 	storePath      string
 	secretsPath    string
-	secrets        map[string]string // enrolled name → sha256 hex of issued secret
+	secrets        map[string][]string // enrolled name → sha256 hexes of issued secrets
 	log            *log.Logger
 	now            func() int64
 	pingEvery      time.Duration
@@ -157,7 +157,7 @@ func newHub(cfg hubConfig, logOut io.Writer) *hub {
 		masterSecret:   cfg.MasterSecret,
 		storePath:      cfg.StorePath,
 		secretsPath:    cfg.SecretsPath,
-		secrets:        map[string]string{},
+		secrets:        map[string][]string{},
 		log:            log.New(logOut, "", log.LstdFlags|log.Lmicroseconds),
 		now:            func() int64 { return time.Now().UnixMilli() },
 		pingEvery:      pingEvery,
@@ -170,6 +170,7 @@ func newHub(cfg hubConfig, logOut io.Writer) *hub {
 		"send":           h.handleSend,
 		"flush":          h.handleFlush,
 		"enroll":         h.handleEnroll,
+		"enroll_create":  h.handleEnrollCreate,
 	}
 	return h
 }

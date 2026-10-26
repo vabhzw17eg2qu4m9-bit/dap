@@ -112,10 +112,9 @@ func (h *hub) adminEvict(w http.ResponseWriter, r *http.Request) {
 	delete(h.agents, id)
 	delete(h.mailbox, id)
 	delete(h.mailboxDropped, id)
-	// The issued secret is keyed by hello NAME, and duplicate enrollments
-	// can share one name. Purge it only when this eviction took the last
-	// registry entry holding the name; otherwise the surviving agent's
-	// dial-in would break.
+	// Issued secrets are keyed by hello NAME, and independent agents can
+	// share one name. Retain every credential while another registry entry
+	// holds the name; the final eviction purges all of that name's hashes.
 	_, held := h.secrets[name]
 	shared := false
 	for _, e := range h.agents {

@@ -14,15 +14,18 @@ v1 spec. The hub and every adapter implement exactly this. Hub never sees plaint
 - The `GET /ws` upgrade requires `Authorization: Bearer <token>`. Missing or wrong token → `401 unauthorized` before the WebSocket handshake (no frames exchanged).
 - The token is either the **master secret** (enrollment connections) or a hub-issued **client secret** (normal agent connections); compared in constant time.
 - Browser WebSocket clients cannot set request headers: the credential may instead ride in the `?token=` query parameter (checked after the Authorization header).
-- Hub config: `HUB_MASTER_SECRET` env / `-master-secret` flag (REQUIRED — the hub refuses to start without it); issued-secret hashes live in `HUB_SECRETS_FILE` env / `-secrets-file` flag (default `secrets.json`; atomic JSON, reloaded on start). The store keeps **sha256 hashes only** (`name → hash`); plaintext secrets are never stored or logged.
+- Hub config: `HUB_MASTER_SECRET` env / `-master-secret` flag (REQUIRED — the hub refuses to start without it); issued-secret hashes live in `HUB_SECRETS_FILE` env / `-secrets-file` flag (default `secrets.json`; atomic JSON, reloaded on start). The store keeps **sha256 hashes only** in `{"secrets":[{"name":"...","hash":"..."}]}`; repeated names represent independent credentials. Plaintext secrets are never stored or logged, and legacy single-record-per-name files load unchanged.
 - A client-secret connection's hello `name` MUST equal the name the secret was issued to; mismatch → `error` frame + close.
-- **Enrollment**: on a master-authenticated connection, after `hello`, the client may send `{"t":"enroll"}`. The hub replies `{"t":"enrolled","secret":"<base64url RawURLEncoding of 32 random bytes>"}` and binds the secret's hash to the hello name. Re-enrolling replaces the secret (the old client secret then 401s). `enroll` on any other connection is rejected.
-- Client config: `DAP_MASTER_SECRET` (enrollment credential — never persisted), `DAP_CLIENT_SECRET`, or the persisted `clientSecret` field in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`). Resolution: `DAP_CLIENT_SECRET` > `clientSecret` > `DAP_MASTER_SECRET` (dials in enroll mode) > none (dials anyway; hub 401s). Enroll mode sends `enroll` after `welcome`, persists the returned `clientSecret`, and keeps the connection open (it is already master-authenticated).
+- **Enrollment**: both ops require a master-authenticated connection after a signed `hello`, and both reply with the same frozen shape: `{"t":"enrolled","secret":"<base64url RawURLEncoding of 32 random bytes>"}`.
+  - Legacy `{"t":"enroll"}` **rotates all credentials for the hello name**: it persists only the newly issued hash for that name, so every earlier client secret for the name fails subsequent dials with 401. Credentials for other names are unaffected.
+  - `{"t":"enroll_create"}` **adds an independent credential** bound to the hello name without revoking existing credentials. Different Ed25519 keys using these secrets retain distinct agentIds and may be online simultaneously with the same display name. This is a genuinely separate op, not an `enroll` mode: old hubs reject it as `bad_frame` / `unknown op enroll_create` without rotating anything. A client seeking an additional credential MUST NOT fall back to legacy `enroll` after that rejection.
+  - Either op before `hello` gets `not_authenticated`; either op on a client-secret connection gets `access_denied`.
+- Client config: `DAP_MASTER_SECRET` (enrollment credential — never persisted), `DAP_CLIENT_SECRET`, or the persisted `clientSecret` field in `~/.dap/config.json` (path injectable via `DAP_CONFIG_FILE`). Resolution: `DAP_CLIENT_SECRET` > `clientSecret` > `DAP_MASTER_SECRET` (dials in enroll mode) > none (dials anyway; hub 401s). Legacy enroll mode sends `enroll` after `welcome`, persists the returned `clientSecret`, and keeps the connection open (it is already master-authenticated); its rotation semantics are unchanged. Clients explicitly creating an additional same-name credential send `enroll_create` instead.
 ## Identity
 
 - Each agent holds an **Ed25519** keypair. Pubkeys are base64 (raw 32 bytes).
 - `agentId = hex(sha256(pubkey_raw))[:16]`.
-- Optional display `name`.
+- Optional display `name`. Names are credential-binding labels, not unique identity keys: independent pubkeys with one name remain independent agents.
 
 ## Crypto
 
@@ -99,7 +102,7 @@ Same frame with `"to":"a_y"` instead of `channel`. Delivered to that agent only 
 - `GET /api/channels` → `[{"name","members":N,"aclSize":N}]`
 - `PUT /api/channels/{name}/acl` body `{"allowed":["<pubkey b64>",...]}` (empty list = any authenticated agent)
 - `GET /api/agents` → presence list
-- `DELETE /api/agents/{agentId}` → evict one identity from the registry (explicit admin action only — never automatic; refused with `409` while the agent is connected)
+- `DELETE /api/agents/{agentId}` → evict one identity from the registry (explicit admin action only — never automatic; refused with `409` while the agent is connected). Credentials bound to its hello name are retained while any other registry entry has that name; evicting the last entry purges all credentials for the name from memory and `HUB_SECRETS_FILE`.
 - Unauthorized → `401`.
 
 ## Client reconnect

@@ -73,7 +73,9 @@ sudo docker compose -f ~/dap/docker-compose.yml restart hub
 ```
 
 `secrets.json` holds sha256 hashes only, but treat the file as sensitive
-anyway (0600-style discipline; a leaked secret is rotated by re-enrolling).
+anyway (0600-style discipline). Legacy `enroll` rotates every credential for
+the hello name, revoking a leaked secret and its siblings; `enroll_create`
+only adds a credential and must not be used as a rotation substitute.
 
 ## 4. DNS cutover
 
